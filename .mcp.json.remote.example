@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "graph-memory": {
+      "type": "http",
+      "url": "https://your-host.example/mcp"
+    }
+  }
+}

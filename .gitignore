@@ -1,0 +1,28 @@
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+*.js.map
+*.d.ts.map
+
+# Local MCP config (contains paths and credentials)
+.mcp.json
+
+# Claude Code local state
+.claude/
+
+# Environment and secrets — but track .env.example as the public template
+.env
+.env.*
+!.env.example
+
+# Logs
+*.log
+
+# Personal/internal docs — kept locally, excluded from public repo
+docs/internal/
+
+# OS
+.DS_Store
+Thumbs.db

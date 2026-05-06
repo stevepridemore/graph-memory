@@ -1,0 +1,90 @@
+services:
+  # ─── Local Neo4j (replaces Aura Free for the graph backend) ───
+  # Community Edition 5.x. Single-database, single-instance, APOC enabled.
+  # Storage lives under the user's mounted graph-memory tree alongside the
+  # MCP data so backups can capture both with one tar/zip.
+  neo4j:
+    image: neo4j:5.20-community
+    container_name: graph-memory-neo4j
+    restart: unless-stopped
+    ports:
+      # Browser UI and Bolt are bound to localhost only — the MCP server
+      # talks to neo4j over the docker-compose internal network as
+      # bolt://neo4j:7687, so external exposure is just for ad-hoc admin.
+      - "127.0.0.1:7474:7474"
+      - "127.0.0.1:7687:7687"
+    environment:
+      - NEO4J_AUTH=neo4j/${NEO4J_PASSWORD}
+      - NEO4J_PLUGINS=["apoc"]
+      - NEO4J_apoc_export_file_enabled=true
+      - NEO4J_apoc_import_file_enabled=true
+      - NEO4J_dbms_security_procedures_unrestricted=apoc.*
+      - NEO4J_server_memory_heap_initial__size=512m
+      - NEO4J_server_memory_heap_max__size=1G
+      - NEO4J_server_memory_pagecache_size=512m
+    volumes:
+      # Host paths come from .env — set GRAPH_MEMORY_HOME to your data root
+      # (e.g. C:\Users\you\graph-memory on Windows, ~/graph-memory on macOS/Linux).
+      - ${GRAPH_MEMORY_HOME}/neo4j/data:/data
+      - ${GRAPH_MEMORY_HOME}/neo4j/logs:/logs
+      - ${GRAPH_MEMORY_HOME}/neo4j/import:/import
+    healthcheck:
+      test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://localhost:7474 || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 30s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+
+  graph-memory-mcp:
+    build: .
+    image: graph-memory-mcp:latest
+    container_name: graph-memory-mcp
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:3847:3847"
+    env_file:
+      - .env
+    environment:
+      - TLS_CERT=/root/graph-memory/certs/server.crt
+      - TLS_KEY=/root/graph-memory/certs/server.key
+      # Multi-tenant identity. BOOTSTRAP_TENANT_ID is the existing single-user
+      # graph; legacy entities are backfilled with this id at startup, and
+      # this tenant has admin privileges (graph_cypher, all-tenants reembed).
+      - BOOTSTRAP_TENANT_ID=${BOOTSTRAP_TENANT_ID:-bootstrap}
+      # LOCAL_TENANT_ID is the tenant used by stdio-transport callers (Claude
+      # Code, Claude Desktop). Defaults to BOOTSTRAP_TENANT_ID so existing
+      # local workflows keep working.
+      - LOCAL_TENANT_ID=${LOCAL_TENANT_ID:-${BOOTSTRAP_TENANT_ID:-bootstrap}}
+      # TENANT_ID_SOURCE: static (default) | cf-access | header | oauth
+      #   static    → use LOCAL_TENANT_ID for every request (stdio mode + dev)
+      #   cf-access → verify Cf-Access-Jwt-Assertion via JWKS, tenant = email
+      #   header    → trust X-Graph-Memory-Tenant header (only behind a proxy)
+      #   oauth     → verify Authorization: Bearer issued by our /oauth/token,
+      #               tenant = email claim. Use this when fronting the server
+      #               with Cloudflare Tunnel for AI clients (claude.ai, ChatGPT)
+      #               that speak OAuth 2.1.
+      - TENANT_ID_SOURCE=${TENANT_ID_SOURCE:-static}
+      # Cloudflare Access JWT verification — needed for cf-access mode AND for
+      # the /oauth/authorize endpoint in oauth mode (the user logs in via CF
+      # Access on that one path, then everything else is bearer-token based).
+      - CF_ACCESS_TEAM_DOMAIN=${CF_ACCESS_TEAM_DOMAIN:-}
+      - CF_ACCESS_AUD=${CF_ACCESS_AUD:-}
+      # OAuth 2.1 issuer — the public origin used in token iss/aud claims and
+      # in OAuth metadata URLs. Should match the user-visible URL.
+      - OAUTH_ISSUER=${OAUTH_ISSUER:-https://localhost:3847}
+    volumes:
+      - ${GRAPH_MEMORY_HOME}:/root/graph-memory
+      # Read-only mount of Claude Code project transcripts so the dream process
+      # can ingest them. Set CLAUDE_PROJECTS_DIR in .env to your local path
+      # (e.g. C:\Users\you\.claude\projects on Windows, ~/.claude/projects elsewhere).
+      - ${CLAUDE_PROJECTS_DIR}:/root/.claude/projects:ro
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"

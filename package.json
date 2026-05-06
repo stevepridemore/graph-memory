@@ -1,0 +1,37 @@
+{
+  "name": "graph-memory",
+  "version": "0.1.0",
+  "description": "Graph-based memory system for Claude Code using Neo4j",
+  "type": "module",
+  "main": "dist/mcp-server/index.js",
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsc --watch",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "start": "node dist/mcp-server/index.js",
+    "schema:init": "node dist/shared/schema-init.js"
+  },
+  "keywords": [
+    "mcp",
+    "neo4j",
+    "memory",
+    "graph"
+  ],
+  "license": "MIT",
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "dependencies": {
+    "@huggingface/transformers": "^4.2.0",
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "jose": "^6.2.3",
+    "neo4j-driver": "^6.0.1",
+    "zod": "^4.3.6"
+  },
+  "devDependencies": {
+    "@types/node": "^25.5.2",
+    "typescript": "^6.0.2",
+    "vitest": "^4.1.3"
+  }
+}

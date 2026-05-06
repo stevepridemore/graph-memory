@@ -1,0 +1,307 @@
+# Remote / claude.ai access
+
+This guide walks through exposing graph-memory to the **claude.ai web interface** as a remote MCP connector. The architecture keeps the Docker container at home (no new hosting bill) and uses Cloudflare Tunnel + Cloudflare Access for a public hostname, real TLS, and OAuth/OIDC authentication.
+
+```
+claude.ai web UI
+   │  OIDC handshake → access token
+   ▼
+Cloudflare Edge (your hostname)
+   ├── Cloudflare Access (OIDC IdP "SaaS application")
+   │      ↳ user authenticates via Google / GitHub / email OTP
+   │      ↳ Access issues JWT in Cf-Access-Jwt-Assertion header
+   ▼
+Cloudflare Tunnel
+   │  encrypted outbound from cloudflared on the home machine
+   ▼
+graph-memory-mcp Docker container, port 3847
+   ├── verifies JWT signature against team JWKS
+   ├── extracts user email → tenant_id
+   └── all reads/writes filter / set by tenant_id
+```
+
+## Prerequisites
+
+- A Cloudflare account (free tier is fine).
+- A domain on Cloudflare (or use a free Cloudflare-provided `*.cfargotunnel.com` hostname for testing).
+- The graph-memory Docker container already running at home.
+- An identity provider for Cloudflare Access — Google, GitHub, or one-time PIN over email work for personal use.
+
+## Phase 1 — Public reachability via Cloudflare Tunnel
+
+1. **Install cloudflared** on the host machine running the graph-memory container.
+   - Windows: `winget install --id Cloudflare.cloudflared`
+   - macOS: `brew install cloudflared`
+   - Linux: see [Cloudflare's downloads page](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/downloads/).
+
+2. **Authenticate cloudflared** with your Cloudflare account:
+   ```
+   cloudflared tunnel login
+   ```
+
+3. **Create the tunnel:**
+   ```
+   cloudflared tunnel create graph-memory
+   ```
+   This prints a tunnel UUID — note it.
+
+4. **Configure DNS.** Pick a hostname (e.g. `graph-memory.your-domain.com`) and route it to the tunnel:
+   ```
+   cloudflared tunnel route dns graph-memory graph-memory.your-domain.com
+   ```
+
+5. **Configure the tunnel** in `~/.cloudflared/config.yml`:
+   ```yaml
+   tunnel: <UUID from step 3>
+   credentials-file: ~/.cloudflared/<UUID>.json
+
+   ingress:
+     - hostname: graph-memory.your-domain.com
+       service: https://localhost:3847
+       originRequest:
+         noTLSVerify: true   # the container uses a self-signed cert
+     - service: http_status:404
+   ```
+
+   Or, for simplicity, drop the self-signed cert and serve plain HTTP behind the tunnel — Cloudflare terminates TLS at the edge anyway:
+   ```yaml
+   ingress:
+     - hostname: graph-memory.your-domain.com
+       service: http://localhost:3847
+     - service: http_status:404
+   ```
+   (To do this, comment out the `TLS_CERT` / `TLS_KEY` env vars in `docker-compose.yml`.)
+
+6. **Run the tunnel:**
+   ```
+   cloudflared tunnel run graph-memory
+   ```
+   For production, register it as a Windows service / systemd unit so it restarts with the machine.
+
+7. **Verify** from an external network (mobile data, VPN, etc.):
+   ```
+   curl https://graph-memory.your-domain.com/health
+   ```
+   Should return `{"status":"ok","transport":"https"}` with a real Cloudflare-issued cert.
+
+## Phase 2 — Authentication via Cloudflare Access
+
+### Configure Access
+
+1. In the Cloudflare dashboard: **Zero Trust → Access → Applications → Add application → Self-hosted**.
+
+2. Set up the application:
+   - **Application name:** `graph-memory`
+   - **Session duration:** 24 hours (or whatever you prefer)
+   - **Application domain:** `graph-memory.your-domain.com`
+   - **Identity providers:** add Google, GitHub, or "One-time PIN" (email).
+
+3. Create an Access policy:
+   - **Policy name:** `graph-memory-allowed-users`
+   - **Action:** Allow
+   - **Include:** Emails: list specific email addresses (e.g. `your.email@gmail.com`)
+
+   This is your tenant allowlist — every email here becomes an isolated tenant in the graph.
+
+4. **Save and test.** Visit `https://graph-memory.your-domain.com/health` in a browser. You should be redirected to a Cloudflare Access login page; after auth, you should see `{"status":"ok"}`.
+
+### Find your audience claim
+
+The Cloudflare-issued JWT carries an `aud` claim that the MCP server validates. Get it from:
+
+**Zero Trust → Access → Applications → graph-memory → Application Audience tag**
+
+It's a 64-char hex string. Copy it.
+
+### Configure the MCP server to verify JWTs
+
+Update your `.env` (or create one if missing):
+
+```env
+# Neo4j — local docker-compose service
+NEO4J_URI=bolt://neo4j:7687
+NEO4J_USER=neo4j
+NEO4J_PASSWORD=<your-neo4j-password>
+
+# Multi-tenant identity
+BOOTSTRAP_TENANT_ID=your.email@gmail.com   # the tenant your existing graph belongs to
+LOCAL_TENANT_ID=your.email@gmail.com       # tenant for stdio (Claude Code / Desktop)
+TENANT_ID_SOURCE=oauth                     # production mode: bearer tokens issued by /oauth/token
+CF_ACCESS_TEAM_DOMAIN=your-team.cloudflareaccess.com
+CF_ACCESS_AUD=64charhexaudienceclaim...
+```
+
+**Important:** before flipping `TENANT_ID_SOURCE` from `static` to `cf-access`, set `BOOTSTRAP_TENANT_ID` to your email **and** restart the container. The startup migration uses this value to backfill the existing graph onto your tenant. After migration, your existing 300+ entities live under your email tenant.
+
+Restart from your local clone:
+```
+cd <your-graph-memory-clone>
+docker compose up -d
+```
+
+Verify via the access log:
+```
+tail -f ~/graph-memory/logs/mcp-access.jsonl
+```
+Each browser/MCP request prints one JSON line with `tenant_id`, `method`, `path`, and `identity_source: "cf-access"`.
+
+### Register the connector in claude.ai
+
+1. In claude.ai: **Settings → Connectors → Add custom connector**.
+2. **Name:** Graph Memory
+3. **MCP server URL:** `https://graph-memory.your-domain.com/mcp`
+4. **Authentication:** OAuth (claude.ai will discover the Cloudflare Access OIDC endpoints automatically when you click "Connect").
+5. Complete the OAuth flow — claude.ai redirects to Cloudflare Access, you sign in with your IdP, Cloudflare issues a token, claude.ai stores it.
+6. Test: in a new claude.ai conversation, ask Claude to call `graph_stats`. It should return your tenant's actual node/edge counts.
+
+## Adding more users
+
+1. **Cloudflare dashboard → Access → Applications → graph-memory → Policies → Edit allowlist** — add the new user's email.
+2. The user goes to claude.ai, adds the same custom connector, completes OAuth.
+3. On their first tool call, the MCP server creates entities under their email tenant. They start with an empty graph.
+4. They cannot see your data; you cannot see theirs. See [`docs/MULTI_TENANT.md`](MULTI_TENANT.md) for the data model.
+
+## Update 2026-05-06: OAuth 2.1 in the server, claude.ai web compatible
+
+The original setup put Cloudflare Access in front of every path and let CF
+Access handle OAuth-ish things. That works for browsers but **does not work
+for claude.ai's web connector** — claude.ai expects RFC 9728 / RFC 8414
+metadata and a `WWW-Authenticate: Bearer ...` challenge, not a 302 redirect
+to a browser login page.
+
+The fix: graph-memory now implements OAuth 2.1 itself. CF Access still does
+the actual user authentication, but only on one path (`/oauth/authorize`).
+Everything else uses bearer tokens that we sign.
+
+### What changed in the code
+
+| Path | Before | After |
+|---|---|---|
+| `/.well-known/oauth-authorization-server` | not implemented | public, returns metadata |
+| `/.well-known/oauth-protected-resource` | not implemented | public, returns metadata (RFC 9728) |
+| `/oauth/register` | not implemented | public, dynamic client registration (RFC 7591) |
+| `/oauth/authorize` | not implemented | gated by CF Access; reads JWT, issues code, redirects |
+| `/oauth/token` | not implemented | public, exchanges code (or refresh) for bearer JWT |
+| `/oauth/jwks` | not implemented | public, serves our public key |
+| `/mcp` | gated by CF Access (cookie or Cf-Access-Jwt-Assertion) | gated by Authorization: Bearer (our JWT) |
+| 401 response | `Cf-Access-Jwt-Assertion` scheme (non-standard) | `Bearer realm="..." resource_metadata="..."` (RFC 9728) |
+
+The `TENANT_ID_SOURCE` env var gains a new mode `oauth` (now default for the
+HTTPS transport). Stdio transport (Claude Code, Claude Desktop on this
+machine via `docker exec`) still uses `LOCAL_TENANT_ID` — unaffected.
+
+### Cloudflare Access policy: required path-level bypass list
+
+CF Access in its default config gates every path of the application. With
+this update, only `/oauth/authorize` should still be gated. **Add these
+bypass paths to the Application's policy** (Zero Trust → Access → Applications →
+graph-memory → Edit → Policies):
+
+Create a new policy named **"Public OAuth + MCP endpoints"** with:
+- **Action:** Bypass
+- **Include rule:** Everyone
+- **Configure rules → Path-based bypass** (or use Application path settings):
+  - `/.well-known/oauth-authorization-server`
+  - `/.well-known/oauth-protected-resource`
+  - `/.well-known/openid-configuration`
+  - `/.well-known/jwks.json`
+  - `/oauth/register`
+  - `/oauth/token`
+  - `/oauth/jwks`
+  - `/mcp`
+  - `/health`
+
+Keep the existing **"Allow `<your-email>`"** policy in place — it still
+protects `/oauth/authorize`, which is the one URL the user's browser must
+reach during the connect flow.
+
+If your Access dashboard doesn't expose path-level bypass rules directly,
+the alternative is to create **two separate Access Applications**:
+1. `your-host.example/oauth/authorize` → policy: Allow your email
+2. `your-host.example/*` (everything else) → no Access policy
+   (or a Bypass-Everyone policy)
+
+### Connecting claude.ai (web)
+
+Once the bypass list is in place:
+
+1. Open `claude.ai/settings/connectors`
+2. Click **Add custom connector**
+3. **Name:** Graph-Memory (or anything)
+4. **URL:** `https://your-host.example/mcp`
+5. Click **Add**
+6. The connector enters the OAuth flow:
+   - claude.ai POSTs to `/oauth/register` and stores the returned client_id
+   - claude.ai opens a browser tab to `/oauth/authorize?...`
+   - CF Access intercepts (the only gated path) → user sees CF login if not
+     already logged in → CF passes the user through with Cf-Access-Jwt-Assertion
+   - Our server reads the JWT, generates an auth code, redirects to claude.ai
+   - claude.ai exchanges the code at `/oauth/token` and gets back a bearer JWT
+7. Status flips from "Configure" to "Connected" — graph tools available in
+   any conversation.
+
+### Token signing keys
+
+On first startup the server generates an RSA keypair under
+`~/graph-memory/oauth/`:
+- `private.pem` — used to sign tokens (mode 0600)
+- `public.pem` — used to verify tokens, also exposed via `/oauth/jwks`
+
+The keys persist across container rebuilds because they live in the
+mounted data volume. If you rotate them, every existing claude.ai bearer
+token becomes invalid and clients have to re-authorize. To rotate, delete
+both files and restart; new keys are generated and the JWKS kid changes.
+
+## Deployment values to record
+
+When you stand up your own instance, keep a private note of these values — useful for re-creating Cloudflare Access policies, debugging tunnel issues, or restoring from backup:
+
+| Field | Where to find it |
+|---|---|
+| Public hostname | The CNAME you pointed at the tunnel |
+| Tunnel name & UUID | `cloudflared tunnel list` |
+| Cloudflare team domain | Zero Trust dashboard → Settings → Custom Pages |
+| Access app AUD | Zero Trust dashboard → Access → Applications → your app |
+| Bootstrap / admin tenant | The email you set as `BOOTSTRAP_TENANT_ID` in `.env` |
+
+The team domain and AUD are public identifiers (they appear in JWT claims clients verify), not secrets. But `.cloudflared/<UUID>.json` (tunnel credentials) and `.env` (Neo4j password) must stay out of any committed git history.
+
+Files on the host (under your user's home):
+- `~/.cloudflared/cert.pem` — Cloudflare origin cert (zone authorization)
+- `~/.cloudflared/<UUID>.json` — tunnel credentials (treat as secret)
+- `~/.cloudflared/config.yml` — ingress config
+
+## Windows service: known gotcha
+
+`cloudflared service install` on Windows creates the service but **doesn't pass `tunnel run <name>`** to the binary, so the service starts and immediately exits. The fix: after `service install`, override `binPath` via `sc.exe`. Substitute your own home directory for the config path — `sc.exe` does not expand `%USERPROFILE%` at runtime, so the absolute path must be literal:
+
+```powershell
+# Replace C:\Users\<you> with your actual home directory
+sc.exe config cloudflared binPath= "\"C:\Program Files (x86)\cloudflared\cloudflared.exe\" --config \"C:\Users\<you>\.cloudflared\config.yml\" tunnel run graph-memory"
+```
+
+Run this from an elevated PowerShell or via `Start-Process -Verb RunAs`. The service will then launch cloudflared with the right arguments on every reboot.
+
+A second gotcha: `Stop-Service cloudflared` hangs indefinitely with open QUIC connections. To restart cleanly, force-kill the process:
+```powershell
+taskkill /F /PID <cloudflared pid>   # requires admin
+Start-Service cloudflared
+```
+
+## Operational notes
+
+- **Embedding model concurrency:** the local embedding model is a singleton in the Node process. Concurrent semantic-search calls from multiple users serialize through it. ~10 ms per query — fine for personal scale; revisit if you ever have many simultaneous active users.
+- **Rate limiting:** Cloudflare Access has built-in WAF / rate rules. Configure per-IP or per-policy in the dashboard if abuse becomes a concern.
+- **Uptime:** the home machine must be awake for the tunnel to work. Cloudflare buffers some traffic but won't replay MCP requests. Enable Windows "Keep computer awake" or run on a small always-on machine.
+- **Backups:** `graph_export` produces tenant-scoped JSONL backups via the `/graph-backup` skill. Each tenant gets their own export; admins (the bootstrap tenant) can also re-embed across all tenants via `graph_reembed`.
+- **TLS_CERT / TLS_KEY:** kept in `docker-compose.yml` as a fallback for direct-access scenarios (e.g. you want to bypass the tunnel from inside your home network). Optional — when fronted by Cloudflare Tunnel, plain HTTP behind the tunnel is fine.
+
+## Reverting to local-only
+
+To roll back:
+
+1. Set `TENANT_ID_SOURCE=static` in `.env`, restart container.
+2. Stop `cloudflared`.
+3. Optionally remove the Access application from the Cloudflare dashboard.
+
+Your data is unaffected; you keep using Claude Code and Claude Desktop locally as before.

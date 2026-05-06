@@ -1,0 +1,13 @@
+{
+  "mcpServers": {
+    "graph-memory": {
+      "command": "docker",
+      "args": [
+        "exec", "-i",
+        "-e", "MCP_TRANSPORT=stdio",
+        "graph-memory-mcp",
+        "node", "/app/dist/mcp-server/index.js"
+      ]
+    }
+  }
+}

@@ -1,0 +1,347 @@
+// ─── OAuth 2.1 provider ──────────────────────────────────────────────────────
+//
+// graph-memory's HTTP transport speaks OAuth 2.1 with dynamic client
+// registration (RFC 7591) so that AI clients like claude.ai web can connect
+// via the standard bearer-token flow. Identity is delegated to Cloudflare
+// Access — the /oauth/authorize endpoint is the only one still gated by CF
+// Access; everything else (metadata, register, token, mcp) is public and
+// authenticated by tokens we sign ourselves.
+//
+// Storage is intentionally minimal: an RSA keypair on disk for token signing,
+// a JSON file of registered clients, and an in-memory map of pending auth
+// codes (codes are short-lived; losing them on restart is fine — clients
+// will just retry the flow).
+
+import {
+  generateKeyPair,
+  exportPKCS8,
+  exportSPKI,
+  importPKCS8,
+  importSPKI,
+  SignJWT,
+  jwtVerify,
+  type JWTPayload,
+} from "jose";
+
+// jose v6 dropped the KeyLike alias. importPKCS8/importSPKI return CryptoKey;
+// we use that type directly.
+type SigningKey = CryptoKey;
+import { readFileSync, writeFileSync, mkdirSync, existsSync } from "node:fs";
+import { join } from "node:path";
+import { randomBytes, createHash } from "node:crypto";
+import { GRAPH_MEMORY_HOME } from "./config.js";
+
+// ─── Config ───────────────────────────────────────────────────────────────────
+
+const OAUTH_DIR = join(GRAPH_MEMORY_HOME, "oauth");
+const PRIVATE_KEY_PATH = join(OAUTH_DIR, "private.pem");
+const PUBLIC_KEY_PATH = join(OAUTH_DIR, "public.pem");
+const CLIENTS_PATH = join(OAUTH_DIR, "clients.json");
+
+const ACCESS_TOKEN_TTL_SECONDS = 3600;        // 1 hour
+const REFRESH_TOKEN_TTL_SECONDS = 60 * 60 * 24 * 90; // 90 days
+const AUTH_CODE_TTL_SECONDS = 600;            // 10 minutes
+const ALG = "RS256";
+
+// ─── Issuer URL ──────────────────────────────────────────────────────────────
+//
+// The issuer URL is the public origin of this server (e.g.
+// https://your-host.example). Clients use it as `iss` in tokens and as
+// the base for OAuth metadata discovery. We read it from OAUTH_ISSUER, falling
+// back to localhost for dev.
+
+export function getIssuer(): string {
+  return process.env.OAUTH_ISSUER ?? "https://localhost:3847";
+}
+
+// ─── Keypair management ──────────────────────────────────────────────────────
+
+let cachedKeys: { privateKey: SigningKey; publicKey: SigningKey; publicJwk: Record<string, unknown> } | null = null;
+
+async function loadOrGenerateKeys() {
+  if (cachedKeys) return cachedKeys;
+  mkdirSync(OAUTH_DIR, { recursive: true });
+
+  let privatePem: string;
+  let publicPem: string;
+
+  if (existsSync(PRIVATE_KEY_PATH) && existsSync(PUBLIC_KEY_PATH)) {
+    privatePem = readFileSync(PRIVATE_KEY_PATH, "utf-8");
+    publicPem = readFileSync(PUBLIC_KEY_PATH, "utf-8");
+  } else {
+    const { privateKey, publicKey } = await generateKeyPair(ALG, { extractable: true });
+    privatePem = await exportPKCS8(privateKey);
+    publicPem = await exportSPKI(publicKey);
+    writeFileSync(PRIVATE_KEY_PATH, privatePem, { mode: 0o600 });
+    writeFileSync(PUBLIC_KEY_PATH, publicPem, { mode: 0o644 });
+    process.stderr.write(`[graph-memory] generated new OAuth signing keypair at ${OAUTH_DIR}\n`);
+  }
+
+  const privateKey = await importPKCS8(privatePem, ALG, { extractable: true });
+  const publicKey = await importSPKI(publicPem, ALG, { extractable: true });
+
+  // Build JWK for the JWKS endpoint. Compute kid as a stable hash of the
+  // public key's PEM so it doesn't change unless the key rotates.
+  const kid = createHash("sha256").update(publicPem).digest("hex").slice(0, 16);
+  const { exportJWK } = await import("jose");
+  const publicJwk = (await exportJWK(publicKey)) as Record<string, unknown>;
+  publicJwk.kid = kid;
+  publicJwk.use = "sig";
+  publicJwk.alg = ALG;
+
+  cachedKeys = { privateKey, publicKey, publicJwk };
+  return cachedKeys;
+}
+
+export async function getJwksJson(): Promise<{ keys: Record<string, unknown>[] }> {
+  const { publicJwk } = await loadOrGenerateKeys();
+  return { keys: [publicJwk] };
+}
+
+// ─── Client registration store (RFC 7591) ────────────────────────────────────
+
+export interface RegisteredClient {
+  client_id: string;
+  client_secret?: string; // optional for public clients (PKCE-only)
+  client_name?: string;
+  redirect_uris: string[];
+  token_endpoint_auth_method: "none" | "client_secret_basic" | "client_secret_post";
+  grant_types: string[];
+  response_types: string[];
+  registered_at: string;
+}
+
+interface ClientStore {
+  clients: Record<string, RegisteredClient>;
+}
+
+function loadClients(): ClientStore {
+  try {
+    return JSON.parse(readFileSync(CLIENTS_PATH, "utf-8")) as ClientStore;
+  } catch {
+    return { clients: {} };
+  }
+}
+
+function saveClients(store: ClientStore): void {
+  mkdirSync(OAUTH_DIR, { recursive: true });
+  writeFileSync(CLIENTS_PATH, JSON.stringify(store, null, 2));
+}
+
+export function getClient(clientId: string): RegisteredClient | null {
+  return loadClients().clients[clientId] ?? null;
+}
+
+export function registerClient(input: {
+  client_name?: string;
+  redirect_uris: string[];
+  token_endpoint_auth_method?: RegisteredClient["token_endpoint_auth_method"];
+  grant_types?: string[];
+  response_types?: string[];
+}): RegisteredClient {
+  if (!Array.isArray(input.redirect_uris) || input.redirect_uris.length === 0) {
+    throw new Error("redirect_uris is required and must be a non-empty array");
+  }
+  for (const uri of input.redirect_uris) {
+    try {
+      const u = new URL(uri);
+      // Allow only https in production-ish settings, plus http://localhost for testing.
+      if (u.protocol !== "https:" && !(u.protocol === "http:" && (u.hostname === "localhost" || u.hostname === "127.0.0.1"))) {
+        throw new Error(`redirect_uri must use https (or http://localhost): ${uri}`);
+      }
+    } catch (err) {
+      if (err instanceof Error && err.message.startsWith("redirect_uri must")) throw err;
+      throw new Error(`redirect_uri is not a valid URL: ${uri}`);
+    }
+  }
+
+  const authMethod = input.token_endpoint_auth_method ?? "none";
+  const client: RegisteredClient = {
+    client_id: `client_${randomBytes(16).toString("hex")}`,
+    client_secret: authMethod === "none" ? undefined : randomBytes(32).toString("hex"),
+    client_name: input.client_name,
+    redirect_uris: input.redirect_uris,
+    token_endpoint_auth_method: authMethod,
+    grant_types: input.grant_types ?? ["authorization_code", "refresh_token"],
+    response_types: input.response_types ?? ["code"],
+    registered_at: new Date().toISOString(),
+  };
+
+  const store = loadClients();
+  store.clients[client.client_id] = client;
+  saveClients(store);
+  return client;
+}
+
+// ─── Authorization code store (in-memory) ────────────────────────────────────
+//
+// Codes are short-lived (10 min TTL) and single-use. Losing them on restart
+// is safe — clients just retry the authorize flow.
+
+interface AuthCode {
+  code: string;
+  client_id: string;
+  redirect_uri: string;
+  email: string;       // resolved identity
+  scope: string;
+  code_challenge?: string;
+  code_challenge_method?: "S256" | "plain";
+  expires_at: number;  // ms epoch
+}
+
+const authCodes = new Map<string, AuthCode>();
+
+function purgeExpiredCodes() {
+  const now = Date.now();
+  for (const [k, v] of authCodes) if (v.expires_at < now) authCodes.delete(k);
+}
+
+export function issueAuthCode(input: {
+  client_id: string;
+  redirect_uri: string;
+  email: string;
+  scope?: string;
+  code_challenge?: string;
+  code_challenge_method?: "S256" | "plain";
+}): string {
+  purgeExpiredCodes();
+  const code = randomBytes(32).toString("base64url");
+  authCodes.set(code, {
+    code,
+    client_id: input.client_id,
+    redirect_uri: input.redirect_uri,
+    email: input.email,
+    scope: input.scope ?? "",
+    code_challenge: input.code_challenge,
+    code_challenge_method: input.code_challenge_method,
+    expires_at: Date.now() + AUTH_CODE_TTL_SECONDS * 1000,
+  });
+  return code;
+}
+
+export function consumeAuthCode(code: string): AuthCode | null {
+  purgeExpiredCodes();
+  const entry = authCodes.get(code);
+  if (!entry) return null;
+  authCodes.delete(code); // single-use
+  return entry;
+}
+
+// ─── Token issuance and verification ─────────────────────────────────────────
+
+export interface AccessTokenClaims extends JWTPayload {
+  email: string;
+  client_id: string;
+  scope: string;
+  /** type is "access" or "refresh" — different lifetimes, otherwise same shape */
+  type: "access" | "refresh";
+}
+
+export async function issueAccessToken(input: {
+  email: string;
+  client_id: string;
+  scope?: string;
+}): Promise<string> {
+  const { privateKey, publicJwk } = await loadOrGenerateKeys();
+  return new SignJWT({
+    email: input.email,
+    client_id: input.client_id,
+    scope: input.scope ?? "",
+    type: "access",
+  })
+    .setProtectedHeader({ alg: ALG, kid: String(publicJwk.kid), typ: "JWT" })
+    .setIssuer(getIssuer())
+    .setSubject(input.email)
+    .setAudience(getIssuer())
+    .setIssuedAt()
+    .setExpirationTime(`${ACCESS_TOKEN_TTL_SECONDS}s`)
+    .sign(privateKey);
+}
+
+export async function issueRefreshToken(input: {
+  email: string;
+  client_id: string;
+  scope?: string;
+}): Promise<string> {
+  const { privateKey, publicJwk } = await loadOrGenerateKeys();
+  return new SignJWT({
+    email: input.email,
+    client_id: input.client_id,
+    scope: input.scope ?? "",
+    type: "refresh",
+  })
+    .setProtectedHeader({ alg: ALG, kid: String(publicJwk.kid), typ: "JWT" })
+    .setIssuer(getIssuer())
+    .setSubject(input.email)
+    .setAudience(getIssuer())
+    .setIssuedAt()
+    .setExpirationTime(`${REFRESH_TOKEN_TTL_SECONDS}s`)
+    .sign(privateKey);
+}
+
+export async function verifyAccessToken(token: string): Promise<AccessTokenClaims> {
+  const { publicKey } = await loadOrGenerateKeys();
+  const issuer = getIssuer();
+  const { payload } = await jwtVerify(token, publicKey, {
+    issuer,
+    audience: issuer,
+  });
+  if (payload.type !== "access") {
+    throw new Error(`expected access token, got type=${payload.type}`);
+  }
+  return payload as AccessTokenClaims;
+}
+
+export async function verifyRefreshToken(token: string): Promise<AccessTokenClaims> {
+  const { publicKey } = await loadOrGenerateKeys();
+  const issuer = getIssuer();
+  const { payload } = await jwtVerify(token, publicKey, {
+    issuer,
+    audience: issuer,
+  });
+  if (payload.type !== "refresh") {
+    throw new Error(`expected refresh token, got type=${payload.type}`);
+  }
+  return payload as AccessTokenClaims;
+}
+
+// ─── PKCE verification ───────────────────────────────────────────────────────
+
+export function verifyPkce(
+  verifier: string,
+  challenge: string,
+  method: "S256" | "plain" = "S256",
+): boolean {
+  if (method === "plain") return verifier === challenge;
+  // S256: challenge = base64url(sha256(verifier))
+  const computed = createHash("sha256").update(verifier).digest("base64url");
+  return computed === challenge;
+}
+
+// ─── Discovery metadata ──────────────────────────────────────────────────────
+
+export function authorizationServerMetadata(issuer = getIssuer()) {
+  return {
+    issuer,
+    authorization_endpoint: `${issuer}/oauth/authorize`,
+    token_endpoint: `${issuer}/oauth/token`,
+    registration_endpoint: `${issuer}/oauth/register`,
+    jwks_uri: `${issuer}/oauth/jwks`,
+    response_types_supported: ["code"],
+    grant_types_supported: ["authorization_code", "refresh_token"],
+    token_endpoint_auth_methods_supported: ["none", "client_secret_basic", "client_secret_post"],
+    code_challenge_methods_supported: ["S256", "plain"],
+    scopes_supported: ["openid", "email", "profile", "mcp"],
+    subject_types_supported: ["public"],
+    id_token_signing_alg_values_supported: [ALG],
+  };
+}
+
+export function protectedResourceMetadata(issuer = getIssuer()) {
+  return {
+    resource: issuer,
+    authorization_servers: [issuer],
+    bearer_methods_supported: ["header"],
+    resource_documentation: `${issuer}/health`,
+  };
+}
