@@ -565,7 +565,7 @@ RETURN count(n) AS decayed
 {
   "entity_id": "string",                    // optional — scope to one entity's duplicates
   "entity_type": "string",                  // optional — scope to one type (Person, Project, …)
-  "min_score": 0.7,                         // optional — combined-score threshold (default 0.7)
+  "min_score": 0.8,                         // optional — combined-score threshold (default 0.8)
   "min_embedding_similarity": 0.85,         // optional — vector floor (default 0.85)
   "limit": 20,                              // optional — max suggestions returned (default 20, max 100)
   "weights": {                              // optional — override default 0.4/0.4/0.2

@@ -654,7 +654,7 @@ server.registerTool("graph_merge_suggestions", {
   inputSchema: {
     entity_id: z.string().optional().describe("Scope to one entity's potential duplicates"),
     entity_type: z.string().optional().describe("Scope to one entity type (Person, Project, etc.)"),
-    min_score: z.number().optional().describe("Combined-score threshold to surface (default 0.7)"),
+    min_score: z.number().optional().describe("Combined-score threshold to surface (default 0.8)"),
     min_embedding_similarity: z.number().optional().describe("Embedding-similarity floor for candidates (default 0.85)"),
     limit: z.number().optional().describe("Max suggestions to return (default 20, max 100)"),
     weights: z.object({

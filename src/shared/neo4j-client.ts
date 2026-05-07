@@ -1489,7 +1489,7 @@ export class Neo4jClient {
     threshold_used: number;
     scope: { entity_id?: string; entity_type?: string; global: boolean };
   }> {
-    const minScore = options.min_score ?? 0.7;
+    const minScore = options.min_score ?? 0.8;
     const minEmbSim = options.min_embedding_similarity ?? 0.85;
     const limit = Math.min(options.limit ?? 20, 100);
     const w = {
