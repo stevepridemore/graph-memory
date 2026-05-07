@@ -236,6 +236,56 @@ export class Neo4jClient {
     return Number(rows[0]?.["n"] ?? 0);
   }
 
+  // ─── Time-travel primitives ──────────────────────────────────────────────
+  // Set lifecycle timestamps directly. Primary use is exercising decay and
+  // bi-temporal logic in tests, but production maintenance scripts may also
+  // need them (e.g., manually marking an edge superseded after a wrong fact
+  // was recorded).
+
+  /** Backdate a node's `last_seen` by N days. Fires the decay codepath on
+   *  the next `applyDecay()` run. */
+  async setNodeLastSeen(tenantId: string, id: string, daysAgo: number): Promise<void> {
+    const target = new Date(Date.now() - daysAgo * 86_400_000).toISOString();
+    await this.run(
+      `MATCH (n:Entity {tenant_id: $tenantId, id: $id})
+       SET n.last_seen = datetime($target)`,
+      { tenantId, id, target },
+    );
+  }
+
+  /** Backdate an edge's `last_confirmed` by N days. Same purpose as
+   *  setNodeLastSeen but for edges; decay weighs both ends. */
+  async setEdgeLastConfirmed(
+    tenantId: string,
+    fromId: string,
+    toId: string,
+    relation: RelationshipType,
+    daysAgo: number,
+  ): Promise<void> {
+    const target = new Date(Date.now() - daysAgo * 86_400_000).toISOString();
+    await this.run(
+      `MATCH (a:Entity {tenant_id: $tenantId, id: $fromId})-[r:\`${relation}\`]->(b:Entity {tenant_id: $tenantId, id: $toId})
+       SET r.last_confirmed = datetime($target)`,
+      { tenantId, fromId, toId, target },
+    );
+  }
+
+  /** Mark an edge invalid (superseded) as of a given timestamp. After this,
+   *  query() with the default `current_only: true` filter will exclude it. */
+  async setEdgeInvalidAt(
+    tenantId: string,
+    fromId: string,
+    toId: string,
+    relation: RelationshipType,
+    isoString: string,
+  ): Promise<void> {
+    await this.run(
+      `MATCH (a:Entity {tenant_id: $tenantId, id: $fromId})-[r:\`${relation}\`]->(b:Entity {tenant_id: $tenantId, id: $toId})
+       SET r.invalid_at = datetime($isoString)`,
+      { tenantId, fromId, toId, isoString },
+    );
+  }
+
   // ─── Schema Initialization ───
 
   async initializeSchema(): Promise<void> {
@@ -808,7 +858,10 @@ export class Neo4jClient {
           `
           MATCH (n:\`${type}\` {tenant_id: $tenantId})
           WHERE n.last_seen < datetime() - duration('P1D')
-          WITH n, n.confidence * ($rate ^ duration.between(n.last_seen, datetime()).days) AS new_conf
+          // duration.inDays() forces an all-days representation; using .days
+          // on the normalized duration.between() would drop the months
+          // component (30 days back → "1 month + 0 days" → 0-day decay).
+          WITH n, n.confidence * ($rate ^ duration.inDays(n.last_seen, datetime()).days) AS new_conf
           SET n.confidence = CASE WHEN new_conf < 0.01 THEN 0.01 ELSE new_conf END
           RETURN count(n) AS decayed
           `,
@@ -823,7 +876,7 @@ export class Neo4jClient {
         MATCH (a:Entity {tenant_id: $tenantId})-[r]->(b:Entity {tenant_id: $tenantId})
         WHERE r.last_confirmed < datetime() - duration('P1D')
           AND r.weight IS NOT NULL
-        WITH r, r.weight * ($rate ^ duration.between(r.last_confirmed, datetime()).days) AS new_weight
+        WITH r, r.weight * ($rate ^ duration.inDays(r.last_confirmed, datetime()).days) AS new_weight
         SET r.weight = CASE WHEN new_weight < 0.01 THEN 0.01 ELSE new_weight END
         RETURN count(r) AS decayed
         `,

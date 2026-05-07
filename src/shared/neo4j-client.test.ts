@@ -473,3 +473,246 @@ describe("Merge", () => {
     await expect(client.merge(T, "anna", "nobody")).rejects.toThrow(/not found/i);
   });
 });
+
+// Per-type decay rates from src/shared/config.ts. Mirrored here so the test
+// catches either a config drift (rate changes without test update) or a
+// formula bug (decay output diverges from rate^days).
+const DECAY_RATES = {
+  Person: 0.998,
+  Project: 0.995,
+  Preference: 0.999,
+  Concept: 0.999,
+  Decision: 0.997,
+  Fact: 0.996,
+  Event: 0.993,
+  Object: 0.996,
+};
+const EDGE_DECAY_RATE = 0.997;
+
+describe("Decay", () => {
+  it("applies the per-type rate to node confidence proportional to days elapsed", async () => {
+    await client.createEntity(T, "Person", "alice", "Alice", {}, 0.8);
+    await client.setNodeLastSeen(T, "alice", 30); // 30 days stale
+
+    const result = await client.applyDecay(T);
+    expect(result.nodes_decayed).toBeGreaterThanOrEqual(1);
+
+    const alice = await client.getEntity(T, "alice");
+    // Confidence should be ~ 0.8 * 0.998^30 ≈ 0.7533
+    const expected = 0.8 * Math.pow(DECAY_RATES.Person, 30);
+    expect(alice!.confidence).toBeCloseTo(expected, 2);
+  });
+
+  it("decays different entity types at different rates", async () => {
+    // Project (0.995) decays faster than Preference (0.999) over the same window.
+    await client.createEntity(T, "Project", "proj-x", "Project X", {}, 0.8);
+    await client.createEntity(T, "Preference", "pref-x", "Tabs", {}, 0.8);
+    await client.setNodeLastSeen(T, "proj-x", 30);
+    await client.setNodeLastSeen(T, "pref-x", 30);
+
+    await client.applyDecay(T);
+
+    const proj = await client.getEntity(T, "proj-x");
+    const pref = await client.getEntity(T, "pref-x");
+    expect(proj!.confidence).toBeLessThan(pref!.confidence);
+  });
+
+  it("floors confidence at 0.01 even after extreme decay", async () => {
+    // Event has the steepest rate (0.993). Backdating 1000 days → mathematically
+    // 0.5 * 0.993^1000 ≈ 0.0005, but the floor clamps it at 0.01.
+    await client.createEntity(T, "Event", "ancient", "Ancient Event", {}, 0.5);
+    await client.setNodeLastSeen(T, "ancient", 1000);
+
+    await client.applyDecay(T);
+
+    const e = await client.getEntity(T, "ancient");
+    expect(e!.confidence).toBe(0.01);
+  });
+
+  it("does not decay nodes seen within the last day", async () => {
+    // Fresh node — no last_seen backdating. Decay should leave it alone.
+    await client.createEntity(T, "Person", "fresh", "Fresh Person", {}, 0.7);
+
+    await client.applyDecay(T);
+
+    const fresh = await client.getEntity(T, "fresh");
+    expect(fresh!.confidence).toBe(0.7);
+  });
+
+  it("decays edges using the global edge rate, independent of node types", async () => {
+    await client.createEntity(T, "Person", "alice", "Alice", {}, 0.9);
+    await client.createEntity(T, "Project", "proj", "Project", {}, 0.9);
+    await client.createRelationship(T, "alice", "proj", "WORKS_ON", 0.8);
+    await client.setEdgeLastConfirmed(T, "alice", "proj", "WORKS_ON", 50);
+
+    const result = await client.applyDecay(T);
+    expect(result.edges_decayed).toBeGreaterThanOrEqual(1);
+
+    const edges = await client.getRelationships(T, "alice", "out");
+    const edge = edges.find((e) => e.type === "WORKS_ON");
+    // Expected: 0.8 * 0.997^50 ≈ 0.6884
+    const expected = 0.8 * Math.pow(EDGE_DECAY_RATE, 50);
+    expect(edge!.weight).toBeCloseTo(expected, 2);
+  });
+
+  it("dry_run reports a count without mutating", async () => {
+    await client.createEntity(T, "Person", "alice", "Alice", {}, 0.8);
+    await client.setNodeLastSeen(T, "alice", 30);
+
+    const dry = await client.applyDecay(T, true);
+    expect(dry.nodes_decayed).toBeGreaterThanOrEqual(1);
+
+    const alice = await client.getEntity(T, "alice");
+    // Untouched — dry_run is preview-only.
+    expect(alice!.confidence).toBe(0.8);
+  });
+
+  it("flags nodes for pruning when confidence drops below the threshold and edges are weak", async () => {
+    // Below-threshold node with a weak edge → flagged.
+    // Event has the steepest rate (0.993). Starting at 0.5 with 500-day backdate
+    // gives 0.5 * 0.993^500 ≈ 0.015, well below the 0.1 prune threshold.
+    await client.createEntity(T, "Event", "stale-event", "Stale Event", {}, 0.5);
+    await client.createEntity(T, "Person", "anchor", "Anchor", {}, 0.9);
+    await client.createRelationship(T, "stale-event", "anchor", "PARTICIPATED_IN", 0.04); // below 0.05 edge threshold
+    await client.setNodeLastSeen(T, "stale-event", 500);
+
+    const result = await client.applyDecay(T);
+    expect(result.nodes_flagged_for_pruning).toBeGreaterThanOrEqual(1);
+  });
+});
+
+describe("Bi-temporal queries", () => {
+  beforeEach(async () => {
+    await client.createEntity(T, "Person", "alice", "Alice");
+    await client.createEntity(T, "Project", "old-proj", "Old Project");
+    await client.createEntity(T, "Project", "new-proj", "New Project");
+  });
+
+  it("excludes edges marked invalid_at when current_only=true (default)", async () => {
+    await client.createRelationship(T, "alice", "old-proj", "WORKS_ON", 0.7);
+    await client.createRelationship(T, "alice", "new-proj", "WORKS_ON", 0.8);
+    // Mark the old fact as superseded.
+    await client.setEdgeInvalidAt(T, "alice", "old-proj", "WORKS_ON", "2026-01-01T00:00:00Z");
+
+    const result = await client.query(T, ["Alice"], { max_hops: 1 });
+    const projectNames = result.nodes.map((n) => n.name);
+    expect(projectNames).toContain("New Project");
+    expect(projectNames).not.toContain("Old Project");
+  });
+
+  it("includes superseded edges when current_only=false", async () => {
+    await client.createRelationship(T, "alice", "old-proj", "WORKS_ON", 0.7);
+    await client.createRelationship(T, "alice", "new-proj", "WORKS_ON", 0.8);
+    await client.setEdgeInvalidAt(T, "alice", "old-proj", "WORKS_ON", "2026-01-01T00:00:00Z");
+
+    const result = await client.query(T, ["Alice"], {
+      max_hops: 1,
+      current_only: false,
+    });
+    const projectNames = result.nodes.map((n) => n.name);
+    expect(projectNames).toContain("New Project");
+    expect(projectNames).toContain("Old Project");
+  });
+
+  it("setEdgeInvalidAt does not delete the edge — it remains discoverable on the node", async () => {
+    await client.createRelationship(T, "alice", "old-proj", "WORKS_ON", 0.7);
+    await client.setEdgeInvalidAt(T, "alice", "old-proj", "WORKS_ON", "2026-01-01T00:00:00Z");
+
+    // Raw edge listing isn't filtered by invalid_at — the edge still exists,
+    // it's only hidden from query() under the current_only filter.
+    const edges = await client.getRelationships(T, "alice", "out");
+    expect(edges.find((e) => e.to === "old-proj" && e.type === "WORKS_ON")).toBeDefined();
+  });
+
+  it("preserves valid_at on relationships when supplied", async () => {
+    const validAt = "2025-06-15T12:00:00Z";
+    const edge = await client.createRelationship(
+      T,
+      "alice",
+      "old-proj",
+      "WORKS_ON",
+      0.7,
+      {},
+      undefined,
+      validAt,
+    );
+    expect(edge.valid_at).toContain("2025-06-15");
+  });
+});
+
+describe("Contradictions edge cases", () => {
+  beforeEach(async () => {
+    await client.createEntity(T, "Fact", "fact-vue", "Project X uses Vue");
+    await client.createEntity(T, "Fact", "fact-react", "Project X uses React");
+  });
+
+  it("excludes resolved contradictions by default", async () => {
+    await client.createRelationship(T, "fact-vue", "fact-react", "CONTRADICTS", 1.0, {
+      description: "Tech stack conflict",
+      detected_date: new Date().toISOString(),
+      resolved: true,
+    });
+
+    const result = await client.findContradictions(T);
+    expect(result.count).toBe(0);
+  });
+
+  it("surfaces resolved contradictions when include_resolved=true", async () => {
+    await client.createRelationship(T, "fact-vue", "fact-react", "CONTRADICTS", 1.0, {
+      description: "Tech stack conflict",
+      detected_date: new Date().toISOString(),
+      resolved: true,
+    });
+
+    const result = await client.findContradictions(T, true);
+    expect(result.count).toBe(1);
+    expect(result.contradictions[0].resolved).toBe(true);
+  });
+
+  it("orders contradictions by detected_date descending", async () => {
+    await client.createEntity(T, "Fact", "fact-a", "Fact A");
+    await client.createEntity(T, "Fact", "fact-b", "Fact B");
+    await client.createEntity(T, "Fact", "fact-c", "Fact C");
+    await client.createEntity(T, "Fact", "fact-d", "Fact D");
+
+    await client.createRelationship(T, "fact-a", "fact-b", "CONTRADICTS", 1.0, {
+      description: "Older",
+      detected_date: "2025-01-01T00:00:00Z",
+      resolved: false,
+    });
+    await client.createRelationship(T, "fact-c", "fact-d", "CONTRADICTS", 1.0, {
+      description: "Newer",
+      detected_date: "2026-04-01T00:00:00Z",
+      resolved: false,
+    });
+
+    const result = await client.findContradictions(T);
+    expect(result.count).toBe(2);
+    expect(result.contradictions[0].description).toBe("Newer");
+    expect(result.contradictions[1].description).toBe("Older");
+  });
+
+  it("isolates across tenants — contradictions in tenant A do not surface for tenant B", async () => {
+    const T2 = `${TENANT_PREFIX}xtenant-${randomUUID().slice(0, 8)}`;
+    try {
+      // Tenant A has a contradiction.
+      await client.createRelationship(T, "fact-vue", "fact-react", "CONTRADICTS", 1.0, {
+        description: "A's conflict",
+        detected_date: new Date().toISOString(),
+        resolved: false,
+      });
+
+      // Tenant B has its own pair, no contradiction.
+      await client.createEntity(T2, "Fact", "b-fact-1", "B Fact 1");
+      await client.createEntity(T2, "Fact", "b-fact-2", "B Fact 2");
+
+      const aResult = await client.findContradictions(T);
+      expect(aResult.count).toBe(1);
+
+      const bResult = await client.findContradictions(T2);
+      expect(bResult.count).toBe(0);
+    } finally {
+      await client.clearTenant(T2);
+    }
+  });
+});
