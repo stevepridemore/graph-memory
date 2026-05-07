@@ -123,11 +123,35 @@ The `cwd` and `session_id` are returned at the top level of the response. **You 
 
 Before creating any entity:
 
-1. Call `graph_entities` with a search for the entity name
+1. Call `graph_entities` (or `graph_search` for natural-language candidates) with the entity name
 2. Check if a similar entity already exists (fuzzy match)
 3. **NEVER merge entities unless you are highly confident they are the same thing**
 4. Duplicates are ALWAYS preferable to false merges
 5. Flag suspected duplicates in the changelog for user review
+
+**Always log the resolution decision via `graph_audit`** with the `entity_resolved` event so a later operator (or `graph_unmerge`) can reconstruct *why* the dream chose to match, create, alias, or skip. One event per resolution decision — both the matched-existing case and the created-new case must be logged. Schema:
+
+```json
+{
+  "event": "entity_resolved",
+  "data": {
+    "candidate_name": "<raw name from transcript>",
+    "action": "matched_existing" | "created_new" | "skipped_ambiguous" | "alias_attached",
+    "chosen_id": "<entity id, omitted only for skipped_ambiguous>",
+    "reason": "<exact name match | embedding sim 0.91 to <id> | name token Jaccard 0.8 with <id> | no candidate above threshold | …>",
+    "similarity_score": 0.91,
+    "source_session": "<session_id from graph_read_transcript>"
+  }
+}
+```
+
+Action definitions:
+- `matched_existing` — candidate clearly resolved to an existing entity (exact name, strong embedding similarity, alias hit). Re-emit `entity_resolved`, then call `graph_relate` / `graph_boost` against `chosen_id`.
+- `created_new` — no candidate above threshold; created a fresh entity. `chosen_id` is the new id.
+- `skipped_ambiguous` — multiple candidates above threshold and none clearly best. Skip writing edges for now and flag in the changelog. Omit `chosen_id`.
+- `alias_attached` — candidate kept as a distinct entity but linked to a canonical via `ALIAS_OF`. `chosen_id` is the canonical's id; `candidate_name` is the new alias entity's name.
+
+Audit logging is best-effort — if it fails, continue extracting. The graph state remains the source of truth; the audit log is the explanation trail.
 
 ### 4f. Write to Graph
 

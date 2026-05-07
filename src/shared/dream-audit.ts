@@ -73,6 +73,26 @@ export type DreamAuditEvent =
       new_weight: number;
     })
   | (BaseEvent & {
+      event: "entity_resolved";
+      /** Raw name as encountered in the transcript/document. */
+      candidate_name: string;
+      /** Action taken — see prompts/dream-nightly.md §4e for definitions. */
+      action:
+        | "matched_existing"   // candidate matched an existing entity by name/alias/embedding
+        | "created_new"        // no match strong enough; created a fresh entity
+        | "skipped_ambiguous"  // multiple candidates above threshold, none clearly best — left unresolved
+        | "alias_attached";    // candidate kept distinct but linked via ALIAS_OF to canonical
+      /** Resolved entity id when action != "skipped_ambiguous". */
+      chosen_id?: string;
+      /** Why this action was chosen — "exact name match", "embedding sim 0.91 to <id>",
+       *  "name token Jaccard 0.8 with <id>", "no candidate above threshold", etc. */
+      reason: string;
+      /** Cosine similarity score when the decision was driven by embeddings. */
+      similarity_score?: number;
+      /** Source session for cross-referencing against the changelog. */
+      source_session?: string;
+    })
+  | (BaseEvent & {
       event: "merge_flagged";
       entity_a: string;
       entity_b: string;

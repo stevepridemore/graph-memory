@@ -1605,14 +1605,17 @@ server.registerTool("graph_audit", {
   description:
     "Append a structured event to the dream process audit log (logs/dream-audit.jsonl). " +
     "Call this during the dream process to record run_start, run_end, transcript_start, " +
-    "transcript_end, entity_created, edge_created, edge_modified, merge_flagged, " +
-    "contradiction_found, ingest_start, ingest_end, decay_applied, format_warning, or error events.",
+    "transcript_end, entity_created, entity_resolved, edge_created, edge_modified, merge_flagged, " +
+    "contradiction_found, ingest_start, ingest_end, decay_applied, format_warning, or error events. " +
+    "entity_resolved is the audit trail for entity-resolution decisions during dream — every time the " +
+    "dream picks between matching an existing entity, creating a new one, or flagging an ambiguous " +
+    "candidate, log it here so a later graph_unmerge can reconstruct why a merge happened.",
   inputSchema: {
     event: z
       .enum([
         "run_start", "run_end",
         "transcript_start", "transcript_end", "transcript_skipped",
-        "entity_created", "edge_created", "edge_modified",
+        "entity_created", "entity_resolved", "edge_created", "edge_modified",
         "merge_flagged", "contradiction_found",
         "ingest_start", "ingest_end",
         "decay_applied", "format_warning", "error",

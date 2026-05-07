@@ -774,7 +774,7 @@ Provide either `session_id` (resolved to `~/.claude/projects/**/<session_id>.jso
 }
 ```
 
-**When to use:** Before schema migrations, before bulk imports, or on a scheduled basis via the `/graph-backup` skill.
+**When to use:** Before schema migrations, before bulk imports, or on a scheduled basis via the `/graph-backup` skill. This is one of two backup layers — see [docs/BACKUP.md](BACKUP.md) for the full runbook covering volume snapshots, logical exports, and disaster-recovery scenarios.
 
 ---
 
@@ -928,7 +928,21 @@ All fields optional. `topic` triggers a neighbourhood expansion around the named
 }
 ```
 
-**When to use:** After the MCP server starts fresh with a new embed-text recipe, or when `graph_search` returns poor results due to stale embeddings.
+**When to use:**
+
+| Trigger | `force` | Why |
+|---|---|---|
+| After `graph_merge` | `false` (default) | The merge clears `target.embedding`; default mode picks it up next call. |
+| Bulk-import or restore from `graph_export` finished | `false` | Imported nodes arrive without embeddings (export is JSONL only). |
+| Embed-text recipe changed (new fields included in `buildEmbedText`) | `true` | Existing embeddings reflect the old recipe; semantic-search quality drifts until rebuilt. |
+| Embedding model swapped (different model id, dimensions, or version) | `true` | Old vectors are no longer comparable to query vectors from the new model. |
+| `graph_search` returns obviously poor results despite reasonable queries | `true` | Last-resort diagnostic; consider checking the embed-text recipe first. |
+
+**When NOT to run it:** Don't include in routine maintenance. The default (`force: false`) is idempotent and cheap, but `force: true` re-embeds every node (~10ms per entity, so a few hundred nodes finish in seconds, but multi-thousand-node graphs aren't free). Routine writes already embed at creation time — `graph_reembed` is for catching gaps and recovering from changes that invalidate prior vectors.
+
+**Tenant scope:** When called by an admin tenant, re-embeds across all tenants. Otherwise scoped to the caller's tenant.
+
+
 
 ---
 
