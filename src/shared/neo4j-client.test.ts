@@ -1,16 +1,22 @@
 import { describe, it, expect, beforeAll, afterAll, beforeEach } from "vitest";
+import { randomUUID } from "node:crypto";
 import { Neo4jClient } from "./neo4j-client.js";
 
 // Integration tests — require a running Neo4j instance.
-//   Locally:   NEO4J_PASSWORD=graph-memory-local npm test
+//   Locally:   spin up a throwaway Neo4j on a non-production port and point
+//              NEO4J_URI / NEO4J_PASSWORD at it (see docs/BACKUP.md or
+//              docker run with -p 7689:7687 for a clean rig).
 //   In CI:     a Neo4j 5.20 service container exposes bolt://localhost:7687
 //              with NEO4J_AUTH=neo4j/test1234 (see .github/workflows/ci.yml).
 //
-// All tests run as a single fixed tenant id; clearAll() between tests wipes
-// the whole database, so cross-tenant leakage isn't exercised here. Multi-
-// tenant boundary tests would belong in a separate file.
+// **Data safety**: every test run gets its own UUID-suffixed tenant id; we
+// only ever delete data tagged with that tenant. Even if NEO4J_URI happens
+// to point at a graph with real data, nothing outside the test tenant is
+// touched. A startup guard refuses to run if the database holds non-test
+// data — opt out with ALLOW_DESTRUCTIVE_TESTS=1 if you really mean it.
 
-const T = "test";
+const TENANT_PREFIX = "test-";
+const T = `${TENANT_PREFIX}${randomUUID().slice(0, 8)}`;
 
 let client: Neo4jClient;
 
@@ -22,14 +28,35 @@ beforeAll(async () => {
   );
   await client.verifyConnectivity();
   await client.initializeSchema();
+
+  // Refuse to run if the connected graph has data we didn't create. Catches
+  // the footgun where someone runs `npm test` against their real local
+  // Neo4j with no env vars set — the defaults match production by design,
+  // and per-tenant isolation alone won't reassure if the user thought they
+  // were aimed at a clean rig.
+  if (process.env.ALLOW_DESTRUCTIVE_TESTS !== "1") {
+    const foreign = await client.countNodesOutsideTenantPrefix(TENANT_PREFIX);
+    if (foreign > 0) {
+      throw new Error(
+        `Refusing to run tests: the connected Neo4j has ${foreign} node(s) ` +
+        `outside the test-* tenant namespace. Point NEO4J_URI at a throwaway ` +
+        `instance (e.g. docker run --rm -p 7689:7687 neo4j:5.20-community) ` +
+        `or set ALLOW_DESTRUCTIVE_TESTS=1 if you really mean it.`,
+      );
+    }
+  }
 });
 
 afterAll(async () => {
+  // Best-effort cleanup of this run's tenant so re-runs against a long-lived
+  // Neo4j don't accumulate orphaned nodes.
+  try { await client.clearTenant(T); } catch { /* ignore */ }
   await client.close();
 });
 
 beforeEach(async () => {
-  await client.clearAll();
+  // Tenant-scoped reset — never touches data outside this run's tenant.
+  await client.clearTenant(T);
 });
 
 describe("Entity CRUD", () => {

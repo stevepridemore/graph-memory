@@ -212,6 +212,30 @@ export class Neo4jClient {
     await this.run("MATCH (n) DETACH DELETE n");
   }
 
+  /** Delete every node + edge belonging to a single tenant. Tenant-scoped
+   *  counterpart to clearAll(); safe to call against a shared Neo4j instance
+   *  because it only touches data tagged with the given tenant_id. Used by
+   *  the integration test suite so a misconfigured local run can't wipe a
+   *  real graph that happens to live on the same server. */
+  async clearTenant(tenantId: string): Promise<void> {
+    await this.run(
+      "MATCH (n:Entity {tenant_id: $tenantId}) DETACH DELETE n",
+      { tenantId },
+    );
+  }
+
+  /** Count nodes that DON'T match a tenant-id pattern. Used as a startup
+   *  guard in tests — refuse to run if the database has data we don't own. */
+  async countNodesOutsideTenantPrefix(prefix: string): Promise<number> {
+    const rows = await this.run(
+      `MATCH (n:Entity)
+       WHERE n.tenant_id IS NULL OR NOT n.tenant_id STARTS WITH $prefix
+       RETURN count(n) AS n`,
+      { prefix },
+    );
+    return Number(rows[0]?.["n"] ?? 0);
+  }
+
   // ─── Schema Initialization ───
 
   async initializeSchema(): Promise<void> {
