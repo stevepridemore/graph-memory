@@ -27,3 +27,38 @@ jobs:
 
       - name: Typecheck (tsc)
         run: npm run build
+
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    services:
+      neo4j:
+        image: neo4j:5.20-community
+        env:
+          NEO4J_AUTH: neo4j/test1234
+          NEO4J_PLUGINS: '["apoc"]'
+        ports:
+          - 7687:7687
+        options: >-
+          --health-cmd "cypher-shell -u neo4j -p test1234 'RETURN 1' || exit 1"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 30
+          --health-start-period 30s
+    env:
+      NEO4J_URI: bolt://localhost:7687
+      NEO4J_USER: neo4j
+      NEO4J_PASSWORD: test1234
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run vitest integration suite
+        run: npm test
