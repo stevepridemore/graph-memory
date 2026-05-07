@@ -156,16 +156,16 @@ function toolError(message: string): { content: Array<{ type: "text"; text: stri
 server.registerTool("graph_query", {
   title: "Graph Query",
   description:
-    "Query the memory graph for entities related to a topic. Use this when the user asks about people, projects, decisions, or past context. Returns connected entities with weights and source files.",
+    "Query the memory graph by canonical entity name. Use when you know the entity name or close-to-canonical form (e.g. \"Steve\", \"graph-memory\"); for natural-language phrasing or synonyms (e.g. \"the knowledge graph project\") prefer graph_search. Returns up to `limit` matching nodes plus the edges that connect them within `max_hops`, with per-edge weight and source provenance.",
   inputSchema: {
     entities: z.array(z.string()).describe("Entity names to search for"),
     entity_types: z.array(z.string()).optional().describe("Filter results to these entity types"),
-    max_hops: z.number().optional().describe("Max traversal depth (default: 2)"),
-    min_weight: z.number().optional().describe("Min edge weight to traverse (default: 0.3)"),
-    limit: z.number().optional().describe("Max results (default: 20)"),
+    max_hops: z.number().optional().default(2).describe("Max traversal depth (default: 2)"),
+    min_weight: z.number().optional().default(0.3).describe("Min edge weight to traverse (default: 0.3)"),
+    limit: z.number().optional().default(20).describe("Max results (default: 20)"),
     project_context: z.string().optional().describe("Project directory or name for affinity scoring"),
-    context_level: z.enum(["minimal", "full", "relations-only"]).optional().describe("Response detail level (default: full)"),
-    current_only: z.boolean().optional().describe("Only current facts, exclude superseded (default: true)"),
+    context_level: z.enum(["minimal", "full", "relations-only"]).optional().default("full").describe("Response detail level (default: full)"),
+    current_only: z.boolean().optional().default(true).describe("Only current facts, exclude superseded (default: true)"),
   },
   annotations: { readOnlyHint: true },
 }, async (args) => {
@@ -208,7 +208,7 @@ server.registerTool("graph_query", {
 server.registerTool("graph_relate", {
   title: "Graph Relate",
   description:
-    "Create or strengthen relationships between entities. Creates entities if they don't exist. Supports single or batch mode. Use batch mode for bulk updates from the dream process.",
+    "Create or strengthen a relationship between entities. Creates the endpoint entities if they don't exist. Use single mode (from_name/to_name/relation) for one fact at a time. Use batch mode when extracting from a transcript or document — it's atomic, so a partial failure won't leave dangling nodes. Idempotent: re-asserting an existing edge boosts its weight rather than duplicating.",
   inputSchema: {
     // Single mode
     from_name: z.string().optional().describe("Source entity name (single mode)"),
@@ -332,12 +332,12 @@ server.registerTool("graph_delete", {
 server.registerTool("graph_boost", {
   title: "Graph Boost",
   description:
-    "Increase an edge's weight when the user confirms recalled information. Call this when the user says 'yes', 'exactly', or confirms something you retrieved from the graph.",
+    "Increase an edge's weight when the user confirms recalled information. Call this when the user says 'yes', 'exactly', or confirms something you retrieved from the graph. Persists immediately; weight clamps at 1.0 so repeated boosts saturate rather than overflow. Returns the previous and new weight.",
   inputSchema: {
     from_name: z.string().describe("Source entity name or ID"),
     to_name: z.string().describe("Target entity name or ID"),
     relation: z.string().describe("Relationship type (e.g. WORKS_ON, PREFERS)"),
-    amount: z.number().optional().describe("Boost amount (default: 0.15)"),
+    amount: z.number().optional().default(0.15).describe("Boost amount (default: 0.15)"),
     reason: z.string().optional().describe("Why boosting"),
   },
   annotations: { idempotentHint: true },
@@ -362,15 +362,15 @@ server.registerTool("graph_boost", {
 server.registerTool("graph_weaken", {
   title: "Graph Weaken",
   description:
-    "Decrease an edge's weight when the user corrects a recalled fact. Call this when the user says 'no', 'that's wrong', or corrects something from the graph.",
+    "Decrease an edge's weight when the user corrects a recalled fact. Call this when the user says 'no', 'that's wrong', or corrects something from the graph. Persists immediately; weight clamps at 0.0. Returns an error if the edge doesn't exist — use graph_delete to remove an entity outright. To replace a fact rather than weaken it, prefer graph_relate with the new fact and SUPERSEDES.",
   inputSchema: {
     from_name: z.string().describe("Source entity name or ID"),
     to_name: z.string().describe("Target entity name or ID"),
     relation: z.string().describe("Relationship type"),
-    amount: z.number().optional().describe("Weaken amount (default: 0.3)"),
+    amount: z.number().optional().default(0.3).describe("Weaken amount (default: 0.3)"),
     reason: z.string().optional().describe("Why weakening"),
   },
-  annotations: {},
+  annotations: { idempotentHint: true },
 }, async (args) => {
   try {
     const tenantId = currentTenant();
@@ -393,13 +393,13 @@ server.registerTool("graph_weaken", {
 server.registerTool("graph_entities", {
   title: "Graph Entities",
   description:
-    "Browse or search the entity catalog. Use to check if an entity exists before creating, or to list entities by type.",
+    "Browse or search the entity catalog. Use to check if an entity exists before creating one with graph_relate, or to list entities of a given type. For relationship-aware lookups (entity + its neighbors) use graph_query instead. Returns up to `limit` entities ordered by `sort_by`; pagination is single-page (raise `limit` if you need more).",
   inputSchema: {
     search: z.string().optional().describe("Full-text search query"),
     type: z.string().optional().describe("Filter by entity type (Person, Project, Concept, etc.)"),
     min_confidence: z.number().optional().describe("Min confidence threshold"),
-    sort_by: z.enum(["confidence", "last_seen", "name"]).optional().describe("Sort order (default: confidence)"),
-    limit: z.number().optional().describe("Max results (default: 20)"),
+    sort_by: z.enum(["confidence", "last_seen", "name"]).optional().default("confidence").describe("Sort order (default: confidence)"),
+    limit: z.number().optional().default(20).describe("Max results (default: 20)"),
   },
   annotations: { readOnlyHint: true },
 }, async (args) => {
@@ -424,7 +424,7 @@ server.registerTool("graph_contradictions", {
   description:
     "Find unresolved contradictions in the memory graph. Use during reviews or when the user asks about conflicting information.",
   inputSchema: {
-    include_resolved: z.boolean().optional().describe("Include resolved contradictions (default: false)"),
+    include_resolved: z.boolean().optional().default(false).describe("Include resolved contradictions (default: false)"),
   },
   annotations: { readOnlyHint: true },
 }, async (args) => {
@@ -441,7 +441,7 @@ server.registerTool("graph_contradictions", {
 server.registerTool("graph_ingest", {
   title: "Graph Ingest",
   description:
-    "Queue a document for ingestion into the memory graph, or check ingest queue status. The dream process will extract entities from queued documents.",
+    "Queue a document for asynchronous extraction into the memory graph (mode='queue'), or check the ingest backlog (mode='status'). Use this when you have a file the user wants summarized into the graph but doesn't need it reflected in the same conversation — the nightly dream process picks queued documents up. For inline assertions during a conversation, call graph_relate directly instead. Idempotent: queueing the same file twice overwrites the prior copy in the pending dir.",
   inputSchema: {
     action: z.enum(["queue", "status"]).describe("queue: add file to pending. status: check queue."),
     file_path: z.string().optional().describe("Path to file to queue (required for queue action)"),
@@ -551,11 +551,11 @@ server.registerTool("graph_cypher", {
 server.registerTool("graph_decay", {
   title: "Graph Decay",
   description:
-    "Apply time-based decay to all node confidence and edge weights. Called by the dream process during maintenance. Use dry_run to preview.",
+    "Apply time-based decay to every node confidence and edge weight using per-type half-lives (preferences ~693d, events ~99d, etc.). Called by the dream process during maintenance. Always preview with dry_run=true first — decay is irreversible without restoring from a graph_export backup. Returns counts of nodes/edges modified per type.",
   inputSchema: {
-    dry_run: z.boolean().optional().describe("Preview only, don't apply changes (default: false)"),
+    dry_run: z.boolean().optional().default(false).describe("Preview only, don't apply changes (default: false)"),
   },
-  annotations: {},
+  annotations: { destructiveHint: true },
 }, async (args) => {
   try {
     const result = await client.applyDecay(currentTenant(), args.dry_run ?? false);
@@ -572,11 +572,11 @@ server.registerTool("graph_prune", {
   description:
     "Remove entities and edges that have decayed below threshold. DESTRUCTIVE — always preview first. Requires user confirmation before execute mode.",
   inputSchema: {
-    mode: z.enum(["preview", "execute"]).optional().describe("preview (default) or execute"),
-    node_threshold: z.number().optional().describe("Prune nodes below this confidence (default: 0.1)"),
-    edge_threshold: z.number().optional().describe("Prune edges below this weight (default: 0.05)"),
-    include_orphans: z.boolean().optional().describe("Also prune orphaned nodes (default: true)"),
-    max_age_days: z.number().optional().describe("Max age for orphan pruning (default: 30)"),
+    mode: z.enum(["preview", "execute"]).optional().default("preview").describe("preview (default) or execute"),
+    node_threshold: z.number().optional().default(0.1).describe("Prune nodes below this confidence (default: 0.1)"),
+    edge_threshold: z.number().optional().default(0.05).describe("Prune edges below this weight (default: 0.05)"),
+    include_orphans: z.boolean().optional().default(true).describe("Also prune orphaned nodes (default: true)"),
+    max_age_days: z.number().optional().default(30).describe("Max age for orphan pruning (default: 30)"),
   },
   annotations: { destructiveHint: true },
 }, async (args) => {
@@ -598,7 +598,7 @@ server.registerTool("graph_prune", {
 server.registerTool("graph_unmerge", {
   title: "Graph Unmerge",
   description:
-    "Split a falsely merged entity back into two separate entities, redistributing specified edges. Use when entity resolution made a mistake (e.g. merged 'Anna' and 'Anne').",
+    "Split a falsely merged entity back into two separate entities, redistributing specified edges. Use when entity resolution made a mistake (e.g. merged 'Anna' and 'Anne'). The original entity keeps every edge not listed in `edges_to_move`; the new entity gets the listed edges plus a fresh embedding stub (re-derive with graph_reembed). Logged to the audit trail with `reason`. Returns the IDs of both entities.",
   inputSchema: {
     entity_id: z.string().describe("The merged entity ID to split"),
     new_entity_name: z.string().describe("Name for the split-off entity"),
@@ -703,7 +703,7 @@ server.registerTool("graph_merge_suggestions", {
 server.registerTool("graph_stats", {
   title: "Graph Stats",
   description:
-    "Graph health dashboard. Shows node/edge counts by type, average weight, orphaned nodes, contradictions, and stale entries.",
+    "Graph health dashboard — node/edge counts by type, average weight, orphan count, unresolved contradictions, stale entries, schema version, and pending ingest backlog. Returns aggregate counts only; for individual entities use graph_entities. Call at session start to size up the graph before deeper queries, after graph_decay or graph_prune to verify the result, or when debugging unexpected query output. No parameters.",
   inputSchema: {},
   annotations: { readOnlyHint: true },
 }, async () => {
@@ -765,7 +765,9 @@ server.registerTool("graph_validate", {
   description:
     "Scan recently extracted entities and edges for quality issues: generic names, reference language, " +
     "type mismatches, near-duplicate names, and extreme confidence values. " +
-    "Call this after a dream process extraction batch to catch bad data before it settles into the graph.",
+    "Call this after a dream process extraction batch to catch bad data before it settles into the graph. " +
+    "Returns up to `max_issues` records of shape `{entity_id, name, type, issue, severity}` where severity is high/medium/low. " +
+    "Read-only — pair with graph_delete or graph_unmerge to act on flagged items.",
   inputSchema: {
     source_session: z
       .string()
@@ -1208,6 +1210,7 @@ server.registerTool("graph_reembed", {
       .default(false)
       .describe("Re-embed every entity, even ones that already have an embedding. Default false."),
   },
+  annotations: { idempotentHint: true },
 }, async ({ force }) => {
   try {
     const tenantId = currentTenant();
@@ -1366,7 +1369,9 @@ server.registerTool("graph_communities", {
     "Find clusters of densely-interconnected entities in the graph. Uses greedy seed-based BFS through " +
     "edges above the weight threshold — works without GDS or APOC. Each entity is assigned to at most " +
     "one community (the first that reaches it from a high-degree seed). Useful for understanding " +
-    "knowledge neighbourhoods (e.g. \"everything related to infrastructure\").",
+    "knowledge neighbourhoods (e.g. \"everything related to infrastructure\"). " +
+    "Returns at most `max_communities` clusters, each shaped `{community_id, seed: {id, name, type}, size, members: [{id, name, type}]}`, sorted by size desc; communities below `min_size` are filtered out. " +
+    "Use graph_query or graph_search instead when you have a specific entity to start from.",
   inputSchema: {
     weight_threshold: z
       .number()
