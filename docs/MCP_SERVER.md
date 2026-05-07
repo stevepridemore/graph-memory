@@ -590,8 +590,8 @@ RETURN count(n) AS decayed
         "name_similarity": 0.50,
         "neighbor_jaccard": 0.85,
         "shared_neighbors": [
-          { "id": "graph-memory", "relation": "USES_TECH" },
-          { "id": "letters-workspace", "relation": "USES_TECH" }
+          { "id": "graph-memory", "relation": "USES_TECH", "degree": 28, "weight": 0.23 },
+          { "id": "letters-workspace", "relation": "USES_TECH", "degree": 3, "weight": 0.48 }
         ]
       },
       "recommended_action": "review"
@@ -606,11 +606,17 @@ RETURN count(n) AS decayed
 **Scoring:**
 ```
 score = w.embedding · embedding_similarity
-      + w.neighbor_jaccard · |N(a) ∩ N(b)| / |N(a) ∪ N(b)|
+      + w.neighbor_jaccard · weighted_jaccard(N(a), N(b))
       + w.name · |tokens(a) ∩ tokens(b)| / |tokens(a) ∪ tokens(b)|
+
+weighted_jaccard(A, B) = Σ weight(n) for n ∈ (A ∩ B)
+                       / Σ weight(n) for n ∈ (A ∪ B)
+weight(n) = 1 / (1 + ln(degree(n)))
 ```
 
-Same-type is a hard gate — never suggests cross-type merges.
+Same-type is a hard gate — never suggests cross-type merges. The weighted Jaccard is **hub-aware**: shared neighbors that are themselves connected to many other entities (e.g. the user's own Person node, with ~50 edges) contribute little to the match score, while shared neighbors with few connections contribute close to 1.0. This prevents the false-positive cluster where every pair of entities owned by the same person looks like a duplicate.
+
+**Hub weight examples:** degree 1 → 1.0, degree 2 → 0.59, degree 5 → 0.38, degree 10 → 0.30, degree 50 → 0.20, degree 100 → 0.18.
 
 **Behavior:**
 1. Build seed set from `entity_id` / `entity_type` / global (capped at 200 seeds for safety)

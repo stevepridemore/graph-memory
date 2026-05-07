@@ -1458,9 +1458,10 @@ export class Neo4jClient {
   }
 
   /** Find candidate pairs of entities likely to be duplicates. Combines
-   *  embedding similarity (vector index), shared-neighbor Jaccard overlap,
-   *  and name-token Jaccard. Same-type only — never suggests cross-type
-   *  merges. Read-only; does not perform any merge. */
+   *  embedding similarity (vector index), hub-aware shared-neighbor Jaccard
+   *  (down-weighting overlaps that go through high-degree hubs like the
+   *  user's own Person node), and name-token Jaccard. Same-type only —
+   *  never suggests cross-type merges. Read-only; does not perform any merge. */
   async mergeSuggestions(
     tenantId: string,
     options: {
@@ -1480,7 +1481,7 @@ export class Neo4jClient {
         embedding_similarity: number;
         name_similarity: number;
         neighbor_jaccard: number;
-        shared_neighbors: Array<{ id: string; relation: string }>;
+        shared_neighbors: Array<{ id: string; relation: string; degree: number; weight: number }>;
       };
       recommended_action: "review";
     }>;
@@ -1498,6 +1499,27 @@ export class Neo4jClient {
     };
     // Cap the number of seed entities to avoid runaway scans on large graphs.
     const MAX_SEEDS = 200;
+
+    // Step 0: precompute per-entity edge degrees for hub-aware Jaccard.
+    // A neighbor with degree D contributes weight 1/(1+log(D)) to the
+    // intersection/union sums — so a 1-edge specific neighbor contributes
+    // 1.0, while a 50-edge hub (e.g. the user's own Person node) contributes
+    // ~0.20. Shared neighbors that are everyone's neighbor add little signal.
+    const degreeRows = await this.run(
+      `
+      MATCH (n:Entity {tenant_id: $tenantId})
+      RETURN n.id AS id, count{(n)-[]-(:Entity {tenant_id: $tenantId})} AS degree
+      `,
+      { tenantId },
+    );
+    const degrees = new Map<string, number>();
+    for (const r of degreeRows) {
+      degrees.set(String(r["id"]), Number(r["degree"] ?? 0));
+    }
+    const neighborWeight = (degree: number): number => {
+      const d = Math.max(degree, 1);
+      return 1 / (1 + Math.log(d));
+    };
 
     // Step 1: collect seed entities. Constrained by entity_id / entity_type.
     const seedRows = await this.run(
@@ -1563,7 +1585,7 @@ export class Neo4jClient {
         embedding_similarity: number;
         name_similarity: number;
         neighbor_jaccard: number;
-        shared_neighbors: Array<{ id: string; relation: string }>;
+        shared_neighbors: Array<{ id: string; relation: string; degree: number; weight: number }>;
       };
       recommended_action: "review";
     }> = [];
@@ -1600,8 +1622,27 @@ export class Neo4jClient {
       const setA = new Set(neighborsA);
       const setB = new Set(neighborsB);
       const intersection = neighborsA.filter((x) => setB.has(x));
-      const union = new Set([...neighborsA, ...neighborsB]);
-      const neighborJaccard = union.size === 0 ? 0 : intersection.length / union.size;
+      const unionSet = new Set([...neighborsA, ...neighborsB]);
+      // Hub-aware weighted Jaccard. Each neighbor entry is "id|relation"; we
+      // look up the global degree of the neighbor entity (id portion) and
+      // weight its contribution inversely. A pair that shares only a hub
+      // (everyone's neighbor) gets little credit; a pair that shares a
+      // specific low-degree neighbor gets near-full credit.
+      const idOf = (entry: string): string => {
+        const sep = entry.lastIndexOf("|");
+        return sep >= 0 ? entry.slice(0, sep) : entry;
+      };
+      let weightedInter = 0;
+      for (const entry of intersection) {
+        const deg = degrees.get(idOf(entry)) ?? 1;
+        weightedInter += neighborWeight(deg);
+      }
+      let weightedUnion = 0;
+      for (const entry of unionSet) {
+        const deg = degrees.get(idOf(entry)) ?? 1;
+        weightedUnion += neighborWeight(deg);
+      }
+      const neighborJaccard = weightedUnion === 0 ? 0 : weightedInter / weightedUnion;
 
       const nameA = String(f["nameA"] ?? "");
       const nameB = String(f["nameB"] ?? "");
@@ -1624,9 +1665,14 @@ export class Neo4jClient {
 
       const sharedNeighbors = intersection.map((entry) => {
         const sep = entry.lastIndexOf("|");
+        const id = sep >= 0 ? entry.slice(0, sep) : entry;
+        const relation = sep >= 0 ? entry.slice(sep + 1) : "";
+        const deg = degrees.get(id) ?? 1;
         return {
-          id: sep >= 0 ? entry.slice(0, sep) : entry,
-          relation: sep >= 0 ? entry.slice(sep + 1) : "",
+          id,
+          relation,
+          degree: deg,
+          weight: Number(neighborWeight(deg).toFixed(4)),
         };
       });
 
