@@ -554,6 +554,89 @@ RETURN count(n) AS decayed
 
 ---
 
+### graph_merge_suggestions
+
+**Purpose:** Surface candidate pairs of entities likely to be the same thing — the read-only counterpart to `graph_unmerge`. LLM-driven extraction (the dream process) reliably produces near-duplicates as the graph grows; this tool flags them for human review.
+
+**Why this exists:** Entity-explosion is the natural failure mode of any LLM-driven extraction pipeline. Without a way to surface duplicates, they pile up and degrade retrieval quality silently. This tool gives operators a triage queue.
+
+**Input:**
+```json
+{
+  "entity_id": "string",                    // optional — scope to one entity's duplicates
+  "entity_type": "string",                  // optional — scope to one type (Person, Project, …)
+  "min_score": 0.8,                         // optional — combined-score threshold (default 0.8)
+  "min_embedding_similarity": 0.85,         // optional — vector floor (default 0.85)
+  "limit": 20,                              // optional — max suggestions returned (default 20, max 100)
+  "weights": {                              // optional — override default 0.4/0.4/0.2
+    "embedding": 0.4,
+    "neighbor_jaccard": 0.4,
+    "name": 0.2
+  },
+  "log_to_audit": true                      // optional — emit merge_flagged events (default true)
+}
+```
+
+**Output:**
+```json
+{
+  "suggestions": [
+    {
+      "entity_a": { "id": "postgres", "name": "Postgres", "type": "Technology", "edge_count": 7 },
+      "entity_b": { "id": "postgresql", "name": "PostgreSQL", "type": "Technology", "edge_count": 4 },
+      "score": 0.92,
+      "signals": {
+        "embedding_similarity": 0.97,
+        "name_similarity": 0.50,
+        "neighbor_jaccard": 0.85,
+        "shared_neighbors": [
+          { "id": "graph-memory", "relation": "USES_TECH", "degree": 28, "weight": 0.23 },
+          { "id": "letters-workspace", "relation": "USES_TECH", "degree": 3, "weight": 0.48 }
+        ]
+      },
+      "recommended_action": "review"
+    }
+  ],
+  "total_pairs_evaluated": 412,
+  "threshold_used": 0.7,
+  "scope": { "entity_type": "Technology", "global": false }
+}
+```
+
+**Scoring:**
+```
+score = w.embedding · embedding_similarity
+      + w.neighbor_jaccard · weighted_jaccard(N(a), N(b))
+      + w.name · |tokens(a) ∩ tokens(b)| / |tokens(a) ∪ tokens(b)|
+
+weighted_jaccard(A, B) = Σ weight(n) for n ∈ (A ∩ B)
+                       / Σ weight(n) for n ∈ (A ∪ B)
+weight(n) = 1 / (1 + ln(degree(n)))
+```
+
+Same-type is a hard gate — never suggests cross-type merges. The weighted Jaccard is **hub-aware**: shared neighbors that are themselves connected to many other entities (e.g. the user's own Person node, with ~50 edges) contribute little to the match score, while shared neighbors with few connections contribute close to 1.0. This prevents the false-positive cluster where every pair of entities owned by the same person looks like a duplicate.
+
+**Hub weight examples:** degree 1 → 1.0, degree 2 → 0.59, degree 5 → 0.38, degree 10 → 0.30, degree 50 → 0.20, degree 100 → 0.18.
+
+**Behavior:**
+1. Build seed set from `entity_id` / `entity_type` / global (capped at 200 seeds for safety)
+2. For each seed, query the `entity_embedding` vector index for top-10 same-type neighbors above `min_embedding_similarity`
+3. Dedupe pairs (canonicalised so `a.id < b.id`)
+4. For each pair, fetch names + neighbor sets in one Cypher query, compute Jaccard signals
+5. Apply weights, filter by `min_score`, rank, return top `limit`
+6. If `log_to_audit` (default true), emit one `merge_flagged` event per surfaced pair to `dream-audit.jsonl`
+
+**Performance:** O(seeds × top_k) vector queries. `entity_id`-scoped runs in <500ms for any single entity. `entity_type`-scoped or global runs scale with the seed cap (200 × 10 = 2000 vector queries, ~20s on the 384-dim cosine index).
+
+**When to use:**
+- Periodically (weekly?) — global scan to triage the duplicate backlog
+- Right after a heavy ingest — type-scoped scan on the entity types most likely affected
+- Reactively — when you suspect a specific entity has duplicates, scope to its `entity_id`
+
+**Pairs with:** `graph_unmerge` (inverse — splits false merges) and an as-yet-unimplemented `graph_merge` tool (executes an approved merge). Until that lands, surfaced pairs can be merged manually via `graph_relate` to add an `ALIAS_OF` edge plus targeted `graph_delete` on the duplicate.
+
+---
+
 ### graph_stats
 
 **Purpose:** Graph health dashboard.
@@ -877,6 +960,8 @@ All fields optional. `topic` triggers a neighbourhood expansion around the named
 | graph_prune (preview) | < 200ms |
 | graph_prune (execute) | < 500ms |
 | graph_unmerge | < 200ms |
+| graph_merge_suggestions (entity_id-scoped) | < 500ms |
+| graph_merge_suggestions (entity_type-scoped or global) | scales with seed cap; ~10–20s typical |
 | graph_stats | < 150ms |
 
 All easily achievable for a personal-scale graph on local Neo4j.

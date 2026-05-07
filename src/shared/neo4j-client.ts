@@ -1457,6 +1457,264 @@ export class Neo4jClient {
     }));
   }
 
+  /** Find candidate pairs of entities likely to be duplicates. Combines
+   *  embedding similarity (vector index), hub-aware shared-neighbor Jaccard
+   *  (down-weighting overlaps that go through high-degree hubs like the
+   *  user's own Person node), and name-token Jaccard. Same-type only —
+   *  never suggests cross-type merges. Read-only; does not perform any merge. */
+  async mergeSuggestions(
+    tenantId: string,
+    options: {
+      entity_id?: string;
+      entity_type?: EntityType;
+      min_score?: number;
+      min_embedding_similarity?: number;
+      limit?: number;
+      weights?: { embedding?: number; neighbor_jaccard?: number; name?: number };
+    } = {},
+  ): Promise<{
+    suggestions: Array<{
+      entity_a: { id: string; name: string; type: string; edge_count: number };
+      entity_b: { id: string; name: string; type: string; edge_count: number };
+      score: number;
+      signals: {
+        embedding_similarity: number;
+        name_similarity: number;
+        neighbor_jaccard: number;
+        shared_neighbors: Array<{ id: string; relation: string; degree: number; weight: number }>;
+      };
+      recommended_action: "review";
+    }>;
+    total_pairs_evaluated: number;
+    threshold_used: number;
+    scope: { entity_id?: string; entity_type?: string; global: boolean };
+  }> {
+    const minScore = options.min_score ?? 0.8;
+    const minEmbSim = options.min_embedding_similarity ?? 0.85;
+    const limit = Math.min(options.limit ?? 20, 100);
+    const w = {
+      embedding: options.weights?.embedding ?? 0.4,
+      neighbor_jaccard: options.weights?.neighbor_jaccard ?? 0.4,
+      name: options.weights?.name ?? 0.2,
+    };
+    // Cap the number of seed entities to avoid runaway scans on large graphs.
+    const MAX_SEEDS = 200;
+
+    // Step 0: precompute per-entity edge degrees for hub-aware Jaccard.
+    // A neighbor with degree D contributes weight 1/(1+log(D)) to the
+    // intersection/union sums — so a 1-edge specific neighbor contributes
+    // 1.0, while a 50-edge hub (e.g. the user's own Person node) contributes
+    // ~0.20. Shared neighbors that are everyone's neighbor add little signal.
+    const degreeRows = await this.run(
+      `
+      MATCH (n:Entity {tenant_id: $tenantId})
+      RETURN n.id AS id, count{(n)-[]-(:Entity {tenant_id: $tenantId})} AS degree
+      `,
+      { tenantId },
+    );
+    const degrees = new Map<string, number>();
+    for (const r of degreeRows) {
+      degrees.set(String(r["id"]), Number(r["degree"] ?? 0));
+    }
+    const neighborWeight = (degree: number): number => {
+      const d = Math.max(degree, 1);
+      return 1 / (1 + Math.log(d));
+    };
+
+    // Step 1: collect seed entities. Constrained by entity_id / entity_type.
+    const seedRows = await this.run(
+      `
+      MATCH (n:Entity {tenant_id: $tenantId})
+      WHERE n.embedding IS NOT NULL
+        AND ($entityId IS NULL OR n.id = $entityId)
+        AND ($entityType IS NULL OR $entityType IN labels(n))
+      RETURN n.id AS id,
+             n.name AS name,
+             n.embedding AS embedding,
+             [l IN labels(n) WHERE l <> 'Entity'][0] AS type
+      LIMIT $maxSeeds
+      `,
+      {
+        tenantId,
+        entityId: options.entity_id ?? null,
+        entityType: options.entity_type ?? null,
+        maxSeeds: MAX_SEEDS,
+      },
+    );
+
+    // Step 2: for each seed, find vector-similar same-type neighbors and
+    // build a deduped pair map. Pairs are canonicalised so a.id < b.id.
+    type Pair = { idA: string; idB: string; embSim: number };
+    const pairs = new Map<string, Pair>();
+
+    for (const row of seedRows) {
+      const seedId = String(row["id"]);
+      const seedType = String(row["type"] ?? "");
+      const seedEmbedding = row["embedding"] as number[] | null | undefined;
+      if (!Array.isArray(seedEmbedding) || seedEmbedding.length === 0) continue;
+      if (!seedType) continue;
+
+      const similar = await this.vectorSearch(tenantId, seedEmbedding, {
+        top_k: 10,
+        min_similarity: minEmbSim,
+        entity_types: [seedType as EntityType],
+      });
+
+      for (const candidate of similar) {
+        if (candidate.id === seedId) continue; // self-match
+        const [idA, idB] = seedId < candidate.id
+          ? [seedId, candidate.id]
+          : [candidate.id, seedId];
+        const key = `${idA}::${idB}`;
+        const existing = pairs.get(key);
+        // Keep the higher embedding score if we see the same pair twice.
+        if (!existing || candidate.score > existing.embSim) {
+          pairs.set(key, { idA, idB, embSim: candidate.score });
+        }
+      }
+    }
+
+    const totalPairsEvaluated = pairs.size;
+
+    // Step 3: per-pair feature query — names, types, edge counts, neighbors.
+    const suggestions: Array<{
+      entity_a: { id: string; name: string; type: string; edge_count: number };
+      entity_b: { id: string; name: string; type: string; edge_count: number };
+      score: number;
+      signals: {
+        embedding_similarity: number;
+        name_similarity: number;
+        neighbor_jaccard: number;
+        shared_neighbors: Array<{ id: string; relation: string; degree: number; weight: number }>;
+      };
+      recommended_action: "review";
+    }> = [];
+
+    for (const pair of pairs.values()) {
+      const featureRows = await this.run(
+        `
+        MATCH (a:Entity {tenant_id: $tenantId, id: $idA})
+        MATCH (b:Entity {tenant_id: $tenantId, id: $idB})
+        OPTIONAL MATCH (a)-[ra]-(na:Entity {tenant_id: $tenantId})
+        WHERE na.id <> b.id
+        WITH a, b, collect(DISTINCT na.id + '|' + type(ra)) AS neighborsA
+        OPTIONAL MATCH (b)-[rb]-(nb:Entity {tenant_id: $tenantId})
+        WHERE nb.id <> a.id
+        WITH a, b, neighborsA,
+             collect(DISTINCT nb.id + '|' + type(rb)) AS neighborsB
+        RETURN a.name AS nameA,
+               [l IN labels(a) WHERE l <> 'Entity'][0] AS typeA,
+               b.name AS nameB,
+               [l IN labels(b) WHERE l <> 'Entity'][0] AS typeB,
+               neighborsA,
+               neighborsB
+        `,
+        { tenantId, idA: pair.idA, idB: pair.idB },
+      );
+
+      if (featureRows.length === 0) continue;
+      const f = featureRows[0]!;
+      const neighborsA = (f["neighborsA"] as string[] | null | undefined ?? [])
+        .filter((s) => typeof s === "string" && s.length > 0);
+      const neighborsB = (f["neighborsB"] as string[] | null | undefined ?? [])
+        .filter((s) => typeof s === "string" && s.length > 0);
+
+      const setA = new Set(neighborsA);
+      const setB = new Set(neighborsB);
+      const intersection = neighborsA.filter((x) => setB.has(x));
+      const unionSet = new Set([...neighborsA, ...neighborsB]);
+      // Hub-aware weighted Jaccard. Each neighbor entry is "id|relation"; we
+      // look up the global degree of the neighbor entity (id portion) and
+      // weight its contribution inversely. A pair that shares only a hub
+      // (everyone's neighbor) gets little credit; a pair that shares a
+      // specific low-degree neighbor gets near-full credit.
+      const idOf = (entry: string): string => {
+        const sep = entry.lastIndexOf("|");
+        return sep >= 0 ? entry.slice(0, sep) : entry;
+      };
+      let weightedInter = 0;
+      for (const entry of intersection) {
+        const deg = degrees.get(idOf(entry)) ?? 1;
+        weightedInter += neighborWeight(deg);
+      }
+      let weightedUnion = 0;
+      for (const entry of unionSet) {
+        const deg = degrees.get(idOf(entry)) ?? 1;
+        weightedUnion += neighborWeight(deg);
+      }
+      const neighborJaccard = weightedUnion === 0 ? 0 : weightedInter / weightedUnion;
+
+      const nameA = String(f["nameA"] ?? "");
+      const nameB = String(f["nameB"] ?? "");
+      const tokensA = new Set(
+        nameA.toLowerCase().split(/[^a-z0-9]+/).filter((t) => t.length > 0),
+      );
+      const tokensB = new Set(
+        nameB.toLowerCase().split(/[^a-z0-9]+/).filter((t) => t.length > 0),
+      );
+      const tokenInter = [...tokensA].filter((t) => tokensB.has(t)).length;
+      const tokenUnion = new Set([...tokensA, ...tokensB]).size;
+      const nameSim = tokenUnion === 0 ? 0 : tokenInter / tokenUnion;
+
+      const score =
+        w.embedding * pair.embSim +
+        w.neighbor_jaccard * neighborJaccard +
+        w.name * nameSim;
+
+      if (score < minScore) continue;
+
+      const sharedNeighbors = intersection.map((entry) => {
+        const sep = entry.lastIndexOf("|");
+        const id = sep >= 0 ? entry.slice(0, sep) : entry;
+        const relation = sep >= 0 ? entry.slice(sep + 1) : "";
+        const deg = degrees.get(id) ?? 1;
+        return {
+          id,
+          relation,
+          degree: deg,
+          weight: Number(neighborWeight(deg).toFixed(4)),
+        };
+      });
+
+      suggestions.push({
+        entity_a: {
+          id: pair.idA,
+          name: nameA,
+          type: String(f["typeA"] ?? "?"),
+          edge_count: setA.size,
+        },
+        entity_b: {
+          id: pair.idB,
+          name: nameB,
+          type: String(f["typeB"] ?? "?"),
+          edge_count: setB.size,
+        },
+        score: Number(score.toFixed(4)),
+        signals: {
+          embedding_similarity: Number(pair.embSim.toFixed(4)),
+          name_similarity: Number(nameSim.toFixed(4)),
+          neighbor_jaccard: Number(neighborJaccard.toFixed(4)),
+          shared_neighbors: sharedNeighbors,
+        },
+        recommended_action: "review",
+      });
+    }
+
+    suggestions.sort((a, b) => b.score - a.score);
+    const truncated = suggestions.slice(0, limit);
+
+    return {
+      suggestions: truncated,
+      total_pairs_evaluated: totalPairsEvaluated,
+      threshold_used: minScore,
+      scope: {
+        entity_id: options.entity_id,
+        entity_type: options.entity_type,
+        global: !options.entity_id && !options.entity_type,
+      },
+    };
+  }
+
   /** Backfill embeddings for entities that don't have one. With force=true,
    *  re-embed every entity (e.g. after changing the embed-text recipe).
    *  Embeds richer text (name + type + select properties) via buildEmbedText
