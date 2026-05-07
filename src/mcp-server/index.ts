@@ -422,7 +422,7 @@ server.registerTool("graph_entities", {
 server.registerTool("graph_contradictions", {
   title: "Graph Contradictions",
   description:
-    "Find unresolved contradictions in the memory graph. Use during reviews or when the user asks about conflicting information.",
+    "Find facts that contradict each other in the memory graph — pairs connected by a CONTRADICTS edge. Use during reviews, before a graph_decay run, or when the user asks about conflicting information. Returns `{contradictions: [{node_a, node_b, description, detected_date, resolved}], count}` ordered by most-recently detected. By default only unresolved pairs are surfaced; set include_resolved=true to audit historical resolutions. Resolve a contradiction by graph_weaken on the wrong edge or by graph_relate with relation=SUPERSEDES on the new fact.",
   inputSchema: {
     include_resolved: z.boolean().optional().default(false).describe("Include resolved contradictions (default: false)"),
   },
@@ -645,12 +645,53 @@ server.registerTool("graph_unmerge", {
   }
 });
 
+// ─── Tool: graph_merge ───
+
+server.registerTool("graph_merge", {
+  title: "Graph Merge",
+  description:
+    "Consolidate two entities into one — moves source's edges onto target, adopts source properties for keys target doesn't have, then deletes source. Inverse of graph_unmerge. Use after graph_merge_suggestions surfaces a duplicate pair, or whenever you've confirmed two nodes refer to the same thing. Same-tenant only; refuses to merge an entity with itself. Edges directly between source and target are dropped (would become self-loops). When source and target both have the same edge to a third node, the edge is consolidated and the higher weight wins. Target's embedding is cleared so the next graph_reembed will re-derive it from the merged state. Logged to logs/merge-audit.jsonl with `reason`. DESTRUCTIVE — always preview with dry_run=true first; recovery requires a graph_export backup or graph_unmerge with the original edge layout.",
+  inputSchema: {
+    source_id: z.string().describe("Entity ID to merge from (will be deleted)"),
+    target_id: z.string().describe("Entity ID to merge into (will absorb source)"),
+    reason: z.string().describe("Why merging (logged in audit)"),
+    dry_run: z.boolean().optional().default(false).describe("Preview only, don't apply changes (default: false)"),
+  },
+  annotations: { destructiveHint: true },
+}, async (args) => {
+  try {
+    const result = await client.merge(currentTenant(), args.source_id, args.target_id, {
+      dryRun: args.dry_run ?? false,
+    });
+
+    // Log to merge audit (skip on dry-run — nothing happened)
+    if (!result.dry_run) {
+      try {
+        const auditDir = join(GRAPH_MEMORY_HOME, "logs");
+        mkdirSync(auditDir, { recursive: true });
+        const auditPath = join(auditDir, "merge-audit.jsonl");
+        const entry = JSON.stringify({
+          action: "merge",
+          timestamp: new Date().toISOString(),
+          ...result,
+          reason: args.reason,
+        });
+        writeFileSync(auditPath, entry + "\n", { flag: "a" });
+      } catch { /* audit logging is best-effort */ }
+    }
+
+    return toolResult({ ...result, audit_logged: !result.dry_run });
+  } catch (err) {
+    return toolError(`graph_merge failed: ${err instanceof Error ? err.message : String(err)}`);
+  }
+});
+
 // ─── Tool: graph_merge_suggestions ───
 
 server.registerTool("graph_merge_suggestions", {
   title: "Graph Merge Suggestions",
   description:
-    "Surface candidate pairs of entities likely to be duplicates. Read-only — never auto-merges. Combines embedding similarity, shared-neighbor overlap, and name-token Jaccard. Same-type only. Use to triage entity-explosion before running graph_merge (when that exists) or graph_relate with ALIAS_OF.",
+    "Surface candidate pairs of entities likely to be duplicates. Read-only — never auto-merges. Combines embedding similarity, shared-neighbor overlap, and name-token Jaccard. Same-type only. Use to triage entity-explosion before running graph_merge (destructive consolidation) or graph_relate with ALIAS_OF (soft alias).",
   inputSchema: {
     entity_id: z.string().optional().describe("Scope to one entity's potential duplicates"),
     entity_type: z.string().optional().describe("Scope to one entity type (Person, Project, etc.)"),

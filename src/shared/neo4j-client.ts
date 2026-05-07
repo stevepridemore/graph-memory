@@ -1285,6 +1285,223 @@ export class Neo4jClient {
     };
   }
 
+  // ─── Merge (inverse of unmerge) ───
+  //
+  // Consolidates source into target: moves source's edges to target (deduplicating
+  // same-type edges to the same neighbor by max-weight), adopts source's properties
+  // for keys target doesn't have, deletes source. Edges directly between source and
+  // target (which would become self-loops) are dropped. Embedding on target is
+  // cleared so backfillEmbeddings() will re-derive it from the merged state.
+  //
+  // Pairs with unmerge() — they are inverses by intent. unmerge does not depend on
+  // any state left behind by merge (no on-graph "merge_history" breadcrumbs); the
+  // logs/merge-audit.jsonl trail is the only record of what happened.
+
+  async merge(
+    tenantId: string,
+    sourceId: string,
+    targetId: string,
+    options: { dryRun?: boolean } = {},
+  ): Promise<{
+    source: { id: string; name: string; deleted: boolean };
+    target: { id: string; name: string };
+    edges_added: number;
+    edges_consolidated: number;
+    self_loops_dropped: number;
+    properties_adopted: string[];
+    dry_run: boolean;
+  }> {
+    if (sourceId === targetId) {
+      throw new Error("Cannot merge an entity with itself");
+    }
+
+    // Verify both entities exist within the tenant
+    const srcRows = await this.run(
+      `MATCH (n:Entity {tenant_id: $tenantId, id: $sourceId}) RETURN n.name AS name, properties(n) AS props`,
+      { tenantId, sourceId },
+    );
+    if (srcRows.length === 0) {
+      throw new Error(`Source entity ${sourceId} not found in tenant ${tenantId}`);
+    }
+    const tgtRows = await this.run(
+      `MATCH (n:Entity {tenant_id: $tenantId, id: $targetId}) RETURN n.name AS name, properties(n) AS props`,
+      { tenantId, targetId },
+    );
+    if (tgtRows.length === 0) {
+      throw new Error(`Target entity ${targetId} not found in tenant ${tenantId}`);
+    }
+
+    const sourceName = String(srcRows[0]?.["name"] ?? sourceId);
+    const targetName = String(tgtRows[0]?.["name"] ?? targetId);
+
+    // Dry-run: count what would change without mutating
+    if (options.dryRun) {
+      const outgoing = await this.run(
+        `MATCH (s:Entity {tenant_id: $tenantId, id: $sourceId})-[r]->(o:Entity {tenant_id: $tenantId})
+         WHERE o.id <> $targetId
+         RETURN count(r) AS n`,
+        { tenantId, sourceId, targetId },
+      );
+      const incoming = await this.run(
+        `MATCH (o:Entity {tenant_id: $tenantId})-[r]->(s:Entity {tenant_id: $tenantId, id: $sourceId})
+         WHERE o.id <> $targetId
+         RETURN count(r) AS n`,
+        { tenantId, sourceId, targetId },
+      );
+      const selfLoops = await this.run(
+        `MATCH (s:Entity {tenant_id: $tenantId, id: $sourceId})-[r]-(t:Entity {tenant_id: $tenantId, id: $targetId})
+         RETURN count(r) AS n`,
+        { tenantId, sourceId, targetId },
+      );
+      const totalEdges = Number(outgoing[0]?.["n"] ?? 0) + Number(incoming[0]?.["n"] ?? 0);
+      return {
+        source: { id: sourceId, name: sourceName, deleted: false },
+        target: { id: targetId, name: targetName },
+        edges_added: totalEdges,           // upper bound — actual split between added vs consolidated requires execution
+        edges_consolidated: 0,
+        self_loops_dropped: Number(selfLoops[0]?.["n"] ?? 0),
+        properties_adopted: [],
+        dry_run: true,
+      };
+    }
+
+    // Drop direct edges between source and target — they would become self-loops on target
+    const selfLoopCountRows = await this.run(
+      `MATCH (s:Entity {tenant_id: $tenantId, id: $sourceId})-[r]-(t:Entity {tenant_id: $tenantId, id: $targetId})
+       RETURN count(r) AS n`,
+      { tenantId, sourceId, targetId },
+    );
+    const selfLoopsDropped = Number(selfLoopCountRows[0]?.["n"] ?? 0);
+    if (selfLoopsDropped > 0) {
+      await this.run(
+        `MATCH (s:Entity {tenant_id: $tenantId, id: $sourceId})-[r]-(t:Entity {tenant_id: $tenantId, id: $targetId})
+         DELETE r`,
+        { tenantId, sourceId, targetId },
+      );
+    }
+
+    let edgesAdded = 0;
+    let edgesConsolidated = 0;
+
+    // Move outgoing edges (source -> other) to (target -> other)
+    const outgoing = await this.run(
+      `MATCH (s:Entity {tenant_id: $tenantId, id: $sourceId})-[r]->(o:Entity {tenant_id: $tenantId})
+       RETURN type(r) AS rel, o.id AS otherId, properties(r) AS props`,
+      { tenantId, sourceId },
+    );
+    for (const row of outgoing) {
+      const rel = String(row["rel"]);
+      const otherId = String(row["otherId"]);
+      const props = (row["props"] as Record<string, unknown>) ?? {};
+      const existing = await this.run(
+        `MATCH (t:Entity {tenant_id: $tenantId, id: $targetId})-[r:\`${rel}\`]->(o:Entity {tenant_id: $tenantId, id: $otherId})
+         RETURN r.weight AS weight LIMIT 1`,
+        { tenantId, targetId, otherId },
+      );
+      if (existing.length > 0) {
+        const newWeight = Math.max(Number(existing[0]?.["weight"] ?? 0), Number(props["weight"] ?? 0));
+        await this.run(
+          `MATCH (t:Entity {tenant_id: $tenantId, id: $targetId})-[r:\`${rel}\`]->(o:Entity {tenant_id: $tenantId, id: $otherId})
+           SET r.weight = $newWeight, r.last_seen = datetime()`,
+          { tenantId, targetId, otherId, newWeight },
+        );
+        edgesConsolidated++;
+      } else {
+        await this.run(
+          `MATCH (t:Entity {tenant_id: $tenantId, id: $targetId}), (o:Entity {tenant_id: $tenantId, id: $otherId})
+           CREATE (t)-[newR:\`${rel}\`]->(o)
+           SET newR = $props`,
+          { tenantId, targetId, otherId, props },
+        );
+        edgesAdded++;
+      }
+    }
+
+    // Move incoming edges (other -> source) to (other -> target)
+    const incoming = await this.run(
+      `MATCH (o:Entity {tenant_id: $tenantId})-[r]->(s:Entity {tenant_id: $tenantId, id: $sourceId})
+       RETURN type(r) AS rel, o.id AS otherId, properties(r) AS props`,
+      { tenantId, sourceId },
+    );
+    for (const row of incoming) {
+      const rel = String(row["rel"]);
+      const otherId = String(row["otherId"]);
+      const props = (row["props"] as Record<string, unknown>) ?? {};
+      const existing = await this.run(
+        `MATCH (o:Entity {tenant_id: $tenantId, id: $otherId})-[r:\`${rel}\`]->(t:Entity {tenant_id: $tenantId, id: $targetId})
+         RETURN r.weight AS weight LIMIT 1`,
+        { tenantId, targetId, otherId },
+      );
+      if (existing.length > 0) {
+        const newWeight = Math.max(Number(existing[0]?.["weight"] ?? 0), Number(props["weight"] ?? 0));
+        await this.run(
+          `MATCH (o:Entity {tenant_id: $tenantId, id: $otherId})-[r:\`${rel}\`]->(t:Entity {tenant_id: $tenantId, id: $targetId})
+           SET r.weight = $newWeight, r.last_seen = datetime()`,
+          { tenantId, targetId, otherId, newWeight },
+        );
+        edgesConsolidated++;
+      } else {
+        await this.run(
+          `MATCH (o:Entity {tenant_id: $tenantId, id: $otherId}), (t:Entity {tenant_id: $tenantId, id: $targetId})
+           CREATE (o)-[newR:\`${rel}\`]->(t)
+           SET newR = $props`,
+          { tenantId, targetId, otherId, props },
+        );
+        edgesAdded++;
+      }
+    }
+
+    // Adopt source's properties for keys target doesn't have. Reserved keys
+    // (identity, embedding, lifecycle counters) are never copied.
+    const RESERVED = new Set([
+      "id", "tenant_id", "name", "embedding",
+      "first_seen", "last_seen", "times_mentioned", "confidence",
+    ]);
+    const srcProps = (srcRows[0]?.["props"] as Record<string, unknown>) ?? {};
+    const tgtProps = (tgtRows[0]?.["props"] as Record<string, unknown>) ?? {};
+    const adopted: string[] = [];
+    const patch: Record<string, unknown> = {};
+    for (const [k, v] of Object.entries(srcProps)) {
+      if (RESERVED.has(k)) continue;
+      const existing = tgtProps[k];
+      if (existing === undefined || existing === null) {
+        patch[k] = v;
+        adopted.push(k);
+      }
+    }
+
+    // Update target: adopt patched properties, take max times_mentioned, refresh
+    // last_seen, clear embedding so backfill regenerates from the merged state.
+    const newTimesMentioned = Math.max(
+      Number(srcProps["times_mentioned"] ?? 0),
+      Number(tgtProps["times_mentioned"] ?? 0),
+    );
+    await this.run(
+      `MATCH (t:Entity {tenant_id: $tenantId, id: $targetId})
+       SET t += $patch,
+           t.times_mentioned = $newTimesMentioned,
+           t.last_seen = datetime(),
+           t.embedding = null`,
+      { tenantId, targetId, patch, newTimesMentioned },
+    );
+
+    // Delete source (DETACH catches any edges that slipped through)
+    await this.run(
+      `MATCH (s:Entity {tenant_id: $tenantId, id: $sourceId}) DETACH DELETE s`,
+      { tenantId, sourceId },
+    );
+
+    return {
+      source: { id: sourceId, name: sourceName, deleted: true },
+      target: { id: targetId, name: targetName },
+      edges_added: edgesAdded,
+      edges_consolidated: edgesConsolidated,
+      self_loops_dropped: selfLoopsDropped,
+      properties_adopted: adopted,
+      dry_run: false,
+    };
+  }
+
   // ─── Export ───
 
   async exportGraph(tenantId: string): Promise<{
