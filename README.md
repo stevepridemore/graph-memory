@@ -1,6 +1,6 @@
 # Graph Memory
 
-[![graph-memory MCP server](https://glama.ai/mcp/servers/stevepridemore/graph-memory/badges/score.svg)](https://glama.ai/mcp/servers/stevepridemore/graph-memory)
+[![graph-memory MCP server](https://glama.ai/mcp/servers/stevepridemore/graph-memory/badges/score.svg?v=2)](https://glama.ai/mcp/servers/stevepridemore/graph-memory)
 
 A personal knowledge graph for Claude that survives across sessions, devices, and tools. Built on Neo4j with semantic embeddings, OAuth-secured for use from Claude Code, Claude Desktop, and claude.ai web — all hitting the same graph.
 
