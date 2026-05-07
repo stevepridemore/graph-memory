@@ -645,6 +645,59 @@ server.registerTool("graph_unmerge", {
   }
 });
 
+// ─── Tool: graph_merge_suggestions ───
+
+server.registerTool("graph_merge_suggestions", {
+  title: "Graph Merge Suggestions",
+  description:
+    "Surface candidate pairs of entities likely to be duplicates. Read-only — never auto-merges. Combines embedding similarity, shared-neighbor overlap, and name-token Jaccard. Same-type only. Use to triage entity-explosion before running graph_merge (when that exists) or graph_relate with ALIAS_OF.",
+  inputSchema: {
+    entity_id: z.string().optional().describe("Scope to one entity's potential duplicates"),
+    entity_type: z.string().optional().describe("Scope to one entity type (Person, Project, etc.)"),
+    min_score: z.number().optional().describe("Combined-score threshold to surface (default 0.7)"),
+    min_embedding_similarity: z.number().optional().describe("Embedding-similarity floor for candidates (default 0.85)"),
+    limit: z.number().optional().describe("Max suggestions to return (default 20, max 100)"),
+    weights: z.object({
+      embedding: z.number().optional(),
+      neighbor_jaccard: z.number().optional(),
+      name: z.number().optional(),
+    }).optional().describe("Override default weights (0.4 / 0.4 / 0.2)"),
+    log_to_audit: z.boolean().optional().describe("Emit merge_flagged audit events for surfaced pairs (default true)"),
+  },
+  annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true },
+}, async (args) => {
+  try {
+    const tenantId = currentTenant();
+    const result = await client.mergeSuggestions(tenantId, {
+      entity_id: args.entity_id,
+      entity_type: args.entity_type as EntityType | undefined,
+      min_score: args.min_score,
+      min_embedding_similarity: args.min_embedding_similarity,
+      limit: args.limit,
+      weights: args.weights,
+    });
+
+    if (args.log_to_audit !== false) {
+      for (const s of result.suggestions) {
+        try {
+          appendAuditEvent({
+            event: "merge_flagged",
+            timestamp: new Date().toISOString(),
+            tenant_id: tenantId,
+            entity_a: s.entity_a.id,
+            entity_b: s.entity_b.id,
+            reason: `score=${s.score} (emb=${s.signals.embedding_similarity}, neighbor_jaccard=${s.signals.neighbor_jaccard}, name=${s.signals.name_similarity})`,
+          });
+        } catch { /* audit is best-effort */ }
+      }
+    }
+
+    return toolResult(result);
+  } catch (err) {
+    return toolError(`graph_merge_suggestions failed: ${err instanceof Error ? err.message : String(err)}`);
+  }
+});
+
 // ─── Tool: graph_stats ───
 
 server.registerTool("graph_stats", {
