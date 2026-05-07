@@ -1,0 +1,37 @@
+# Dockerfile.glama — introspection-only build for the Glama registry.
+#
+# graph-memory's real deployment is two containers (this server + Neo4j) wired
+# via docker-compose. Glama's sandbox runs ONE container and talks to it over
+# stdio, so this image is a thin variant that boots stdio mode without a DB.
+#
+# tools/list is a static enumeration of registered tools (no DB hit), and the
+# server's Neo4j connect failure is caught at startup, so introspection works
+# fine without a graph backend. Actual tool calls would fail here — that's
+# expected; Glama scores tool schemas, it does not invoke them.
+#
+# This image is NOT the supported way to run graph-memory. Use the root
+# Dockerfile + docker-compose.yml for real deployments.
+
+FROM node:22-bookworm-slim
+
+WORKDIR /app
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY package*.json ./
+RUN npm ci --omit=dev && npm cache clean --force
+
+COPY dist/ ./dist/
+COPY schema/ ./schema/
+
+ENV MCP_TRANSPORT=stdio
+# NEO4J_URI must parse as a valid bolt URL so the driver's constructor doesn't
+# throw at import time. The address is unreachable, which is fine — the actual
+# verifyConnectivity() call is wrapped in a try/catch and tools/list does not
+# require a DB connection.
+ENV NEO4J_URI=bolt://localhost:7687
+ENV NEO4J_PASSWORD=glama-introspection-only
+
+CMD ["node", "dist/mcp-server/index.js"]
