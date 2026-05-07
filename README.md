@@ -2,6 +2,10 @@
 
 A personal knowledge graph for Claude that survives across sessions, devices, and tools. Built on Neo4j with semantic embeddings, OAuth-secured for use from Claude Code, Claude Desktop, and claude.ai web — all hitting the same graph.
 
+https://github.com/user-attachments/assets/826e5f5a-5759-4b31-83dd-6bd7e0e044b8
+
+*Asked from my phone. Pulls a decision made days ago on my laptop, citing the commit hash.*
+
 > **No external API keys, no LLM provider integration, no per-token costs.** Entity extraction runs inside your Claude sessions (Max plan). Embedding runs locally via [bge-small-en](https://huggingface.co/BAAI/bge-small-en-v1.5). Everything stays on your hardware unless you choose to expose it.
 
 ## Why a graph
