@@ -3,11 +3,24 @@ import { randomUUID } from "node:crypto";
 import { Neo4jClient } from "./neo4j-client.js";
 
 // Integration tests — require a running Neo4j instance.
-//   Locally:   spin up a throwaway Neo4j on a non-production port and point
-//              NEO4J_URI / NEO4J_PASSWORD at it (see docs/BACKUP.md or
-//              docker run with -p 7689:7687 for a clean rig).
-//   In CI:     a Neo4j 5.20 service container exposes bolt://localhost:7687
-//              with NEO4J_AUTH=neo4j/test1234 (see .github/workflows/ci.yml).
+//
+//   Locally (verified working procedure):
+//     1. docker run -d --name graph-memory-test-neo4j --rm -p 7689:7687 \
+//          -e NEO4J_AUTH=neo4j/test1234 -e NEO4J_PLUGINS='["apoc"]' \
+//          neo4j:5.20-community
+//     2. Wait ~10s for the container to accept connections (the bolt port
+//        comes up before auth is initialized; on Windows give it a bit longer).
+//     3. NEO4J_URI=bolt://localhost:7689 NEO4J_USER=neo4j \
+//          NEO4J_PASSWORD=test1234 npx vitest run
+//     4. docker stop graph-memory-test-neo4j   # --rm cleans the container
+//
+//     Port 7689 (not 7687) keeps the throwaway off your live deployment's
+//     port. Vitest does NOT load .env, so the env vars must be set on the
+//     command line — see docs/TESTING.md for the rationale and a Windows
+//     PowerShell variant.
+//
+//   In CI: a Neo4j 5.20 service container exposes bolt://localhost:7687
+//     with NEO4J_AUTH=neo4j/test1234 (see .github/workflows/ci.yml).
 //
 // **Data safety**: every test run gets its own UUID-suffixed tenant id; we
 // only ever delete data tagged with that tenant. Even if NEO4J_URI happens

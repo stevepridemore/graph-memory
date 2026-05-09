@@ -25,6 +25,7 @@ import {
 } from "../shared/auth.js";
 import {
   registerClient,
+  RegistrationLimitError,
   getClient,
   issueAuthCode,
   consumeAuthCode,
@@ -36,6 +37,7 @@ import {
   protectedResourceMetadata,
   getJwksJson,
   getIssuer,
+  revokeToken,
 } from "../shared/oauth.js";
 
 // ─── Tenant request context ──────────────────────────────────────────────────
@@ -1730,6 +1732,12 @@ if (MCP_TRANSPORT === "http") {
           });
           return jsonResp(res, 201, client);
         } catch (err) {
+          if (err instanceof RegistrationLimitError) {
+            return jsonResp(res, 429, {
+              error: "too_many_requests",
+              error_description: err.message,
+            });
+          }
           return jsonResp(res, 400, {
             error: "invalid_client_metadata",
             error_description: err instanceof Error ? err.message : String(err),
@@ -1862,6 +1870,9 @@ if (MCP_TRANSPORT === "http") {
           if (claims.client_id !== clientId) {
             return jsonResp(res, 400, { error: "invalid_grant", error_description: "client_id mismatch" });
           }
+          if (!getClient(clientId)) {
+            return jsonResp(res, 400, { error: "invalid_grant", error_description: "client_no_longer_registered" });
+          }
           const access = await issueAccessToken({ email: claims.email, client_id: clientId, scope: claims.scope });
           return jsonResp(res, 200, {
             access_token: access,
@@ -1872,6 +1883,20 @@ if (MCP_TRANSPORT === "http") {
         }
 
         return jsonResp(res, 400, { error: "unsupported_grant_type", error_description: `grant_type=${grantType} not supported` });
+      }
+
+      // ── Revocation endpoint (RFC 7009) ──
+      if (url.pathname === "/oauth/revoke") {
+        if (req.method !== "POST") {
+          return jsonResp(res, 405, { error: "method_not_allowed" }, { Allow: "POST" });
+        }
+        const body = await readBody(req);
+        const token = String(body.token ?? "");
+        // Per RFC 7009 §2.2: always respond 200, even for unknown/invalid tokens.
+        if (token) await revokeToken(token);
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end("{}");
+        return;
       }
 
       jsonResp(res, 404, { error: "not_found" });
@@ -1904,6 +1929,7 @@ if (MCP_TRANSPORT === "http") {
       url.pathname === "/oauth/authorize" ||
       url.pathname === "/oauth/token" ||
       url.pathname === "/oauth/register" ||
+      url.pathname === "/oauth/revoke" ||
       url.pathname === "/oauth/jwks"
     ) {
       await handleOAuthRoute(req, res, url);

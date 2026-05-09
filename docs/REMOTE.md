@@ -252,6 +252,43 @@ mounted data volume. If you rotate them, every existing claude.ai bearer
 token becomes invalid and clients have to re-authorize. To rotate, delete
 both files and restart; new keys are generated and the JWKS kid changes.
 
+## Dynamic client registration security
+
+### redirect_uri hostname allowlist
+
+`POST /oauth/register` validates each `redirect_uri` against a hostname allowlist. Only URIs whose hostname matches the allowlist are accepted; everything else returns `400 invalid_client_metadata`. This prevents the OAuth phishing chain where an attacker registers `https://attacker.example/cb`, tricks the operator into visiting a crafted `/oauth/authorize` URL on the legitimate hostname, and receives the auth code.
+
+The default allowlist covers the known legitimate connectors:
+
+| Pattern | Matches |
+|---|---|
+| `claude.ai` | Exact hostname |
+| `*.claude.ai` | One-level subdomains, e.g. `connector.claude.ai` |
+| `claude.com` | Exact hostname |
+| `*.claude.com` | One-level subdomains |
+| `localhost` | Local dev (`http://localhost`) |
+| `127.0.0.1` | Local dev (`http://127.0.0.1`) |
+
+To extend the allowlist (e.g. to add an internal connector), set the `OAUTH_REDIRECT_URI_HOSTS` env var to a comma-separated list of exact hostnames and/or `*.domain` patterns in `.env`:
+
+```env
+OAUTH_REDIRECT_URI_HOSTS=claude.ai,*.claude.ai,claude.com,*.claude.com,localhost,127.0.0.1,connector.internal.example
+```
+
+When `OAUTH_REDIRECT_URI_HOSTS` is unset the production defaults above apply.
+
+### Client registration cap
+
+To limit denial-of-service via unbounded client registrations, the server rejects `POST /oauth/register` with `429 too_many_requests` once the number of registered clients reaches `OAUTH_MAX_CLIENTS` (default 100). Raise this if you have many legitimate users:
+
+```env
+OAUTH_MAX_CLIENTS=500
+```
+
+### Edge-layer rate limiting (recommended)
+
+As a second layer of defence, configure a rate rule on `POST /oauth/register` at the Cloudflare edge: **Zero Trust → WAF → Rate limiting rules**, for example 10 requests per minute per IP. This limits attacker throughput before requests reach the server.
+
 ## Deployment values to record
 
 When you stand up your own instance, keep a private note of these values — useful for re-creating Cloudflare Access policies, debugging tunnel issues, or restoring from backup:

@@ -26,7 +26,7 @@ import {
 // jose v6 dropped the KeyLike alias. importPKCS8/importSPKI return CryptoKey;
 // we use that type directly.
 type SigningKey = CryptoKey;
-import { readFileSync, writeFileSync, mkdirSync, existsSync } from "node:fs";
+import { readFileSync, writeFileSync, chmodSync, mkdirSync, existsSync } from "node:fs";
 import { join } from "node:path";
 import { randomBytes, createHash } from "node:crypto";
 import { GRAPH_MEMORY_HOME } from "./config.js";
@@ -37,9 +37,10 @@ const OAUTH_DIR = join(GRAPH_MEMORY_HOME, "oauth");
 const PRIVATE_KEY_PATH = join(OAUTH_DIR, "private.pem");
 const PUBLIC_KEY_PATH = join(OAUTH_DIR, "public.pem");
 const CLIENTS_PATH = join(OAUTH_DIR, "clients.json");
+const REVOKED_PATH = join(OAUTH_DIR, "revoked.json");
 
 const ACCESS_TOKEN_TTL_SECONDS = 3600;        // 1 hour
-const REFRESH_TOKEN_TTL_SECONDS = 60 * 60 * 24 * 90; // 90 days
+const REFRESH_TOKEN_TTL_SECONDS = 60 * 60 * 24 * 30; // 30 days
 const AUTH_CODE_TTL_SECONDS = 600;            // 10 minutes
 const ALG = "RS256";
 
@@ -125,11 +126,111 @@ function loadClients(): ClientStore {
 
 function saveClients(store: ClientStore): void {
   mkdirSync(OAUTH_DIR, { recursive: true });
-  writeFileSync(CLIENTS_PATH, JSON.stringify(store, null, 2));
+  writeFileSync(CLIENTS_PATH, JSON.stringify(store, null, 2), { mode: 0o600 });
+  // Best-effort chmod to upgrade permissions on existing files (no-op on Windows).
+  try { chmodSync(CLIENTS_PATH, 0o600); } catch { /* ignore */ }
 }
 
 export function getClient(clientId: string): RegisteredClient | null {
   return loadClients().clients[clientId] ?? null;
+}
+
+// ─── Revocation deny-list (RFC 7009) ─────────────────────────────────────────
+
+interface RevokedEntry {
+  revoked_at: string; // ISO
+  exp: number;        // original token expiry (epoch seconds) — for pruning
+}
+
+interface RevokedStore {
+  revoked: Record<string, RevokedEntry>;
+}
+
+function loadRevoked(): RevokedStore {
+  let store: RevokedStore;
+  try {
+    store = JSON.parse(readFileSync(REVOKED_PATH, "utf-8")) as RevokedStore;
+  } catch {
+    store = { revoked: {} };
+  }
+  // Prune entries whose token has already expired naturally.
+  const now = Date.now() / 1000;
+  let changed = false;
+  for (const jti of Object.keys(store.revoked)) {
+    if (store.revoked[jti].exp < now) {
+      delete store.revoked[jti];
+      changed = true;
+    }
+  }
+  if (changed) saveRevoked(store);
+  return store;
+}
+
+function saveRevoked(store: RevokedStore): void {
+  mkdirSync(OAUTH_DIR, { recursive: true });
+  writeFileSync(REVOKED_PATH, JSON.stringify(store, null, 2));
+}
+
+export function isRevoked(jti: string): boolean {
+  const store = loadRevoked();
+  return jti in store.revoked;
+}
+
+export function addRevocation(jti: string, exp: number): void {
+  const store = loadRevoked();
+  store.revoked[jti] = { revoked_at: new Date().toISOString(), exp };
+  saveRevoked(store);
+}
+
+// ─── Registration limit error ────────────────────────────────────────────────
+
+export class RegistrationLimitError extends Error {
+  constructor(limit: number) {
+    super(`registration limit reached (max ${limit} clients)`);
+    this.name = "RegistrationLimitError";
+  }
+}
+
+// ─── redirect_uri hostname allowlist ─────────────────────────────────────────
+//
+// Only redirect URIs whose hostname belongs to an allowlisted domain are
+// accepted at registration time. This closes the OAuth phishing chain where an
+// attacker registers https://attacker.example/cb, sends the operator a crafted
+// /oauth/authorize URL on the legitimate hostname, CF Access lets the operator
+// through, and the server 302s the auth code to the attacker.
+//
+// The allowlist is driven by OAUTH_REDIRECT_URI_HOSTS (comma-separated exact
+// hostnames and/or "*.domain" one-level-subdomain patterns). When unset it
+// defaults to the production-safe list below.
+//
+// Wildcard matching is intentionally strict: "*.claude.ai" matches
+// "connector.claude.ai" but NOT "evil.claude.ai.attacker.example" — we split
+// on "." and only accept a single label prepended to the exact base domain.
+
+const DEFAULT_REDIRECT_URI_HOSTS = "claude.ai,*.claude.ai,claude.com,*.claude.com,localhost,127.0.0.1";
+
+function getRedirectUriAllowlist(): string[] {
+  const raw = process.env.OAUTH_REDIRECT_URI_HOSTS ?? DEFAULT_REDIRECT_URI_HOSTS;
+  return raw.split(",").map(h => h.trim()).filter(Boolean);
+}
+
+export function isRedirectUriHostAllowed(hostname: string, allowlist?: string[]): boolean {
+  const list = allowlist ?? getRedirectUriAllowlist();
+  for (const pattern of list) {
+    if (pattern.startsWith("*.")) {
+      // One-level subdomain: pattern "*.claude.ai" matches "connector.claude.ai"
+      // but not "a.b.claude.ai" or "claude.ai" itself.
+      const base = pattern.slice(2); // e.g. "claude.ai"
+      // hostname must be exactly <single-label>.<base> — no extra dots allowed.
+      if (hostname.endsWith("." + base)) {
+        const prefix = hostname.slice(0, hostname.length - base.length - 1);
+        if (prefix.length > 0 && !prefix.includes(".")) return true;
+      }
+    } else {
+      if (hostname === pattern) return true;
+    }
+  }
+  return false;
 }
 
 export function registerClient(input: {
@@ -149,10 +250,21 @@ export function registerClient(input: {
       if (u.protocol !== "https:" && !(u.protocol === "http:" && (u.hostname === "localhost" || u.hostname === "127.0.0.1"))) {
         throw new Error(`redirect_uri must use https (or http://localhost): ${uri}`);
       }
+      // Hostname allowlist check — reject anything not in the approved list.
+      if (!isRedirectUriHostAllowed(u.hostname)) {
+        throw new Error(`redirect_uri hostname not allowed: ${u.hostname}`);
+      }
     } catch (err) {
       if (err instanceof Error && err.message.startsWith("redirect_uri must")) throw err;
+      if (err instanceof Error && err.message.startsWith("redirect_uri hostname")) throw err;
       throw new Error(`redirect_uri is not a valid URL: ${uri}`);
     }
+  }
+
+  const maxClients = parseInt(process.env.OAUTH_MAX_CLIENTS ?? "100", 10);
+  const store = loadClients();
+  if (Object.keys(store.clients).length >= maxClients) {
+    throw new RegistrationLimitError(maxClients);
   }
 
   const authMethod = input.token_endpoint_auth_method ?? "none";
@@ -167,7 +279,6 @@ export function registerClient(input: {
     registered_at: new Date().toISOString(),
   };
 
-  const store = loadClients();
   store.clients[client.client_id] = client;
   saveClients(store);
   return client;
@@ -250,6 +361,7 @@ export async function issueAccessToken(input: {
     type: "access",
   })
     .setProtectedHeader({ alg: ALG, kid: String(publicJwk.kid), typ: "JWT" })
+    .setJti(randomBytes(16).toString("hex"))
     .setIssuer(getIssuer())
     .setSubject(input.email)
     .setAudience(getIssuer())
@@ -271,6 +383,7 @@ export async function issueRefreshToken(input: {
     type: "refresh",
   })
     .setProtectedHeader({ alg: ALG, kid: String(publicJwk.kid), typ: "JWT" })
+    .setJti(randomBytes(16).toString("hex"))
     .setIssuer(getIssuer())
     .setSubject(input.email)
     .setAudience(getIssuer())
@@ -289,6 +402,9 @@ export async function verifyAccessToken(token: string): Promise<AccessTokenClaim
   if (payload.type !== "access") {
     throw new Error(`expected access token, got type=${payload.type}`);
   }
+  if (payload.jti && isRevoked(payload.jti)) {
+    throw new Error("token revoked");
+  }
   return payload as AccessTokenClaims;
 }
 
@@ -302,7 +418,31 @@ export async function verifyRefreshToken(token: string): Promise<AccessTokenClai
   if (payload.type !== "refresh") {
     throw new Error(`expected refresh token, got type=${payload.type}`);
   }
+  if (payload.jti && isRevoked(payload.jti)) {
+    throw new Error("token revoked");
+  }
   return payload as AccessTokenClaims;
+}
+
+/** Revoke a token (access or refresh) per RFC 7009.
+ *  Returns true if the token was valid and revoked, false if unknown/already expired.
+ *  Per RFC 7009 callers should return 200 regardless. */
+export async function revokeToken(token: string): Promise<boolean> {
+  const { publicKey } = await loadOrGenerateKeys();
+  const issuer = getIssuer();
+  let payload: JWTPayload;
+  try {
+    ({ payload } = await jwtVerify(token, publicKey, { issuer, audience: issuer }));
+  } catch {
+    // Unknown, expired, or already revoked — RFC 7009 §2.2: respond 200 anyway.
+    return false;
+  }
+  const jti = payload.jti;
+  if (!jti) return false; // pre-jti token — grace period: can't revoke, not in deny-list
+  if (isRevoked(jti)) return false; // already revoked
+  const exp = typeof payload.exp === "number" ? payload.exp : 0;
+  addRevocation(jti, exp);
+  return true;
 }
 
 // ─── PKCE verification ───────────────────────────────────────────────────────
@@ -325,6 +465,7 @@ export function authorizationServerMetadata(issuer = getIssuer()) {
     issuer,
     authorization_endpoint: `${issuer}/oauth/authorize`,
     token_endpoint: `${issuer}/oauth/token`,
+    revocation_endpoint: `${issuer}/oauth/revoke`,
     registration_endpoint: `${issuer}/oauth/register`,
     jwks_uri: `${issuer}/oauth/jwks`,
     response_types_supported: ["code"],

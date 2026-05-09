@@ -77,6 +77,14 @@ services:
       # OAuth 2.1 issuer — the public origin used in token iss/aud claims and
       # in OAuth metadata URLs. Should match the user-visible URL.
       - OAUTH_ISSUER=${OAUTH_ISSUER:-https://localhost:3847}
+      # redirect_uri hostname allowlist — comma-separated exact hostnames and/or
+      # "*.domain" one-level-subdomain patterns. Defaults to the production list
+      # (claude.ai, *.claude.ai, claude.com, *.claude.com, localhost, 127.0.0.1).
+      # Set this to restrict registration to a smaller set of origins.
+      - OAUTH_REDIRECT_URI_HOSTS=${OAUTH_REDIRECT_URI_HOSTS:-}
+      # Maximum number of registered OAuth clients. Default 100. Once reached,
+      # POST /oauth/register returns 429. Raise if you have many legitimate users.
+      - OAUTH_MAX_CLIENTS=${OAUTH_MAX_CLIENTS:-100}
     volumes:
       - ${GRAPH_MEMORY_HOME}:/root/graph-memory
       # Read-only mount of Claude Code project transcripts so the dream process

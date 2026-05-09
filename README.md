@@ -205,6 +205,7 @@ Currently steady-state. Active development is opportunistic; the system runs una
 - [`docs/SKILLS.md`](docs/SKILLS.md) — slash command definitions
 - [`docs/REMOTE.md`](docs/REMOTE.md) — exposing graph-memory via Cloudflare Tunnel + Access
 - [`docs/MULTI_TENANT.md`](docs/MULTI_TENANT.md) — tenant isolation model
+- [`docs/TESTING.md`](docs/TESTING.md) — running the test suite locally and in CI
 - [`CLAUDE.md`](CLAUDE.md) — retrieval and chat-write guidelines for Claude
 
 ## License
