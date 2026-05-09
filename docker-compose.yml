@@ -50,6 +50,10 @@ services:
     env_file:
       - .env
     environment:
+      # Override the env_file value so the container's data root is the Linux
+      # mount path, not the host path that .env carries for volume substitution.
+      # config.ts reads GRAPH_MEMORY_HOME from env (fallback: homedir/graph-memory).
+      - GRAPH_MEMORY_HOME=/root/graph-memory
       - TLS_CERT=/root/graph-memory/certs/server.crt
       - TLS_KEY=/root/graph-memory/certs/server.key
       # Multi-tenant identity. BOOTSTRAP_TENANT_ID is the existing single-user
