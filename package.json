@@ -9,6 +9,9 @@
     "dev": "tsc --watch",
     "test": "vitest run",
     "test:watch": "vitest",
+    "test:coverage": "vitest run --coverage",
+    "test:local": "bash scripts/test-with-neo4j.sh",
+    "test:coverage:local": "bash scripts/test-with-neo4j.sh --coverage",
     "start": "node dist/mcp-server/index.js",
     "schema:init": "node dist/shared/schema-init.js"
   },
@@ -31,6 +34,7 @@
   },
   "devDependencies": {
     "@types/node": "^25.5.2",
+    "@vitest/coverage-v8": "^4.1.5",
     "typescript": "^6.0.2",
     "vitest": "^4.1.3"
   }

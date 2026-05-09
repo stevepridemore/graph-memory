@@ -1,13 +1,15 @@
 # Testing
 
-Two test suites live in `src/`:
+Test suites live in `src/`:
 
 | File | What it covers | Needs Neo4j? |
 |---|---|---|
-| `src/shared/oauth.test.ts` | Pure-logic unit tests for OAuth provider — token issuance/verification, revocation deny-list, redirect_uri host allowlist, registration cap | No |
+| `src/shared/oauth.test.ts` | Pure-logic unit tests for OAuth provider — token issuance/verification, revocation deny-list, redirect_uri host allowlist, registration cap, PKCE, email allowlist, public-clients-only enforcement | No |
+| `src/shared/oauth-events.test.ts` | Structured-event log shape, IP-extraction precedence chain, throw-resilience | No |
+| `src/mcp-server/read-body.test.ts` | Body-size cap (64 KB OAuth / 4 MB MCP), fast reject via `Content-Length`, streaming reject | No |
 | `src/shared/neo4j-client.test.ts` | Integration tests for the Neo4j client — schema init, multi-tenant data ops, decay/bi-temporal/contradiction queries, `graph_merge`/`graph_unmerge` | **Yes** |
 
-Total: 81 tests when both suites run end-to-end.
+The full suite runs in ~10 seconds end-to-end against a fresh Neo4j. Test counts grow as new functionality lands; check the run output for the current totals.
 
 ## Running OAuth-only tests
 
@@ -67,7 +69,7 @@ Remove-Item Env:\NEO4J_URI, Env:\NEO4J_USER, Env:\NEO4J_PASSWORD
 docker stop graph-memory-test-neo4j
 ```
 
-Expected output: `Test Files  2 passed (2)` / `Tests  81 passed (81)` in ~10 seconds.
+Expected output: `Test Files  N passed (N)` / `Tests  M passed (M)` with N matching the count of files in the table above and M growing as new tests are added; the full suite finishes in ~10 seconds.
 
 ## Why aren't env vars loaded from `.env` automatically?
 
@@ -103,3 +105,34 @@ The throwaway container is still booting. Neo4j's bolt port comes up before auth
 - Required as a status check on `main` (branch ruleset 16067964).
 
 If a PR fails CI but passes locally, the most common cause is a test that depends on undeclared env or filesystem state — re-run locally with **only** `NEO4J_*` env set (no `.env` sourced, no other graph-memory env) to mirror CI.
+
+## Coverage
+
+Coverage is measured with Vitest's [v8 provider](https://vitest.dev/guide/coverage.html) — no source instrumentation, just native V8 counters.
+
+### Commands
+
+| Command | What it does |
+|---|---|
+| `npm run test:coverage` | Run the full suite with coverage. Requires `NEO4J_*` env to be set (CI uses this). |
+| `npm run test:local` | Spin up throwaway Neo4j, run the full suite, tear down. No coverage output. |
+| `npm run test:coverage:local` | Spin up throwaway Neo4j, run the full suite **with coverage**, tear down. |
+
+`npm run test:coverage:local` is the primary local command — it handles the Docker container dance automatically and prints coverage numbers at the end.
+
+### Reporters
+
+- **text** — console summary table printed at the end of every coverage run; visible in local output and in CI logs.
+- **html** — browseable report written to `coverage/index.html`. Open it in a browser for line-by-line breakdown. The `coverage/` directory is gitignored.
+
+### Local requirements
+
+- Docker must be running. The scripts start a `neo4j:5.20-community` container on port `7689` and tear it down on exit (including Ctrl-C).
+- The wrapper scripts use `bash`. On Windows, `bash` resolves to Git Bash, which ships with Git for Windows and is on PATH in any repo that uses git tooling. If `bash` is not on your PATH, invoke the PowerShell wrapper directly instead:
+  ```powershell
+  pwsh scripts/test-with-neo4j.ps1 --coverage
+  ```
+
+### CI
+
+CI runs `npm run test:coverage` on every push and PR. The `NEO4J_*` env vars are already set on the `Test` job via the service container. Coverage numbers appear in the `Test` job log — no artifact upload, no threshold gate (measure first, decide later).
