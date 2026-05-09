@@ -129,7 +129,7 @@ volumes:
 
 A local MCP server that executes Cypher queries against Neo4j. **No LLM calls — it's a thin wrapper.**
 
-For remote access (claude.ai web, multi-device), the MCP server is exposed via Cloudflare Tunnel at `https://your-host.example/mcp` and implements OAuth 2.1 (RFC 8414, RFC 9728, RFC 7591). See [REMOTE.md](REMOTE.md) for full setup details. The OAuth keypair is generated on first startup and persisted at `~/graph-memory/oauth/{private,public}.pem`.
+For remote access (claude.ai web, multi-device), the MCP server is exposed via Cloudflare Tunnel at `https://your-host.example/mcp` and implements OAuth 2.1 (RFC 8414, RFC 9728, RFC 7591, RFC 7009). See [REMOTE.md](REMOTE.md) for full setup details. The OAuth keypair is generated on first startup and persisted at `~/graph-memory/oauth/{private,public}.pem`.
 
 **Exposed tools (~21 total):**
 

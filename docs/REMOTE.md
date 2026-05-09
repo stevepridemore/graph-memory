@@ -139,11 +139,16 @@ cd <your-graph-memory-clone>
 docker compose up -d
 ```
 
-Verify via the access log:
+Two log files in `~/graph-memory/logs/` cover the production deployment:
+
 ```
-tail -f ~/graph-memory/logs/mcp-access.jsonl
+tail -f ~/graph-memory/logs/mcp-access.jsonl     # one line per /mcp request
+tail -f ~/graph-memory/logs/oauth-events.jsonl   # one line per OAuth event
 ```
-Each browser/MCP request prints one JSON line with `tenant_id`, `method`, `path`, and `identity_source: "cf-access"`.
+
+`mcp-access.jsonl` records `tenant_id`, `method`, `path`, and `identity_source` for every authenticated `/mcp` call.
+
+`oauth-events.jsonl` records every OAuth-relevant event: `register` / `register_fail`, `authorize_ok` / `authorize_fail`, `token_issue` / `token_refresh` / `token_consume_fail` / `token_pkce_fail` / `token_refresh_fail`, `client_deregistered`, `revoke_ok` / `revoke_noop`, and `bearer_verify_fail`. Each carries `client_id`, `email`, `jti`, `redirect_uri_host`, `reason`, and `source_ip` as applicable. Both logs are best-effort and never throw from the request path.
 
 ### Register the connector in claude.ai
 
@@ -183,6 +188,7 @@ Everything else uses bearer tokens that we sign.
 | `/oauth/authorize` | not implemented | gated by CF Access; reads JWT, issues code, redirects |
 | `/oauth/token` | not implemented | public, exchanges code (or refresh) for bearer JWT |
 | `/oauth/jwks` | not implemented | public, serves our public key |
+| `/oauth/revoke` | not implemented | public, RFC 7009 token revocation |
 | `/mcp` | gated by CF Access (cookie or Cf-Access-Jwt-Assertion) | gated by Authorization: Bearer (our JWT) |
 | 401 response | `Cf-Access-Jwt-Assertion` scheme (non-standard) | `Bearer realm="..." resource_metadata="..."` (RFC 9728) |
 
@@ -207,6 +213,7 @@ Create a new policy named **"Public OAuth + MCP endpoints"** with:
   - `/.well-known/jwks.json`
   - `/oauth/register`
   - `/oauth/token`
+  - `/oauth/revoke`
   - `/oauth/jwks`
   - `/mcp`
   - `/health`
@@ -251,6 +258,22 @@ The keys persist across container rebuilds because they live in the
 mounted data volume. If you rotate them, every existing claude.ai bearer
 token becomes invalid and clients have to re-authorize. To rotate, delete
 both files and restart; new keys are generated and the JWKS kid changes.
+
+### Token lifetimes, revocation, and PKCE
+
+- **Access tokens** live 1 hour. **Refresh tokens** live 30 days. Each
+  carries a unique `jti` claim so individual tokens can be revoked
+  without rotating the signing key.
+- **`POST /oauth/revoke`** (RFC 7009) revokes a single access or refresh
+  token. Pass the token in the `token` form field; per RFC 7009 the
+  endpoint always responds 200 regardless of whether the token was known.
+  The revocation deny-list lives at `~/graph-memory/oauth/revoked.json`
+  and self-prunes entries past their original `exp`.
+- **PKCE-S256 is required** for any client registered with
+  `token_endpoint_auth_method: "none"` (i.e., public clients including
+  the claude.ai connector). Discovery metadata advertises `["S256"]` only;
+  `code_challenge_method=plain` is rejected. Existing claude.ai connector
+  clients send S256 by default — no flow change.
 
 ## Dynamic client registration security
 
