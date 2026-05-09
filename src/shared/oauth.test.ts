@@ -22,6 +22,8 @@ const {
   registerClient,
   isRedirectUriHostAllowed,
   RegistrationLimitError,
+  verifyPkce,
+  authorizationServerMetadata,
 } = await import("./oauth.js");
 
 // Clean up temp dir after all tests (best-effort).
@@ -299,5 +301,40 @@ describe("registerClient registration cap", () => {
     registerClient({ redirect_uris: ["https://claude.ai/cb2"] });
     expect(() => registerClient({ redirect_uris: ["https://claude.ai/cb3"] }))
       .toThrow("max 2 clients");
+  });
+});
+
+// ─── PKCE / OAuth 2.1 conformance ────────────────────────────────────────────
+
+import { createHash } from "node:crypto";
+describe("verifyPkce", () => {
+  // Known-good S256 pair: verifier = "test-verifier-32chars-long-xyz123",
+  // challenge = base64url(sha256(verifier)).
+  const verifier = "test-verifier-32chars-long-xyz123";
+  const challengeS256 = createHash("sha256").update(verifier).digest("base64url");
+
+  it("accepts a matching S256 pair", () => {
+    expect(verifyPkce(verifier, challengeS256, "S256")).toBe(true);
+  });
+
+  it("rejects a non-matching S256 pair", () => {
+    expect(verifyPkce(verifier, "wrong-challenge", "S256")).toBe(false);
+  });
+
+  it("rejects `plain` even when verifier === challenge (defense-in-depth)", () => {
+    expect(verifyPkce("same", "same", "plain")).toBe(false);
+  });
+
+  it("rejects an unknown method", () => {
+    // @ts-expect-error — testing runtime defense for invalid method
+    expect(verifyPkce(verifier, challengeS256, "MD5")).toBe(false);
+  });
+});
+
+describe("authorizationServerMetadata PKCE conformance", () => {
+  it("advertises only S256 in code_challenge_methods_supported", () => {
+    const meta = authorizationServerMetadata("https://test.example");
+    expect(meta.code_challenge_methods_supported).toEqual(["S256"]);
+    expect(meta.code_challenge_methods_supported).not.toContain("plain");
   });
 });

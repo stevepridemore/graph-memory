@@ -456,7 +456,9 @@ export function verifyPkce(
   challenge: string,
   method: "S256" | "plain" = "S256",
 ): boolean {
-  if (method === "plain") return verifier === challenge;
+  // OAuth 2.1 forbids `plain`. Reject defensively even though /oauth/authorize
+  // already rejects it at issue time.
+  if (method !== "S256") return false;
   // S256: challenge = base64url(sha256(verifier))
   const computed = createHash("sha256").update(verifier).digest("base64url");
   return computed === challenge;
@@ -475,7 +477,7 @@ export function authorizationServerMetadata(issuer = getIssuer()) {
     response_types_supported: ["code"],
     grant_types_supported: ["authorization_code", "refresh_token"],
     token_endpoint_auth_methods_supported: ["none", "client_secret_basic", "client_secret_post"],
-    code_challenge_methods_supported: ["S256", "plain"],
+    code_challenge_methods_supported: ["S256"],
     scopes_supported: ["openid", "email", "profile", "mcp"],
     subject_types_supported: ["public"],
     id_token_signing_alg_values_supported: [ALG],

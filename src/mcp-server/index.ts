@@ -1811,6 +1811,23 @@ if (MCP_TRANSPORT === "http") {
           return jsonResp(res, 400, { error: "invalid_request", error_description: "redirect_uri does not match registered values" });
         }
 
+        // OAuth 2.1: require PKCE-S256 for public clients; reject `plain` method
+        // for any client. (RFC 7636 §4.2 plus draft-ietf-oauth-v2-1.)
+        if (codeChallengeMethod === "plain") {
+          logAuthorizeFail("code_challenge_method=plain not supported");
+          return jsonResp(res, 400, {
+            error: "invalid_request",
+            error_description: "code_challenge_method must be S256",
+          });
+        }
+        if (client.token_endpoint_auth_method === "none" && !codeChallenge) {
+          logAuthorizeFail("public client missing code_challenge");
+          return jsonResp(res, 400, {
+            error: "invalid_request",
+            error_description: "code_challenge is required for public clients (PKCE)",
+          });
+        }
+
         // Identify the user via Cloudflare Access JWT (this path stays gated
         // by CF Access in the dashboard so we receive the header here).
         const cfJwt = (req.headers["cf-access-jwt-assertion"] ?? "") as string;
