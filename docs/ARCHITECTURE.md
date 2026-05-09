@@ -449,7 +449,7 @@ The MCP server resolves paths at startup using `os.homedir()` and exposes a `GRA
 
 - Neo4j listens only on localhost (Docker port binding `127.0.0.1:7687`); not exposed externally
 - MCP server for local clients uses stdio transport (docker exec); for remote clients uses HTTPS via Cloudflare Tunnel
-- Remote access is gated by OAuth 2.1: only `/oauth/authorize` requires Cloudflare Access; all other paths use RS256 bearer tokens issued by the server
+- Remote access is gated by OAuth 2.1: only `/oauth/authorize` requires Cloudflare Access; all other paths use RS256 bearer tokens issued by the server. Only public clients (`token_endpoint_auth_method: "none"`) are supported — confidential clients (`client_secret_basic`/`client_secret_post`) are rejected at registration.
 - No sensitive data stored in graph (entities and relationships only; full content stays in markdown)
 - Dream process reads transcripts from local filesystem only
 - OAuth keypair at `~/graph-memory/oauth/` should be kept out of backups shared externally

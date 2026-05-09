@@ -103,10 +103,9 @@ export async function getJwksJson(): Promise<{ keys: Record<string, unknown>[] }
 
 export interface RegisteredClient {
   client_id: string;
-  client_secret?: string; // optional for public clients (PKCE-only)
   client_name?: string;
   redirect_uris: string[];
-  token_endpoint_auth_method: "none" | "client_secret_basic" | "client_secret_post";
+  token_endpoint_auth_method: "none";
   grant_types: string[];
   response_types: string[];
   registered_at: string;
@@ -191,6 +190,13 @@ export class RegistrationLimitError extends Error {
   }
 }
 
+export class InvalidClientMetadataError extends Error {
+  constructor(description: string) {
+    super(description);
+    this.name = "InvalidClientMetadataError";
+  }
+}
+
 // ─── redirect_uri hostname allowlist ─────────────────────────────────────────
 //
 // Only redirect URIs whose hostname belongs to an allowlisted domain are
@@ -239,7 +245,7 @@ export function isRedirectUriHostAllowed(hostname: string, allowlist?: string[])
 export function registerClient(input: {
   client_name?: string;
   redirect_uris: string[];
-  token_endpoint_auth_method?: RegisteredClient["token_endpoint_auth_method"];
+  token_endpoint_auth_method?: string;
   grant_types?: string[];
   response_types?: string[];
 }): RegisteredClient {
@@ -271,12 +277,16 @@ export function registerClient(input: {
   }
 
   const authMethod = input.token_endpoint_auth_method ?? "none";
+  if (authMethod !== "none") {
+    throw new InvalidClientMetadataError(
+      "only public clients (token_endpoint_auth_method=none) are supported",
+    );
+  }
   const client: RegisteredClient = {
     client_id: `client_${randomBytes(16).toString("hex")}`,
-    client_secret: authMethod === "none" ? undefined : randomBytes(32).toString("hex"),
     client_name: input.client_name,
     redirect_uris: input.redirect_uris,
-    token_endpoint_auth_method: authMethod,
+    token_endpoint_auth_method: "none",
     grant_types: input.grant_types ?? ["authorization_code", "refresh_token"],
     response_types: input.response_types ?? ["code"],
     registered_at: new Date().toISOString(),
@@ -476,7 +486,7 @@ export function authorizationServerMetadata(issuer = getIssuer()) {
     jwks_uri: `${issuer}/oauth/jwks`,
     response_types_supported: ["code"],
     grant_types_supported: ["authorization_code", "refresh_token"],
-    token_endpoint_auth_methods_supported: ["none", "client_secret_basic", "client_secret_post"],
+    token_endpoint_auth_methods_supported: ["none"],
     code_challenge_methods_supported: ["S256"],
     scopes_supported: ["openid", "email", "profile", "mcp"],
     subject_types_supported: ["public"],

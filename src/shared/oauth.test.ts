@@ -22,6 +22,7 @@ const {
   registerClient,
   isRedirectUriHostAllowed,
   RegistrationLimitError,
+  InvalidClientMetadataError,
   verifyPkce,
   authorizationServerMetadata,
   isEmailAllowed,
@@ -337,6 +338,63 @@ describe("authorizationServerMetadata PKCE conformance", () => {
     const meta = authorizationServerMetadata("https://test.example");
     expect(meta.code_challenge_methods_supported).toEqual(["S256"]);
     expect(meta.code_challenge_methods_supported).not.toContain("plain");
+  });
+});
+
+// ─── Confidential clients no longer supported ────────────────────────────────
+
+describe("confidential clients no longer supported", () => {
+  beforeEach(resetClients);
+  afterEach(resetClients);
+
+  it("registering with token_endpoint_auth_method=none succeeds and returns no client_secret", () => {
+    const client = registerClient({
+      redirect_uris: ["https://claude.ai/cb"],
+      token_endpoint_auth_method: "none",
+    });
+    expect(client.client_id).toMatch(/^client_/);
+    expect(client.token_endpoint_auth_method).toBe("none");
+    expect((client as Record<string, unknown>).client_secret).toBeUndefined();
+  });
+
+  it("registering with no token_endpoint_auth_method defaults to none and succeeds", () => {
+    const client = registerClient({ redirect_uris: ["https://claude.ai/cb"] });
+    expect(client.token_endpoint_auth_method).toBe("none");
+    expect((client as Record<string, unknown>).client_secret).toBeUndefined();
+  });
+
+  it("registering with token_endpoint_auth_method=client_secret_basic throws InvalidClientMetadataError", () => {
+    expect(() =>
+      registerClient({
+        redirect_uris: ["https://claude.ai/cb"],
+        token_endpoint_auth_method: "client_secret_basic",
+      }),
+    ).toThrow(InvalidClientMetadataError);
+  });
+
+  it("registering with client_secret_basic error message mentions only public clients", () => {
+    expect(() =>
+      registerClient({
+        redirect_uris: ["https://claude.ai/cb"],
+        token_endpoint_auth_method: "client_secret_basic",
+      }),
+    ).toThrow("only public clients");
+  });
+
+  it("registering with token_endpoint_auth_method=client_secret_post throws InvalidClientMetadataError", () => {
+    expect(() =>
+      registerClient({
+        redirect_uris: ["https://claude.ai/cb"],
+        token_endpoint_auth_method: "client_secret_post",
+      }),
+    ).toThrow(InvalidClientMetadataError);
+  });
+
+  it("authorizationServerMetadata advertises only none in token_endpoint_auth_methods_supported", () => {
+    const meta = authorizationServerMetadata("https://test.example");
+    expect(meta.token_endpoint_auth_methods_supported).toEqual(["none"]);
+    expect(meta.token_endpoint_auth_methods_supported).not.toContain("client_secret_basic");
+    expect(meta.token_endpoint_auth_methods_supported).not.toContain("client_secret_post");
   });
 });
 

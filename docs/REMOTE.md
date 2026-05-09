@@ -277,6 +277,22 @@ both files and restart; new keys are generated and the JWKS kid changes.
 
 ## Dynamic client registration security
 
+### Public clients only
+
+Only public clients (`token_endpoint_auth_method: "none"`) are supported. Confidential clients (those that authenticate with a `client_secret`) are not — registration with `client_secret_basic` or `client_secret_post` is rejected with `400 invalid_client_metadata`. Discovery metadata advertises `["none"]` only.
+
+All real clients (claude.ai web, Claude Desktop, Claude Code) use PKCE + `token_endpoint_auth_method: "none"`, which is the only supported mode.
+
+### Future enhancements: server-to-server / machine-to-machine clients
+
+**Server-to-server / machine-to-machine clients are intentionally out of scope.** To support them in the future, three coherent additions are needed together:
+
+1. Implement `grant_type=client_credentials` at `/oauth/token`.
+2. Reintroduce confidential clients with `client_secret` stored as a salted SHA-256 hash (per-client salt, `timingSafeEqual` verification).
+3. Re-advertise `client_secret_basic`/`client_secret_post` in discovery metadata.
+
+Doing these together keeps the implementation honest with the metadata. See git history for `oauth.ts` and the threat model finding I-1 for context.
+
 ### redirect_uri hostname allowlist
 
 `POST /oauth/register` validates each `redirect_uri` against a hostname allowlist. Only URIs whose hostname matches the allowlist are accepted; everything else returns `400 invalid_client_metadata`. This prevents the OAuth phishing chain where an attacker registers `https://attacker.example/cb`, tricks the operator into visiting a crafted `/oauth/authorize` URL on the legitimate hostname, and receives the auth code.

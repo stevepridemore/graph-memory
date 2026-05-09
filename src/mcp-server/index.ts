@@ -28,6 +28,7 @@ import {
 import {
   registerClient,
   RegistrationLimitError,
+  InvalidClientMetadataError,
   getClient,
   issueAuthCode,
   consumeAuthCode,
@@ -1703,8 +1704,8 @@ if (MCP_TRANSPORT === "http") {
             client_name: typeof body.client_name === "string" ? body.client_name : undefined,
             redirect_uris: redirectUris,
             token_endpoint_auth_method: typeof body.token_endpoint_auth_method === "string"
-              ? body.token_endpoint_auth_method as "none" | "client_secret_basic" | "client_secret_post"
-              : "none",
+              ? body.token_endpoint_auth_method
+              : undefined,
             grant_types: Array.isArray(body.grant_types) ? body.grant_types.map(String) : undefined,
             response_types: Array.isArray(body.response_types) ? body.response_types.map(String) : undefined,
           });
@@ -1729,6 +1730,12 @@ if (MCP_TRANSPORT === "http") {
           if (err instanceof RegistrationLimitError) {
             return jsonResp(res, 429, {
               error: "too_many_requests",
+              error_description: err.message,
+            });
+          }
+          if (err instanceof InvalidClientMetadataError) {
+            return jsonResp(res, 400, {
+              error: "invalid_client_metadata",
               error_description: err.message,
             });
           }
