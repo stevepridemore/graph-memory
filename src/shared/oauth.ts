@@ -210,7 +210,10 @@ export class RegistrationLimitError extends Error {
 const DEFAULT_REDIRECT_URI_HOSTS = "claude.ai,*.claude.ai,claude.com,*.claude.com,localhost,127.0.0.1";
 
 function getRedirectUriAllowlist(): string[] {
-  const raw = process.env.OAUTH_REDIRECT_URI_HOSTS ?? DEFAULT_REDIRECT_URI_HOSTS;
+  // `||` (not `??`) so docker-compose's `${VAR:-}` empty-string default falls
+  // through to the production default rather than producing an empty allowlist
+  // that rejects every registration.
+  const raw = process.env.OAUTH_REDIRECT_URI_HOSTS?.trim() || DEFAULT_REDIRECT_URI_HOSTS;
   return raw.split(",").map(h => h.trim()).filter(Boolean);
 }
 

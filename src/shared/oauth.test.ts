@@ -247,6 +247,16 @@ describe("registerClient OAUTH_REDIRECT_URI_HOSTS env var", () => {
     expect(() => registerClient({ redirect_uris: ["https://sub.custom.example/cb"] })).not.toThrow();
   });
 
+  it("falls back to default allowlist when env is empty string (docker-compose ${VAR:-} regression)", () => {
+    process.env.OAUTH_REDIRECT_URI_HOSTS = "";
+    expect(() => registerClient({ redirect_uris: ["https://claude.ai/cb"] })).not.toThrow();
+  });
+
+  it("falls back to default allowlist when env is whitespace only", () => {
+    process.env.OAUTH_REDIRECT_URI_HOSTS = "   ";
+    expect(() => registerClient({ redirect_uris: ["https://claude.ai/cb"] })).not.toThrow();
+  });
+
   it("rejects claude.ai when not in the custom list", () => {
     expect(() => registerClient({ redirect_uris: ["https://claude.ai/callback"] }))
       .toThrow("redirect_uri hostname not allowed");
