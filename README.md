@@ -45,7 +45,7 @@ This project replaces flat keyword matching with weighted, relationship-aware re
                             └─── bolt-internal ───────┘
 ```
 
-Two Docker services, talking over the compose network. The MCP server is the only thing that touches Neo4j directly — it implements OAuth 2.1 itself (RS256 JWTs with dynamic client registration per RFC 7591), validates bearer tokens for `/mcp` calls, and exposes Cloudflare Access only on `/oauth/authorize` for the actual user login. The Neo4j instance has no external listeners.
+Two Docker services, talking over the compose network. The MCP server is the only thing that touches Neo4j directly — it implements OAuth 2.1 itself (RS256 JWTs, public clients with PKCE-S256, RFC 7591 dynamic client registration, RFC 7009 revocation), validates bearer tokens for `/mcp` calls, and exposes Cloudflare Access only on `/oauth/authorize` for the actual user login. The Neo4j instance has no external listeners.
 
 The dream process is just another Claude session that runs on a schedule, reads transcripts, and calls the same MCP tools any client would call — there's no separate extraction pipeline.
 
@@ -66,13 +66,13 @@ Full schema in [`docs/SCHEMA.md`](docs/SCHEMA.md).
 
 ## Tools
 
-The MCP server exposes about 20 tools across these categories:
+The MCP server exposes 23 tools across these categories:
 
 | Category | Tools |
 |---|---|
-| Query | `graph_query`, `graph_search` (semantic), `graph_entities`, `graph_communities`, `graph_build_context` |
-| Write | `graph_relate` (single + batch), `graph_boost`, `graph_weaken`, `graph_delete`, `graph_unmerge` |
-| Maintenance | `graph_decay`, `graph_prune`, `graph_validate`, `graph_reembed` |
+| Query | `graph_query`, `graph_search` (semantic), `graph_entities`, `graph_contradictions`, `graph_communities`, `graph_build_context` |
+| Write | `graph_relate` (single + batch), `graph_boost`, `graph_weaken`, `graph_delete`, `graph_merge`, `graph_unmerge` |
+| Maintenance | `graph_decay`, `graph_prune`, `graph_validate`, `graph_reembed`, `graph_merge_suggestions` |
 | Operational | `graph_stats`, `graph_export`, `graph_audit`, `graph_ingest`, `graph_read_transcript`, `graph_cypher` (admin only) |
 
 Slash-command wrappers (`/graph`, `/graph-ask`, `/graph-search`, `/graph-stats`, `/graph-dream`, `/graph-briefing`, `/graph-find`, `/graph-backup`, `/graph-capture`, `/ingest`, etc.) install into `~/.claude/skills/`. Full reference: [`docs/SKILLS.md`](docs/SKILLS.md).
@@ -154,6 +154,8 @@ For Claude Code on remote machines, [`.mcp.json.remote.example`](.mcp.json.remot
 
 Claude Code walks the OAuth flow on first call and caches the bearer token. claude.ai web uses its own custom-connector UI — the URL is the same.
 
+If you use Claude Code on more than one PC and want a single dream process to ingest transcripts from all of them, see [Multi-PC transcript sharing](docs/REMOTE.md#multi-pc-transcript-sharing) — that's a separate concern from the OAuth multi-device story above, with a one-time sync setup.
+
 ## Document ingestion
 
 Drop files into `~/graph-memory/ingest/pending/` (or call `graph_ingest` directly). The next dream run extracts entities and relationships into the graph. Native support for `.md`, `.txt`, `.json`, `.html`, `.srt`, `.vtt`. With [MarkItDown](https://github.com/microsoft/markitdown) installed (`pip install "markitdown[pdf,docx,xlsx,pptx]"`), also handles `.pdf`, `.docx`, `.xlsx`, `.pptx`, `.epub`, `.msg`, `.csv`, `.xml`, `.png`, `.jpg`, etc. — converted to Markdown first, then extracted. Original files archive to `ingest/originals/<date>/`.
@@ -193,6 +195,11 @@ All planned phases shipped:
 - ✅ Multi-tenant infrastructure (single-user by design, multi-user-ready)
 - ✅ OAuth 2.1 + Cloudflare Tunnel for multi-device access
 - ✅ Aura → local Neo4j migration with full data preservation
+- ✅ OAuth 2.1 hardening: PKCE-S256 mandatory, public clients only, RFC 7009 revocation, jti tracking, refresh-token TTL 30d, redirect-URI allowlist, optional email allowlist, body-size caps (64 KB OAuth / 4 MB MCP), structured event logging
+- ✅ Internal threat model fully resolved (16 of 16 findings closed)
+- ✅ npm audit clean (0 vulnerabilities)
+
+Current release: [`v0.2.1`](https://github.com/stevepridemore/graph-memory/releases/tag/v0.2.1).
 
 Currently steady-state. Active development is opportunistic; the system runs unattended via the nightly dream process.
 

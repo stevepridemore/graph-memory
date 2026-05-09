@@ -388,6 +388,34 @@ Start-Service cloudflared
 - **Backups:** `graph_export` produces tenant-scoped JSONL backups via the `/graph-backup` skill. Each tenant gets their own export; admins (the bootstrap tenant) can also re-embed across all tenants via `graph_reembed`.
 - **TLS_CERT / TLS_KEY:** kept in `docker-compose.yml` as a fallback for direct-access scenarios (e.g. you want to bypass the tunnel from inside your home network). Optional — when fronted by Cloudflare Tunnel, plain HTTP behind the tunnel is fine.
 
+## Multi-PC transcript sharing
+
+The OAuth setup above lets multiple devices reach one MCP server. There's a separate concern if you use **Claude Code** on more than one machine, and it's worth understanding why.
+
+### Why this matters
+
+The dream process is a Claude Code session that runs on a single machine and reads transcripts from that machine's local `~/.claude/projects/`. Claude Code on a *different* machine writes its transcripts to *that* machine's local `~/.claude/projects/` — completely invisible to the dream.
+
+The MCP server stays consistent across machines (every client hits the same graph regardless of which PC it's running on), but transcript extraction only sees what's local to the dream-running machine. So queries you ran on the office PC, decisions you made on the laptop, conversations on the home PC — only the home PC's get extracted into the graph by the home PC's dream. The rest are lost to extraction unless you take action.
+
+If you only ever use Claude Code on one machine, this doesn't apply — skip the rest of this section.
+
+### The principle
+
+If you use Claude Code on multiple PCs and want one consolidated graph, **share `~/.claude/projects/` between the machines**. The project doesn't prescribe a sync tool — OneDrive, Dropbox, Syncthing, Google Drive, iCloud, NFS, scheduled `rsync` over Tailscale all work. Two patterns:
+
+1. Use a directory junction (`mklink /J` on Windows, `ln -s` on Linux/macOS) on each PC pointing `~/.claude/projects/` at a shared synced location.
+2. Configure your sync tool to mirror `~/.claude/projects/` directly, so every PC has its own copy that the tool keeps in sync.
+
+Each Claude Code session writes a uniquely-named UUID transcript file, so simultaneous writes from multiple machines never collide. Per-PC project subdirectories (named after each machine's absolute project path) sit side-by-side in the merged tree, and the dream walks them all.
+
+### Two gotchas worth knowing
+
+1. **Active-file sync lag.** Claude Code keeps the JSONL open while a session is in progress; most sync tools defer upload until the file is idle for several seconds. The most recent few minutes of a live session may not have synced to other PCs yet. The nightly dream isn't affected — sessions have been closed for hours by then. If you trigger an ad-hoc dream during active work on another PC, mind this.
+2. **Online-only placeholders.** Cloud sync tools (OneDrive, Dropbox, Google Drive) often default to space-saving placeholder files that download on access. The dream's `Read` calls expect real file content; placeholders can block or fail. Mark the synced directory as "always keep on this device" (or your tool's equivalent) to materialize all transcript files locally.
+
+If your sync tool doesn't follow directory junctions transparently, point your `~/.claude/projects/` junction *at* the sync-watched directory rather than the other way around.
+
 ## Reverting to local-only
 
 To roll back:
