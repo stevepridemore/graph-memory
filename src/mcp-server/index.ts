@@ -43,6 +43,7 @@ import {
   isEmailAllowed,
 } from "../shared/oauth.js";
 import { appendOAuthEventLog, pickClientIp, type ClientIpReq } from "../shared/oauth-events.js";
+import { readBody, PayloadTooLargeError, READ_BODY_CAP_OAUTH, READ_BODY_CAP_MCP } from "./read-body.js";
 
 // ─── Tenant request context ──────────────────────────────────────────────────
 // Threaded into every tool handler via AsyncLocalStorage. The HTTP request
@@ -1657,36 +1658,6 @@ if (MCP_TRANSPORT === "http") {
 
   // ─── OAuth helpers ────────────────────────────────────────────────────────
 
-  /** Read body, supporting application/json or application/x-www-form-urlencoded.
-   *  Returns a key→value record; values are strings or string arrays. */
-  async function readBody(req: import("node:http").IncomingMessage): Promise<Record<string, unknown>> {
-    const raw = await new Promise<string>((resolve, reject) => {
-      let data = "";
-      req.on("data", (c) => { data += c; });
-      req.on("end", () => resolve(data));
-      req.on("error", reject);
-    });
-    if (!raw) return {};
-    const ct = (req.headers["content-type"] ?? "").toString();
-    if (ct.includes("application/json")) {
-      try { return JSON.parse(raw) as Record<string, unknown>; } catch { return {}; }
-    }
-    if (ct.includes("application/x-www-form-urlencoded")) {
-      const params = new URLSearchParams(raw);
-      const out: Record<string, string> = {};
-      for (const [k, v] of params) out[k] = v;
-      return out;
-    }
-    // Fallback: try JSON, then form
-    try { return JSON.parse(raw) as Record<string, unknown>; } catch { /* fall through */ }
-    try {
-      const params = new URLSearchParams(raw);
-      const out: Record<string, string> = {};
-      for (const [k, v] of params) out[k] = v;
-      return out;
-    } catch { return {}; }
-  }
-
   function jsonResp(res: import("node:http").ServerResponse, status: number, body: unknown, extra?: Record<string, string>) {
     res.writeHead(status, { "Content-Type": "application/json", ...(extra ?? {}) });
     res.end(JSON.stringify(body));
@@ -2064,6 +2035,9 @@ if (MCP_TRANSPORT === "http") {
 
       jsonResp(res, 404, { error: "not_found" });
     } catch (err) {
+      if (err instanceof PayloadTooLargeError) {
+        return jsonResp(res, 413, { error: "payload_too_large" });
+      }
       jsonResp(res, 500, {
         error: "server_error",
         error_description: err instanceof Error ? err.message : String(err),
@@ -2121,12 +2095,50 @@ if (MCP_TRANSPORT === "http") {
     // stateless transport per request.
     let parsedBody: unknown;
     if (req.method === "POST") {
-      const raw = await new Promise<string>((resolve, reject) => {
-        let data = "";
-        req.on("data", (chunk) => { data += chunk; });
-        req.on("end", () => resolve(data));
-        req.on("error", reject);
-      });
+      // Fast reject via Content-Length before reading any body bytes.
+      const contentLengthHeader = req.headers["content-length"];
+      if (contentLengthHeader !== undefined) {
+        const declared = parseInt(contentLengthHeader, 10);
+        if (!isNaN(declared) && declared > READ_BODY_CAP_MCP) {
+          res.writeHead(413, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "payload_too_large" }));
+          return;
+        }
+      }
+      let raw: string;
+      try {
+        const chunks: Buffer[] = [];
+        let totalBytes = 0;
+        raw = await new Promise<string>((resolve, reject) => {
+          req.on("data", (chunk: Buffer) => {
+            totalBytes += chunk.byteLength;
+            if (totalBytes > READ_BODY_CAP_MCP) {
+              req.destroy();
+              reject(new PayloadTooLargeError(READ_BODY_CAP_MCP));
+              return;
+            }
+            chunks.push(chunk);
+          });
+          req.on("end", () => resolve(Buffer.concat(chunks).toString("utf8")));
+          req.on("error", reject);
+        });
+      } catch (err) {
+        if (err instanceof PayloadTooLargeError) {
+          appendMcpAccessLog({
+            timestamp: new Date().toISOString(),
+            tenant_id: "unknown",
+            method: req.method ?? "?",
+            path: url.pathname,
+            identity_source: "static",
+          });
+          res.writeHead(413, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "payload_too_large" }));
+          return;
+        }
+        res.writeHead(400, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "Bad Request: read error" }));
+        return;
+      }
       try {
         parsedBody = JSON.parse(raw);
       } catch {
