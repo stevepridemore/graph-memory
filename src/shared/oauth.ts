@@ -425,9 +425,10 @@ export async function verifyRefreshToken(token: string): Promise<AccessTokenClai
 }
 
 /** Revoke a token (access or refresh) per RFC 7009.
- *  Returns true if the token was valid and revoked, false if unknown/already expired.
+ *  Returns `{ revoked: true, jti }` if the token was valid and newly revoked.
+ *  Returns `{ revoked: false }` if unknown / expired / already revoked / pre-jti.
  *  Per RFC 7009 callers should return 200 regardless. */
-export async function revokeToken(token: string): Promise<boolean> {
+export async function revokeToken(token: string): Promise<{ revoked: boolean; jti?: string }> {
   const { publicKey } = await loadOrGenerateKeys();
   const issuer = getIssuer();
   let payload: JWTPayload;
@@ -435,14 +436,14 @@ export async function revokeToken(token: string): Promise<boolean> {
     ({ payload } = await jwtVerify(token, publicKey, { issuer, audience: issuer }));
   } catch {
     // Unknown, expired, or already revoked — RFC 7009 §2.2: respond 200 anyway.
-    return false;
+    return { revoked: false };
   }
   const jti = payload.jti;
-  if (!jti) return false; // pre-jti token — grace period: can't revoke, not in deny-list
-  if (isRevoked(jti)) return false; // already revoked
+  if (!jti) return { revoked: false }; // pre-jti token — grace period: can't revoke
+  if (isRevoked(jti)) return { revoked: false }; // already revoked
   const exp = typeof payload.exp === "number" ? payload.exp : 0;
   addRevocation(jti, exp);
-  return true;
+  return { revoked: true, jti };
 }
 
 // ─── PKCE verification ───────────────────────────────────────────────────────

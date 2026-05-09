@@ -67,15 +67,26 @@ describe("access token revocation", () => {
     await expect(verifyAccessToken(token)).rejects.toThrow("token revoked");
   });
 
-  it("revokeToken returns true for a valid unrevoked token", async () => {
+  it("revokeToken returns { revoked: true, jti } for a valid unrevoked token", async () => {
     const token = await issueAccessToken(SAMPLE);
+    const expectedJti = decodeJwt(token).jti;
     const result = await revokeToken(token);
-    expect(result).toBe(true);
+    expect(result.revoked).toBe(true);
+    expect(result.jti).toBe(expectedJti);
   });
 
-  it("revokeToken returns false for a garbage string", async () => {
+  it("revokeToken returns { revoked: false } with no jti for a garbage string", async () => {
     const result = await revokeToken("not.a.jwt");
-    expect(result).toBe(false);
+    expect(result.revoked).toBe(false);
+    expect(result.jti).toBeUndefined();
+  });
+
+  it("revokeToken returns { revoked: false } for an already-revoked token", async () => {
+    const token = await issueAccessToken(SAMPLE);
+    await revokeToken(token);
+    const second = await revokeToken(token);
+    expect(second.revoked).toBe(false);
+    expect(second.jti).toBeUndefined();
   });
 });
 
@@ -169,12 +180,11 @@ describe("isRedirectUriHostAllowed — custom allowlist", () => {
 
 // ─── registerClient redirect_uri validation ───────────────────────────────────
 //
-// config.ts hardcodes GRAPH_MEMORY_HOME as homedir()/graph-memory — it does not
-// read process.env.GRAPH_MEMORY_HOME — so registerClient writes to the real
-// ~/graph-memory/oauth/clients.json. We clean up before and after each test.
+// config.ts honors GRAPH_MEMORY_HOME via env, so registerClient writes to the
+// per-test-suite temp dir we set above. Each test cleans up clients.json so
+// tests don't leak state to one another.
 
-import { homedir } from "node:os";
-const clientsPath = join(homedir(), "graph-memory", "oauth", "clients.json");
+const clientsPath = join(testHome, "oauth", "clients.json");
 
 function resetClients() {
   if (existsSync(clientsPath)) unlinkSync(clientsPath);

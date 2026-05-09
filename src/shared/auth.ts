@@ -122,6 +122,17 @@ export class TenantAuthError extends Error {
   }
 }
 
+/** Thrown when bearer-token verification fails. The public `message` is a
+ *  constant string (no detail leaked to the wire); the verbose jose reason
+ *  is carried separately on `.reason` so the request handler can route it
+ *  to the OAuth events log instead. */
+export class BearerVerifyError extends TenantAuthError {
+  constructor(public readonly reason: string) {
+    super("bearer token verification failed", 401);
+    this.name = "BearerVerifyError";
+  }
+}
+
 /** Resolve the tenant id for an inbound HTTP request, applying the strategy
  *  configured by TENANT_ID_SOURCE. Throws TenantAuthError when the request
  *  doesn't carry the expected proof of identity. */
@@ -194,9 +205,7 @@ async function resolveTenantViaBearer(
       },
     };
   } catch (err) {
-    throw new TenantAuthError(
-      `bearer token verification failed: ${err instanceof Error ? err.message : String(err)}`,
-    );
+    throw new BearerVerifyError(err instanceof Error ? err.message : String(err));
   }
 }
 

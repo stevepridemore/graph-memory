@@ -2,7 +2,7 @@ import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { homedir } from "node:os";
 
-export const GRAPH_MEMORY_HOME = join(homedir(), "graph-memory");
+export const GRAPH_MEMORY_HOME = process.env.GRAPH_MEMORY_HOME ?? join(homedir(), "graph-memory");
 
 export interface GraphMemoryConfig {
   neo4j: {

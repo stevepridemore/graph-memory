@@ -2,6 +2,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { z } from "zod";
+import { decodeJwt } from "jose";
 import { Neo4jClient } from "../shared/neo4j-client.js";
 import { GRAPH_MEMORY_HOME } from "../shared/config.js";
 import { ENTITY_TYPES, RELATIONSHIP_TYPES } from "../shared/types.js";
@@ -20,6 +21,7 @@ import {
   getStaticTenantId,
   isAdminTenant,
   TenantAuthError,
+  BearerVerifyError,
   verifyCfAccessJwt,
   type VerifiedAccessIdentity,
 } from "../shared/auth.js";
@@ -39,6 +41,7 @@ import {
   getIssuer,
   revokeToken,
 } from "../shared/oauth.js";
+import { appendOAuthEventLog, pickClientIp, type ClientIpReq } from "../shared/oauth-events.js";
 
 // ─── Tenant request context ──────────────────────────────────────────────────
 // Threaded into every tool handler via AsyncLocalStorage. The HTTP request
@@ -93,6 +96,7 @@ function appendMcpAccessLog(event: AccessLogEvent): void {
     appendFileSync(logPath, JSON.stringify(event) + "\n");
   } catch { /* never throw from logging */ }
 }
+
 
 // ─── Initialize ───
 
@@ -1719,19 +1723,37 @@ if (MCP_TRANSPORT === "http") {
         if (req.method !== "POST") {
           return jsonResp(res, 405, { error: "method_not_allowed" }, { Allow: "POST" });
         }
+        const sourceIp = pickClientIp(req as unknown as ClientIpReq);
         const body = await readBody(req);
         try {
+          const redirectUris = Array.isArray(body.redirect_uris) ? body.redirect_uris.map(String) : [];
           const client = registerClient({
             client_name: typeof body.client_name === "string" ? body.client_name : undefined,
-            redirect_uris: Array.isArray(body.redirect_uris) ? body.redirect_uris.map(String) : [],
+            redirect_uris: redirectUris,
             token_endpoint_auth_method: typeof body.token_endpoint_auth_method === "string"
               ? body.token_endpoint_auth_method as "none" | "client_secret_basic" | "client_secret_post"
               : "none",
             grant_types: Array.isArray(body.grant_types) ? body.grant_types.map(String) : undefined,
             response_types: Array.isArray(body.response_types) ? body.response_types.map(String) : undefined,
           });
+          let firstHost: string | undefined;
+          try { firstHost = new URL(redirectUris[0] ?? "").host; } catch { /* ignore */ }
+          appendOAuthEventLog({
+            timestamp: new Date().toISOString(),
+            event: "register",
+            client_id: client.client_id,
+            redirect_uri_host: firstHost,
+            source_ip: sourceIp,
+          });
           return jsonResp(res, 201, client);
         } catch (err) {
+          const reason = err instanceof Error ? err.message : String(err);
+          appendOAuthEventLog({
+            timestamp: new Date().toISOString(),
+            event: "register_fail",
+            reason,
+            source_ip: sourceIp,
+          });
           if (err instanceof RegistrationLimitError) {
             return jsonResp(res, 429, {
               error: "too_many_requests",
@@ -1740,7 +1762,7 @@ if (MCP_TRANSPORT === "http") {
           }
           return jsonResp(res, 400, {
             error: "invalid_client_metadata",
-            error_description: err instanceof Error ? err.message : String(err),
+            error_description: reason,
           });
         }
       }
@@ -1751,6 +1773,7 @@ if (MCP_TRANSPORT === "http") {
         if (req.method !== "GET") {
           return jsonResp(res, 405, { error: "method_not_allowed" }, { Allow: "GET" });
         }
+        const sourceIp = pickClientIp(req as unknown as ClientIpReq);
         const params = url.searchParams;
         const responseType = params.get("response_type");
         const clientId = params.get("client_id");
@@ -1760,17 +1783,31 @@ if (MCP_TRANSPORT === "http") {
         const codeChallengeMethod = (params.get("code_challenge_method") as "S256" | "plain" | null) ?? undefined;
         const scope = params.get("scope") ?? "";
 
+        const logAuthorizeFail = (reason: string) => {
+          appendOAuthEventLog({
+            timestamp: new Date().toISOString(),
+            event: "authorize_fail",
+            client_id: clientId ?? undefined,
+            reason,
+            source_ip: sourceIp,
+          });
+        };
+
         if (responseType !== "code") {
+          logAuthorizeFail("unsupported_response_type");
           return jsonResp(res, 400, { error: "unsupported_response_type", error_description: "only response_type=code is supported" });
         }
         if (!clientId || !redirectUri) {
+          logAuthorizeFail("missing client_id or redirect_uri");
           return jsonResp(res, 400, { error: "invalid_request", error_description: "client_id and redirect_uri are required" });
         }
         const client = getClient(clientId);
         if (!client) {
+          logAuthorizeFail(`unknown client_id ${clientId}`);
           return jsonResp(res, 400, { error: "invalid_client", error_description: `unknown client_id ${clientId}` });
         }
         if (!client.redirect_uris.includes(redirectUri)) {
+          logAuthorizeFail("redirect_uri mismatch");
           return jsonResp(res, 400, { error: "invalid_request", error_description: "redirect_uri does not match registered values" });
         }
 
@@ -1778,6 +1815,7 @@ if (MCP_TRANSPORT === "http") {
         // by CF Access in the dashboard so we receive the header here).
         const cfJwt = (req.headers["cf-access-jwt-assertion"] ?? "") as string;
         if (!cfJwt) {
+          logAuthorizeFail("missing Cf-Access-Jwt-Assertion header");
           return jsonResp(res, 401, {
             error: "login_required",
             error_description: "this endpoint must be reached through Cloudflare Access — the CF Access policy was likely bypassed for this path. Re-add policy on /oauth/authorize.",
@@ -1786,15 +1824,17 @@ if (MCP_TRANSPORT === "http") {
         const teamDomain = process.env.CF_ACCESS_TEAM_DOMAIN;
         const audience = process.env.CF_ACCESS_AUD;
         if (!teamDomain || !audience) {
+          logAuthorizeFail("server misconfigured: CF_ACCESS_TEAM_DOMAIN/CF_ACCESS_AUD missing");
           return jsonResp(res, 500, { error: "server_error", error_description: "CF_ACCESS_TEAM_DOMAIN and CF_ACCESS_AUD must be configured" });
         }
         let identity;
         try {
           identity = await verifyCfAccessJwt(cfJwt, { teamDomain, audience });
         } catch (err) {
+          logAuthorizeFail(err instanceof Error ? err.message : String(err));
           return jsonResp(res, 401, {
             error: "invalid_grant",
-            error_description: `Cf-Access-Jwt-Assertion verification failed: ${err instanceof Error ? err.message : String(err)}`,
+            error_description: "Cf-Access-Jwt-Assertion verification failed",
           });
         }
 
@@ -1805,6 +1845,14 @@ if (MCP_TRANSPORT === "http") {
           scope,
           code_challenge: codeChallenge,
           code_challenge_method: codeChallengeMethod ?? undefined,
+        });
+
+        appendOAuthEventLog({
+          timestamp: new Date().toISOString(),
+          event: "authorize_ok",
+          client_id: clientId,
+          email: identity.email,
+          source_ip: sourceIp,
         });
 
         const dest = new URL(redirectUri);
@@ -1820,6 +1868,7 @@ if (MCP_TRANSPORT === "http") {
         if (req.method !== "POST") {
           return jsonResp(res, 405, { error: "method_not_allowed" }, { Allow: "POST" });
         }
+        const sourceIp = pickClientIp(req as unknown as ClientIpReq);
         const body = await readBody(req);
         const grantType = String(body.grant_type ?? "");
 
@@ -1829,26 +1878,51 @@ if (MCP_TRANSPORT === "http") {
           const clientId = String(body.client_id ?? "");
           const verifier = typeof body.code_verifier === "string" ? body.code_verifier : undefined;
 
+          const logTokenFail = (event: "token_consume_fail" | "token_pkce_fail", reason: string) => {
+            appendOAuthEventLog({
+              timestamp: new Date().toISOString(),
+              event,
+              client_id: clientId || undefined,
+              reason,
+              source_ip: sourceIp,
+            });
+          };
+
           const entry = consumeAuthCode(code);
           if (!entry) {
+            logTokenFail("token_consume_fail", "auth code expired, already used, or unknown");
             return jsonResp(res, 400, { error: "invalid_grant", error_description: "auth code expired, already used, or unknown" });
           }
           if (entry.client_id !== clientId) {
+            logTokenFail("token_consume_fail", "client_id mismatch");
             return jsonResp(res, 400, { error: "invalid_grant", error_description: "client_id mismatch" });
           }
           if (entry.redirect_uri !== redirectUri) {
+            logTokenFail("token_consume_fail", "redirect_uri mismatch");
             return jsonResp(res, 400, { error: "invalid_grant", error_description: "redirect_uri mismatch" });
           }
           if (entry.code_challenge) {
             if (!verifier) {
+              logTokenFail("token_pkce_fail", "code_verifier required");
               return jsonResp(res, 400, { error: "invalid_request", error_description: "code_verifier required" });
             }
             if (!verifyPkce(verifier, entry.code_challenge, entry.code_challenge_method ?? "S256")) {
+              logTokenFail("token_pkce_fail", "PKCE verification failed");
               return jsonResp(res, 400, { error: "invalid_grant", error_description: "PKCE verification failed" });
             }
           }
           const access = await issueAccessToken({ email: entry.email, client_id: clientId, scope: entry.scope });
           const refresh = await issueRefreshToken({ email: entry.email, client_id: clientId, scope: entry.scope });
+          let accessJti: string | undefined;
+          try { accessJti = decodeJwt(access).jti; } catch { /* shouldn't happen */ }
+          appendOAuthEventLog({
+            timestamp: new Date().toISOString(),
+            event: "token_issue",
+            client_id: clientId,
+            email: entry.email,
+            jti: accessJti,
+            source_ip: sourceIp,
+          });
           return jsonResp(res, 200, {
             access_token: access,
             token_type: "Bearer",
@@ -1865,15 +1939,45 @@ if (MCP_TRANSPORT === "http") {
           try {
             claims = await verifyRefreshToken(token);
           } catch (err) {
-            return jsonResp(res, 400, { error: "invalid_grant", error_description: err instanceof Error ? err.message : String(err) });
+            appendOAuthEventLog({
+              timestamp: new Date().toISOString(),
+              event: "token_refresh_fail",
+              client_id: clientId || undefined,
+              reason: err instanceof Error ? err.message : String(err),
+              source_ip: sourceIp,
+            });
+            return jsonResp(res, 400, { error: "invalid_grant", error_description: "refresh token verification failed" });
           }
           if (claims.client_id !== clientId) {
+            appendOAuthEventLog({
+              timestamp: new Date().toISOString(),
+              event: "token_refresh_fail",
+              client_id: clientId || undefined,
+              reason: "client_id mismatch",
+              source_ip: sourceIp,
+            });
             return jsonResp(res, 400, { error: "invalid_grant", error_description: "client_id mismatch" });
           }
           if (!getClient(clientId)) {
+            appendOAuthEventLog({
+              timestamp: new Date().toISOString(),
+              event: "client_deregistered",
+              client_id: clientId,
+              source_ip: sourceIp,
+            });
             return jsonResp(res, 400, { error: "invalid_grant", error_description: "client_no_longer_registered" });
           }
           const access = await issueAccessToken({ email: claims.email, client_id: clientId, scope: claims.scope });
+          let accessJti: string | undefined;
+          try { accessJti = decodeJwt(access).jti; } catch { /* shouldn't happen */ }
+          appendOAuthEventLog({
+            timestamp: new Date().toISOString(),
+            event: "token_refresh",
+            client_id: clientId,
+            email: claims.email,
+            jti: accessJti,
+            source_ip: sourceIp,
+          });
           return jsonResp(res, 200, {
             access_token: access,
             token_type: "Bearer",
@@ -1890,10 +1994,25 @@ if (MCP_TRANSPORT === "http") {
         if (req.method !== "POST") {
           return jsonResp(res, 405, { error: "method_not_allowed" }, { Allow: "POST" });
         }
+        const sourceIp = pickClientIp(req as unknown as ClientIpReq);
         const body = await readBody(req);
         const token = String(body.token ?? "");
         // Per RFC 7009 §2.2: always respond 200, even for unknown/invalid tokens.
-        if (token) await revokeToken(token);
+        if (token) {
+          const result = await revokeToken(token);
+          appendOAuthEventLog({
+            timestamp: new Date().toISOString(),
+            event: result.revoked ? "revoke_ok" : "revoke_noop",
+            jti: result.jti,
+            source_ip: sourceIp,
+          });
+        } else {
+          appendOAuthEventLog({
+            timestamp: new Date().toISOString(),
+            event: "revoke_noop",
+            source_ip: sourceIp,
+          });
+        }
         res.writeHead(200, { "Content-Type": "application/json" });
         res.end("{}");
         return;
@@ -1983,6 +2102,14 @@ if (MCP_TRANSPORT === "http") {
     } catch (err) {
       const status = err instanceof TenantAuthError ? err.status : 500;
       const message = err instanceof Error ? err.message : String(err);
+      if (err instanceof BearerVerifyError) {
+        appendOAuthEventLog({
+          timestamp: new Date().toISOString(),
+          event: "bearer_verify_fail",
+          reason: err.reason,
+          source_ip: pickClientIp(req as unknown as ClientIpReq),
+        });
+      }
       const headers: Record<string, string> = { "Content-Type": "application/json" };
       // RFC 9728: when auth fails, advertise where to find OAuth metadata so
       // MCP clients (like claude.ai) can start the OAuth flow.
