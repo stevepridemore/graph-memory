@@ -89,6 +89,10 @@ services:
       # Maximum number of registered OAuth clients. Default 100. Once reached,
       # POST /oauth/register returns 429. Raise if you have many legitimate users.
       - OAUTH_MAX_CLIENTS=${OAUTH_MAX_CLIENTS:-100}
+      # Email allowlist for /oauth/authorize and refresh-token re-validation.
+      # Comma-separated exact emails or *@domain wildcards. Unset → allow any
+      # identity that passes Cloudflare Access.
+      - OAUTH_ALLOWED_EMAILS=${OAUTH_ALLOWED_EMAILS:-}
     volumes:
       - ${GRAPH_MEMORY_HOME}:/root/graph-memory
       # Read-only mount of Claude Code project transcripts so the dream process

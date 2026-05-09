@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { mkdtempSync, rmSync, existsSync, unlinkSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
@@ -24,6 +24,7 @@ const {
   RegistrationLimitError,
   verifyPkce,
   authorizationServerMetadata,
+  isEmailAllowed,
 } = await import("./oauth.js");
 
 // Clean up temp dir after all tests (best-effort).
@@ -336,5 +337,122 @@ describe("authorizationServerMetadata PKCE conformance", () => {
     const meta = authorizationServerMetadata("https://test.example");
     expect(meta.code_challenge_methods_supported).toEqual(["S256"]);
     expect(meta.code_challenge_methods_supported).not.toContain("plain");
+  });
+});
+
+// ─── isEmailAllowed ───────────────────────────────────────────────────────────
+
+describe("isEmailAllowed", () => {
+  const origEnv = process.env.OAUTH_ALLOWED_EMAILS;
+
+  beforeEach(() => {
+    delete process.env.OAUTH_ALLOWED_EMAILS;
+  });
+
+  afterEach(() => {
+    if (origEnv === undefined) {
+      delete process.env.OAUTH_ALLOWED_EMAILS;
+    } else {
+      process.env.OAUTH_ALLOWED_EMAILS = origEnv;
+    }
+  });
+
+  it("allows any email when env is unset", () => {
+    expect(isEmailAllowed("anyone@example.com")).toBe(true);
+  });
+
+  it("allows any email when env is empty string (docker-compose ${VAR:-} regression)", () => {
+    process.env.OAUTH_ALLOWED_EMAILS = "";
+    expect(isEmailAllowed("anyone@example.com")).toBe(true);
+  });
+
+  it("allows any email when env is all whitespace", () => {
+    process.env.OAUTH_ALLOWED_EMAILS = "   ";
+    expect(isEmailAllowed("anyone@example.com")).toBe(true);
+  });
+
+  it("allows a matching literal email (case-insensitive stored)", () => {
+    process.env.OAUTH_ALLOWED_EMAILS = "User@Example.Com";
+    expect(isEmailAllowed("user@example.com")).toBe(true);
+  });
+
+  it("allows a matching literal email (case-insensitive compared)", () => {
+    process.env.OAUTH_ALLOWED_EMAILS = "user@example.com";
+    expect(isEmailAllowed("User@Example.Com")).toBe(true);
+  });
+
+  it("rejects a non-matching literal email", () => {
+    process.env.OAUTH_ALLOWED_EMAILS = "user@example.com";
+    expect(isEmailAllowed("other@example.com")).toBe(false);
+  });
+
+  it("wildcard *@example.com matches user@example.com", () => {
+    process.env.OAUTH_ALLOWED_EMAILS = "*@example.com";
+    expect(isEmailAllowed("user@example.com")).toBe(true);
+  });
+
+  it("wildcard *@example.com matches anything@example.com", () => {
+    process.env.OAUTH_ALLOWED_EMAILS = "*@example.com";
+    expect(isEmailAllowed("anything@example.com")).toBe(true);
+  });
+
+  it("wildcard *@example.com rejects steve@otherdomain.com", () => {
+    process.env.OAUTH_ALLOWED_EMAILS = "*@example.com";
+    expect(isEmailAllowed("steve@otherdomain.com")).toBe(false);
+  });
+
+  it("wildcard *@example.com does NOT match subdomain steve@mail.example.com", () => {
+    process.env.OAUTH_ALLOWED_EMAILS = "*@example.com";
+    expect(isEmailAllowed("steve@mail.example.com")).toBe(false);
+  });
+
+  it("mixed list works for a literal email", () => {
+    process.env.OAUTH_ALLOWED_EMAILS = "user@example.com, *@example.com";
+    expect(isEmailAllowed("user@example.com")).toBe(true);
+  });
+
+  it("mixed list works for a wildcard match", () => {
+    process.env.OAUTH_ALLOWED_EMAILS = "user@example.com, *@example.com";
+    expect(isEmailAllowed("anyone@example.com")).toBe(true);
+  });
+
+  it("mixed list rejects an email matching neither entry", () => {
+    process.env.OAUTH_ALLOWED_EMAILS = "user@example.com, *@example.com";
+    expect(isEmailAllowed("other@other.com")).toBe(false);
+  });
+
+  it("tolerates surrounding whitespace on entries", () => {
+    process.env.OAUTH_ALLOWED_EMAILS = "  user@example.com ,  *@example.com  ";
+    expect(isEmailAllowed("user@example.com")).toBe(true);
+    expect(isEmailAllowed("foo@example.com")).toBe(true);
+  });
+
+  it("skips malformed entry with no @ but still matches valid entries", () => {
+    process.env.OAUTH_ALLOWED_EMAILS = "not-an-email, user@example.com";
+    expect(isEmailAllowed("user@example.com")).toBe(true);
+    expect(isEmailAllowed("other@example.com")).toBe(false);
+  });
+
+  it("falls back to allow-any when all entries are malformed", () => {
+    process.env.OAUTH_ALLOWED_EMAILS = "not-an-email, also-bad";
+    expect(isEmailAllowed("anyone@anywhere.com")).toBe(true);
+  });
+
+  it("console.warn fires exactly once per unique malformed entry (dedupe)", () => {
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      // First unique malformed entry — should warn once across two calls.
+      process.env.OAUTH_ALLOWED_EMAILS = "dedupe-test-malformed-1";
+      isEmailAllowed("foo@bar.com");
+      isEmailAllowed("foo@bar.com");
+      expect(warnSpy).toHaveBeenCalledTimes(1);
+
+      // Second unique malformed entry — dedupe is per-entry, so one more warn.
+      process.env.OAUTH_ALLOWED_EMAILS = "dedupe-test-malformed-2@@bad";
+      isEmailAllowed("foo@bar.com");
+      expect(warnSpy).toHaveBeenCalledTimes(2);
+    } finally {
+      warnSpy.mockRestore();
+    }
   });
 });

@@ -492,3 +492,82 @@ export function protectedResourceMetadata(issuer = getIssuer()) {
     resource_documentation: `${issuer}/health`,
   };
 }
+
+// ─── Email allowlist ─────────────────────────────────────────────────────────
+
+const _warnedMalformedAllowEmail = new Set<string>();
+//
+// If OAUTH_ALLOWED_EMAILS is set to a non-empty value, only emails in the
+// comma-separated list are allowed through /oauth/authorize and
+// grant_type=refresh_token. Unset or empty string → allow any identity that
+// passes Cloudflare Access (the existing behaviour).
+//
+// Each entry is either:
+//   - an exact email  e.g. user@example.com
+//   - a wildcard      e.g. *@example.com  (matches any local-part for that domain)
+//
+// Wildcard matching is strict: *@example.com matches foo@example.com but NOT
+// foo@mail.example.com.  A malformed entry (no @, multiple @, wildcard not at
+// start, etc.) is skipped with a one-time console.warn.  If ALL entries are
+// malformed, the function falls back to allow-any but still logs the warning.
+
+export function isEmailAllowed(email: string): boolean {
+  // Use || so that docker-compose ${VAR:-} empty-string falls through to
+  // allow-any, matching the pattern used for OAUTH_REDIRECT_URI_HOSTS.
+  const raw = process.env.OAUTH_ALLOWED_EMAILS?.trim() || "";
+  if (!raw) return true;
+
+  const normalized = email.trim().toLowerCase();
+  const entries = raw.split(",");
+  const validEntries: string[] = [];
+
+  for (const entry of entries) {
+    const trimmed = entry.trim();
+    if (!trimmed) continue;
+
+    const parts = trimmed.split("@");
+    if (parts.length !== 2) {
+      if (!_warnedMalformedAllowEmail.has(trimmed)) {
+        _warnedMalformedAllowEmail.add(trimmed);
+        console.warn(`[graph-memory] OAUTH_ALLOWED_EMAILS: malformed entry (expected one @): "${trimmed}"`);
+      }
+      continue;
+    }
+    const [local, domain] = parts;
+    if (!domain) {
+      if (!_warnedMalformedAllowEmail.has(trimmed)) {
+        _warnedMalformedAllowEmail.add(trimmed);
+        console.warn(`[graph-memory] OAUTH_ALLOWED_EMAILS: malformed entry (empty domain): "${trimmed}"`);
+      }
+      continue;
+    }
+    if (local !== "*" && local!.includes("*")) {
+      if (!_warnedMalformedAllowEmail.has(trimmed)) {
+        _warnedMalformedAllowEmail.add(trimmed);
+        console.warn(`[graph-memory] OAUTH_ALLOWED_EMAILS: malformed entry (wildcard not at start): "${trimmed}"`);
+      }
+      continue;
+    }
+    validEntries.push(trimmed.toLowerCase());
+  }
+
+  if (validEntries.length === 0) {
+    // All entries were malformed — fall back to allow-any.
+    return true;
+  }
+
+  for (const entry of validEntries) {
+    if (entry.startsWith("*@")) {
+      const domain = entry.slice(2);
+      if (normalized.endsWith("@" + domain)) {
+        // Ensure there's a non-empty local-part and no subdomain.
+        const atIdx = normalized.indexOf("@");
+        if (atIdx > 0 && normalized.slice(atIdx + 1) === domain) return true;
+      }
+    } else {
+      if (normalized === entry) return true;
+    }
+  }
+
+  return false;
+}

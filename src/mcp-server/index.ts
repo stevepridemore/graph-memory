@@ -40,6 +40,7 @@ import {
   getJwksJson,
   getIssuer,
   revokeToken,
+  isEmailAllowed,
 } from "../shared/oauth.js";
 import { appendOAuthEventLog, pickClientIp, type ClientIpReq } from "../shared/oauth-events.js";
 
@@ -1855,6 +1856,21 @@ if (MCP_TRANSPORT === "http") {
           });
         }
 
+        if (!isEmailAllowed(identity.email)) {
+          appendOAuthEventLog({
+            timestamp: new Date().toISOString(),
+            event: "authorize_fail",
+            client_id: clientId,
+            email: identity.email,
+            reason: "email_not_allowed",
+            source_ip: sourceIp,
+          });
+          return jsonResp(res, 403, {
+            error: "access_denied",
+            error_description: "email not in OAUTH_ALLOWED_EMAILS",
+          });
+        }
+
         const code = issueAuthCode({
           client_id: clientId,
           redirect_uri: redirectUri,
@@ -1983,6 +1999,17 @@ if (MCP_TRANSPORT === "http") {
               source_ip: sourceIp,
             });
             return jsonResp(res, 400, { error: "invalid_grant", error_description: "client_no_longer_registered" });
+          }
+          if (!isEmailAllowed(claims.email)) {
+            appendOAuthEventLog({
+              timestamp: new Date().toISOString(),
+              event: "token_refresh_fail",
+              client_id: clientId,
+              email: claims.email,
+              reason: "email_not_allowed",
+              source_ip: sourceIp,
+            });
+            return jsonResp(res, 400, { error: "invalid_grant", error_description: "email no longer allowed" });
           }
           const access = await issueAccessToken({ email: claims.email, client_id: clientId, scope: claims.scope });
           let accessJti: string | undefined;

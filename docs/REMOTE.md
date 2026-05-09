@@ -300,6 +300,22 @@ OAUTH_REDIRECT_URI_HOSTS=claude.ai,*.claude.ai,claude.com,*.claude.com,localhost
 
 When `OAUTH_REDIRECT_URI_HOSTS` is unset the production defaults above apply.
 
+### Email allowlist (`OAUTH_ALLOWED_EMAILS`)
+
+As a second-layer guard on top of Cloudflare Access, you can restrict which verified identities are allowed to complete the OAuth flow:
+
+```env
+OAUTH_ALLOWED_EMAILS=user@example.com,*@example.com
+```
+
+Each entry is either an **exact email** (`user@example.com`) or a **domain wildcard** (`*@example.com`). Wildcard matching is strict: `*@example.com` matches `foo@example.com` but not `foo@mail.example.com` (no subdomain expansion). Matching is case-insensitive.
+
+When `OAUTH_ALLOWED_EMAILS` is **unset or empty**, any identity that passes Cloudflare Access is allowed through — the existing behaviour is preserved.
+
+The allowlist is re-evaluated on **every refresh-token grant** as well. This means removing an email from the list invalidates their ability to refresh within seconds rather than waiting up to 30 days for the refresh token to expire naturally.
+
+Rejections are recorded in `oauth-events.jsonl` with `event: "authorize_fail"` or `event: "token_refresh_fail"` and `reason: "email_not_allowed"`.
+
 ### Client registration cap
 
 To limit denial-of-service via unbounded client registrations, the server rejects `POST /oauth/register` with `429 too_many_requests` once the number of registered clients reaches `OAUTH_MAX_CLIENTS` (default 100). Raise this if you have many legitimate users:
