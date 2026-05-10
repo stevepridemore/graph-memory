@@ -2,7 +2,7 @@
 
 You are running the weekly graph memory maintenance routine. Steps run in order; later steps depend on earlier ones succeeding.
 
-The shape: **lock → backup → analyze → prune → report → unlock**. The backup is a safety net for the prune; if backup fails, prune does not run.
+The shape: **lock → backup → analyze → prune → report → email → unlock**. The backup is a safety net for the prune; if backup fails, prune does not run. Email is best-effort — a delivery failure logs an error but doesn't abort the release of the lock.
 
 ## Step 0: Acquire the maintenance lock (mutually-exclusive with the nightly dream)
 
@@ -197,9 +197,35 @@ If a previous weekly report exists at `~/graph-memory/logs/weekly-reports/YYYY-M
 Specific, actionable items for the upcoming week.
 ```
 
-## Step 12: Release the lock
+## Step 12: Email the report (best-effort)
 
-Delete `~/graph-memory/processed/dream.lock`. This must happen on every exit path — successful completion, abort due to backup failure (step 1), abort due to prune-count sanity check (step 9), or any other failure. If the lock isn't released, future runs of either the nightly dream or the next weekly maintenance will see it as "held" until the 2-hour stale threshold expires.
+Send the weekly report to `user@example.com` via the Google Workspace CLI:
+
+```sh
+gws gmail +send \
+  --to user@example.com \
+  --subject "Weekly Graph Maintenance — <YYYY-MM-DD> (<N> pruned, <M> action items)" \
+  --body "<full report markdown as plain text>" \
+  -a "<absolute path to the report .md file>"
+```
+
+Where:
+- `<YYYY-MM-DD>` is today's date matching the report filename
+- `<N>` is `nodes_pruned` from step 10 (or 0 if step 10 was skipped)
+- `<M>` is the count of unchecked items in the report's "Action Required" section
+- `<full report markdown as plain text>` is the body of the report file you wrote in step 11 (Gmail will display the markdown readably as monospace plain text)
+- `-a` attaches the report .md file for archiving and full-text search in Gmail
+
+This step is **best-effort**:
+- If `gws gmail +send` exits non-zero (auth expired, network failure, quota exceeded, etc.), append an error line to `~/graph-memory/logs/weekly-maintenance-errors.log` with timestamp + the gws error output
+- Do NOT abort the run — the report file is already written on disk; the email is purely a delivery-convenience layer
+- Proceed to step 13 (release the lock) regardless
+
+Common failure mode to recognize: `reauth related error (invalid_rapt)` means the gws OAuth refresh token needs human re-auth via `gws auth login`. Log it clearly so the next morning's report check makes the cause obvious.
+
+## Step 13: Release the lock
+
+Delete `~/graph-memory/processed/dream.lock`. This must happen on every exit path — successful completion, abort due to backup failure (step 1), abort due to prune-count sanity check (step 9), email failure in step 12, or any other failure. If the lock isn't released, future runs of either the nightly dream or the next weekly maintenance will see it as "held" until the 2-hour stale threshold expires.
 
 ## Rules
 
