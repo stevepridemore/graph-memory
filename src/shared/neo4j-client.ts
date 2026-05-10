@@ -200,6 +200,29 @@ export class Neo4jClient {
     }
   }
 
+  private async runReadOnly(
+    cypher: string,
+    params: Record<string, unknown> = {},
+    options: { timeoutMs?: number } = {},
+  ): Promise<Row[]> {
+    const session = this.driver.session({ defaultAccessMode: neo4j.session.READ, database: this.database });
+    try {
+      const result = await session.executeRead(
+        (tx) => tx.run(cypher, intifyParams(params) as Record<string, unknown>),
+        { timeout: options.timeoutMs ?? 30_000 },
+      );
+      return result.records.map((rec) => {
+        const obj: Row = {};
+        for (const key of rec.keys) {
+          obj[key as string] = toPlain(rec.get(key as string));
+        }
+        return obj;
+      });
+    } finally {
+      await session.close();
+    }
+  }
+
   async close(): Promise<void> {
     await this.driver.close();
   }
@@ -436,6 +459,8 @@ export class Neo4jClient {
     validAt?: string,
   ): Promise<RelationshipEdge> {
     const now = new Date().toISOString();
+    const supersede = validAt !== undefined && validAt !== null;
+    const supersedeAt = validAt ?? now;
     const allProps = {
       ...properties,
       tenant_id: tenantId, // edges carry the tenant of the relationship for audit/export
@@ -443,7 +468,6 @@ export class Neo4jClient {
       ...(provenance?.source_transcript && { source_transcript: provenance.source_transcript }),
       ...(provenance?.source_type && { source_type: provenance.source_type }),
       ...(provenance?.source_tenant && { source_tenant: provenance.source_tenant }),
-      ...(validAt && { valid_at: validAt }),
     };
 
     // Both endpoints must belong to the same tenant — cross-tenant edges are
@@ -452,11 +476,21 @@ export class Neo4jClient {
       `
       MATCH (a:Entity {tenant_id: $tenantId, id: $fromId})
       MATCH (b:Entity {tenant_id: $tenantId, id: $toId})
+
+      WITH a, b
+      OPTIONAL MATCH (a)-[old:\`${type}\`]->(other:Entity)
+      WHERE $supersede = true
+        AND other.id <> $toId
+        AND old.invalid_at IS NULL
+      SET old.invalid_at = datetime($supersedeAt)
+
+      WITH a, b
       MERGE (a)-[r:\`${type}\`]->(b)
       ON CREATE SET
         r.weight = $weight,
         r.last_confirmed = datetime($now),
         r.ingested_at = datetime($now),
+        r.valid_at = CASE WHEN $validAt IS NOT NULL THEN datetime($validAt) ELSE null END,
         r += $allProps
       ON MATCH SET
         r.weight = CASE
@@ -464,10 +498,11 @@ export class Neo4jClient {
           ELSE r.weight + 0.05
         END,
         r.last_confirmed = datetime($now),
+        r.valid_at = CASE WHEN $validAt IS NOT NULL THEN datetime($validAt) ELSE r.valid_at END,
         r += $allProps
       RETURN r, a.id AS fromId, b.id AS toId, type(r) AS relType
       `,
-      { tenantId, fromId, toId, weight, now, allProps },
+      { tenantId, fromId, toId, weight, now, allProps, supersede, supersedeAt, validAt: validAt ?? null },
     );
     const row = rows[0];
     if (!row) {
@@ -1027,6 +1062,7 @@ export class Neo4jClient {
         continue;
       }
 
+      const batchValidAt = rel.valid_at ?? null;
       const allProps: Record<string, unknown> = {
         ...(rel.properties ?? {}),
         tenant_id: tenantId,
@@ -1034,7 +1070,6 @@ export class Neo4jClient {
         ...(batch.source_session && { source_session: batch.source_session }),
         ...(batch.source_transcript && { source_transcript: batch.source_transcript }),
         ...(batch.source_type && { source_type: batch.source_type }),
-        ...(rel.valid_at && { valid_at: rel.valid_at }),
       };
 
       const rows = await this.run(
@@ -1046,6 +1081,7 @@ export class Neo4jClient {
           r.weight = $weight,
           r.last_confirmed = datetime($now),
           r.ingested_at = datetime($now),
+          r.valid_at = CASE WHEN $batchValidAt IS NOT NULL THEN datetime($batchValidAt) ELSE null END,
           r += $allProps
         ON MATCH SET
           r.weight = CASE
@@ -1053,10 +1089,11 @@ export class Neo4jClient {
             ELSE r.weight + 0.05
           END,
           r.last_confirmed = datetime($now),
+          r.valid_at = CASE WHEN $batchValidAt IS NOT NULL THEN datetime($batchValidAt) ELSE r.valid_at END,
           r += $allProps
         RETURN CASE WHEN r.weight = $weight THEN 'created' ELSE 'strengthened' END AS action
         `,
-        { tenantId, fromId, toId, weight: rel.weight, now, allProps },
+        { tenantId, fromId, toId, weight: rel.weight, now, allProps, batchValidAt },
       );
       const action = rows[0]?.["action"];
       if (!action) {
@@ -1092,7 +1129,7 @@ export class Neo4jClient {
     params: Record<string, unknown> = {},
   ): Promise<{ results: Record<string, unknown>[]; result_count: number; execution_time_ms: number }> {
     const start = Date.now();
-    const rows = await this.run(cypher, params);
+    const rows = await this.runReadOnly(cypher, params);
     const elapsed = Date.now() - start;
     return { results: rows, result_count: rows.length, execution_time_ms: elapsed };
   }
@@ -1479,7 +1516,7 @@ export class Neo4jClient {
         const newWeight = Math.max(Number(existing[0]?.["weight"] ?? 0), Number(props["weight"] ?? 0));
         await this.run(
           `MATCH (t:Entity {tenant_id: $tenantId, id: $targetId})-[r:\`${rel}\`]->(o:Entity {tenant_id: $tenantId, id: $otherId})
-           SET r.weight = $newWeight, r.last_seen = datetime()`,
+           SET r.weight = $newWeight, r.last_confirmed = datetime()`,
           { tenantId, targetId, otherId, newWeight },
         );
         edgesConsolidated++;
@@ -1513,7 +1550,7 @@ export class Neo4jClient {
         const newWeight = Math.max(Number(existing[0]?.["weight"] ?? 0), Number(props["weight"] ?? 0));
         await this.run(
           `MATCH (o:Entity {tenant_id: $tenantId, id: $otherId})-[r:\`${rel}\`]->(t:Entity {tenant_id: $tenantId, id: $targetId})
-           SET r.weight = $newWeight, r.last_seen = datetime()`,
+           SET r.weight = $newWeight, r.last_confirmed = datetime()`,
           { tenantId, targetId, otherId, newWeight },
         );
         edgesConsolidated++;

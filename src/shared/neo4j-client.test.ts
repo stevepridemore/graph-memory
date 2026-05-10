@@ -376,6 +376,68 @@ describe("Raw Cypher", () => {
   });
 });
 
+describe("read-only Cypher enforcement", () => {
+  it("executeCypher succeeds on a read query", async () => {
+    const result = await client.executeCypher(
+      "MATCH (n) RETURN count(n) AS c",
+    );
+    expect(result.results.length).toBeGreaterThanOrEqual(1);
+    expect(typeof result.results[0].c).toBe("number");
+  });
+
+  it("executeCypher rejects a CREATE query", async () => {
+    await expect(
+      client.executeCypher(
+        "CREATE (n:Entity {test: 'should-fail'}) RETURN n",
+      ),
+    ).rejects.toThrow(/read|AccessMode/i);
+  });
+
+  it("executeCypher rejects a DELETE query", async () => {
+    await expect(
+      client.executeCypher(
+        "MATCH (n:Entity) DETACH DELETE n",
+      ),
+    ).rejects.toThrow(/read|AccessMode/i);
+  });
+
+  it("executeCypher rejects a SET query", async () => {
+    await expect(
+      client.executeCypher(
+        "MATCH (n:Entity) SET n.foo = 'bar'",
+      ),
+    ).rejects.toThrow(/read|AccessMode/i);
+  });
+
+  it("executeCypher times out on slow queries via APOC sleep", async () => {
+    // Uses APOC's apoc.util.sleep() to reliably trigger a transaction timeout.
+    // If APOC is not available in the test environment, this test is skipped.
+    // A Cartesian self-join alternative was considered but proved unreliable
+    // on small graphs (125 nodes completed the join well within 100 ms).
+    const apocAvailable = await (async () => {
+      try {
+        await (client as unknown as { runReadOnly: (c: string, p: Record<string, unknown>, o?: object) => Promise<unknown> })
+          .runReadOnly("CALL apoc.util.sleep(1) RETURN 1 AS ok");
+        return true;
+      } catch {
+        return false;
+      }
+    })();
+
+    if (!apocAvailable) {
+      // APOC not installed in this environment — skip rather than false-fail.
+      console.log("  [skip] apoc.util.sleep not available; timeout test skipped");
+      return;
+    }
+
+    // Sleep longer than the timeout to guarantee the transaction is killed.
+    await expect(
+      (client as unknown as { runReadOnly: (c: string, p: Record<string, unknown>, o: { timeoutMs: number }) => Promise<unknown> })
+        .runReadOnly("CALL apoc.util.sleep(2000) RETURN 1 AS ok", {}, { timeoutMs: 200 }),
+    ).rejects.toThrow();
+  }, 10_000);
+});
+
 describe("Unmerge", () => {
   it("should split a falsely merged entity", async () => {
     // "anna-anne" has edges that belong to two different people.
@@ -724,6 +786,144 @@ describe("Contradictions edge cases", () => {
 
       const bResult = await client.findContradictions(T2);
       expect(bResult.count).toBe(0);
+    } finally {
+      await client.clearTenant(T2);
+    }
+  });
+});
+
+describe("bi-temporal supersession", () => {
+  beforeEach(async () => {
+    await client.createEntity(T, "Person", "sup-a", "Sup A");
+    await client.createEntity(T, "Project", "sup-b", "Sup B");
+    await client.createEntity(T, "Project", "sup-c", "Sup C");
+    await client.createEntity(T, "Project", "sup-d", "Sup D");
+  });
+
+  it("supersedes previous edge when valid_at is supplied and target differs", async () => {
+    await client.createRelationship(T, "sup-a", "sup-b", "USES", 0.7, {}, undefined, "2024-01-01T00:00:00Z");
+    await client.createRelationship(T, "sup-a", "sup-c", "USES", 0.7, {}, undefined, "2025-01-01T00:00:00Z");
+
+    const all = await client.getRelationships(T, "sup-a", "out");
+    const current = all.filter((e) => e.type === "USES" && e.invalid_at == null);
+    expect(current.length).toBe(1);
+    expect(current[0].to).toBe("sup-c");
+
+    const ab = all.find((e) => e.type === "USES" && e.to === "sup-b");
+    expect(ab).toBeDefined();
+    expect(ab!.invalid_at).not.toBeNull();
+    expect(ab!.invalid_at).toContain("2025-01-01");
+  });
+
+  it("does not supersede when valid_at is NOT supplied (multi-valued case)", async () => {
+    await client.createRelationship(T, "sup-a", "sup-b", "USES", 0.7);
+    await client.createRelationship(T, "sup-a", "sup-c", "USES", 0.7);
+
+    const all = await client.getRelationships(T, "sup-a", "out");
+    const current = all.filter((e) => e.type === "USES" && e.invalid_at == null);
+    expect(current.length).toBe(2);
+  });
+
+  it("same-target reconfirm does not self-invalidate", async () => {
+    await client.createRelationship(T, "sup-a", "sup-b", "USES", 0.7, {}, undefined, "2024-01-01T00:00:00Z");
+    await client.createRelationship(T, "sup-a", "sup-b", "USES", 0.7, {}, undefined, "2025-01-01T00:00:00Z");
+
+    const all = await client.getRelationships(T, "sup-a", "out");
+    const usesEdges = all.filter((e) => e.type === "USES");
+    expect(usesEdges.length).toBe(1);
+    expect(usesEdges[0].invalid_at).toBeNull();
+    expect(usesEdges[0].valid_at).toContain("2025-01-01");
+  });
+
+  it("invalidates multiple predecessor edges when a new target is supplied", async () => {
+    await client.createRelationship(T, "sup-a", "sup-b", "USES", 0.7, {}, undefined, "2023-01-01T00:00:00Z");
+    await client.createRelationship(T, "sup-a", "sup-c", "USES", 0.7, {}, undefined, "2024-01-01T00:00:00Z");
+    await client.createRelationship(T, "sup-a", "sup-d", "USES", 0.7, {}, undefined, "2025-01-01T00:00:00Z");
+
+    const all = await client.getRelationships(T, "sup-a", "out");
+    const current = all.filter((e) => e.type === "USES" && e.invalid_at == null);
+    expect(current.length).toBe(1);
+    expect(current[0].to).toBe("sup-d");
+  });
+
+  it("different relationship types are independent — no cross-type supersession", async () => {
+    await client.createRelationship(T, "sup-a", "sup-b", "USES", 0.7, {}, undefined, "2024-01-01T00:00:00Z");
+    await client.createRelationship(T, "sup-a", "sup-c", "DEPENDS_ON", 0.7, {}, undefined, "2025-01-01T00:00:00Z");
+
+    const all = await client.getRelationships(T, "sup-a", "out");
+    const current = all.filter((e) => e.invalid_at == null);
+    expect(current.length).toBe(2);
+    expect(current.find((e) => e.type === "USES" && e.to === "sup-b")).toBeDefined();
+    expect(current.find((e) => e.type === "DEPENDS_ON" && e.to === "sup-c")).toBeDefined();
+  });
+
+  it("merge() consolidation bumps last_confirmed, not last_seen", async () => {
+    await client.createEntity(T, "Project", "sup-shared", "Sup Shared");
+
+    // Create two source edges into the shared target
+    await client.createRelationship(T, "sup-b", "sup-shared", "USES", 0.4);
+    await client.createRelationship(T, "sup-c", "sup-shared", "USES", 0.6);
+
+    // Backdate so the edges look old before merge
+    await client.setEdgeLastConfirmed(T, "sup-b", "sup-shared", "USES", 30);
+    await client.setEdgeLastConfirmed(T, "sup-c", "sup-shared", "USES", 30);
+
+    await client.merge(T, "sup-b", "sup-c");
+
+    const edges = await client.getRelationships(T, "sup-c", "out");
+    const consolidated = edges.find((e) => e.type === "USES" && e.to === "sup-shared");
+    expect(consolidated).toBeDefined();
+
+    // last_confirmed should be updated to near-now (within 60 seconds)
+    const confirmedMs = new Date(consolidated!.last_confirmed).getTime();
+    expect(Date.now() - confirmedMs).toBeLessThan(60_000);
+
+    // last_seen should not exist on relationship objects at all
+    expect((consolidated!.properties as Record<string, unknown>)["last_seen"]).toBeUndefined();
+  });
+
+  it("valid_at is stored as a Neo4j datetime (comes back as ISO string, not raw string)", async () => {
+    const inputValidAt = "2024-06-15T10:30:00Z";
+    const edge = await client.createRelationship(
+      T,
+      "sup-a",
+      "sup-b",
+      "USES",
+      0.7,
+      {},
+      undefined,
+      inputValidAt,
+    );
+    // The returned valid_at should contain the date from the input (stored as
+    // a Neo4j datetime and serialized back — not the raw string we passed in).
+    expect(edge.valid_at).not.toBeNull();
+    expect(edge.valid_at).toContain("2024-06-15");
+  });
+
+  it("supersession in tenant T1 does not touch edges in tenant T2", async () => {
+    const T2 = `${TENANT_PREFIX}sup-t2-${randomUUID().slice(0, 8)}`;
+    try {
+      await client.createEntity(T2, "Person", "sup-a", "Sup A");
+      await client.createEntity(T2, "Project", "sup-b", "Sup B");
+      await client.createEntity(T2, "Project", "sup-c", "Sup C");
+
+      // T1: A→B with valid_at, then A→C supersedes it
+      await client.createRelationship(T, "sup-a", "sup-b", "USES", 0.7, {}, undefined, "2024-01-01T00:00:00Z");
+      await client.createRelationship(T, "sup-a", "sup-c", "USES", 0.7, {}, undefined, "2025-01-01T00:00:00Z");
+
+      // T2: A→B with valid_at only (no supersession yet)
+      await client.createRelationship(T2, "sup-a", "sup-b", "USES", 0.7, {}, undefined, "2024-01-01T00:00:00Z");
+
+      // T1: A→B should be invalidated
+      const t1Edges = await client.getRelationships(T, "sup-a", "out");
+      const t1Ab = t1Edges.find((e) => e.type === "USES" && e.to === "sup-b");
+      expect(t1Ab!.invalid_at).not.toBeNull();
+
+      // T2: A→B should still be current
+      const t2Edges = await client.getRelationships(T2, "sup-a", "out");
+      const t2Ab = t2Edges.find((e) => e.type === "USES" && e.to === "sup-b");
+      expect(t2Ab).toBeDefined();
+      expect(t2Ab!.invalid_at).toBeNull();
     } finally {
       await client.clearTenant(T2);
     }
