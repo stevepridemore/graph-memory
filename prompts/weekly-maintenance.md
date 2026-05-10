@@ -199,22 +199,27 @@ Specific, actionable items for the upcoming week.
 
 ## Step 12: Email the report (best-effort)
 
-Send the weekly report to `user@example.com` via the Google Workspace CLI:
+Send the weekly report to the maintainer's email address via the Google Workspace CLI, with the report rendered as inline HTML so tables and headings are readable in Gmail. Set `MAINT_EMAIL` to the recipient address (kept out of this checked-in prompt; the scheduled-task copy hardcodes the actual address):
 
 ```sh
+cd ~/graph-memory/logs/weekly-reports
+HTML=$(PYTHONIOENCODING=utf-8 python -c "import markdown,sys; sys.stdout.reconfigure(encoding='utf-8'); print(markdown.markdown(open('<YYYY-MM-DD>.md',encoding='utf-8').read(), extensions=['extra','sane_lists']))")
 gws gmail +send \
-  --to user@example.com \
+  --to "$MAINT_EMAIL" \
   --subject "Weekly Graph Maintenance — <YYYY-MM-DD> (<N> pruned, <M> action items)" \
-  --body "<full report markdown as plain text>" \
-  -a "<absolute path to the report .md file>"
+  --body "$HTML" \
+  --html
 ```
 
 Where:
 - `<YYYY-MM-DD>` is today's date matching the report filename
 - `<N>` is `nodes_pruned` from step 10 (or 0 if step 10 was skipped)
 - `<M>` is the count of unchecked items in the report's "Action Required" section
-- `<full report markdown as plain text>` is the body of the report file you wrote in step 11 (Gmail will display the markdown readably as monospace plain text)
-- `-a` attaches the report .md file for archiving and full-text search in Gmail
+- The report markdown is converted to HTML via the Python `markdown` package (`extra` extension provides table support; `sane_lists` keeps the action-item checkboxes rendering correctly)
+- `PYTHONIOENCODING=utf-8` + `sys.stdout.reconfigure` are required on Windows so unicode arrows (`↔`, `→`) in the report don't blow up the default cp1252 console codec
+- No attachment — the HTML body is the deliverable. The report `.md` file remains on disk under `~/graph-memory/logs/weekly-reports/` for archive/grep
+
+Prerequisite: `pip install markdown` (one-time, ~50KB pure-Python package). If the import fails, log a one-line error and skip the email — do NOT auto-install during the run.
 
 This step is **best-effort**:
 - If `gws gmail +send` exits non-zero (auth expired, network failure, quota exceeded, etc.), append an error line to `~/graph-memory/logs/weekly-maintenance-errors.log` with timestamp + the gws error output
