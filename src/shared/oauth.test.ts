@@ -444,45 +444,45 @@ describe("isEmailAllowed", () => {
     expect(isEmailAllowed("other@example.com")).toBe(false);
   });
 
-  it("wildcard *@example.com matches user@example.com", () => {
-    process.env.OAUTH_ALLOWED_EMAILS = "*@example.com";
-    expect(isEmailAllowed("user@example.com")).toBe(true);
+  it("wildcard *@example.org matches user@example.org", () => {
+    process.env.OAUTH_ALLOWED_EMAILS = "*@example.org";
+    expect(isEmailAllowed("user@example.org")).toBe(true);
   });
 
-  it("wildcard *@example.com matches anything@example.com", () => {
-    process.env.OAUTH_ALLOWED_EMAILS = "*@example.com";
-    expect(isEmailAllowed("anything@example.com")).toBe(true);
+  it("wildcard *@example.org matches anything@example.org", () => {
+    process.env.OAUTH_ALLOWED_EMAILS = "*@example.org";
+    expect(isEmailAllowed("anything@example.org")).toBe(true);
   });
 
-  it("wildcard *@example.com rejects steve@otherdomain.com", () => {
-    process.env.OAUTH_ALLOWED_EMAILS = "*@example.com";
-    expect(isEmailAllowed("steve@otherdomain.com")).toBe(false);
+  it("wildcard *@example.org rejects user@otherdomain.com", () => {
+    process.env.OAUTH_ALLOWED_EMAILS = "*@example.org";
+    expect(isEmailAllowed("user@otherdomain.com")).toBe(false);
   });
 
-  it("wildcard *@example.com does NOT match subdomain steve@mail.example.com", () => {
-    process.env.OAUTH_ALLOWED_EMAILS = "*@example.com";
-    expect(isEmailAllowed("steve@mail.example.com")).toBe(false);
+  it("wildcard *@example.org does NOT match subdomain user@mail.example.org", () => {
+    process.env.OAUTH_ALLOWED_EMAILS = "*@example.org";
+    expect(isEmailAllowed("user@mail.example.org")).toBe(false);
   });
 
   it("mixed list works for a literal email", () => {
-    process.env.OAUTH_ALLOWED_EMAILS = "user@example.com, *@example.com";
+    process.env.OAUTH_ALLOWED_EMAILS = "user@example.com, *@example.org";
     expect(isEmailAllowed("user@example.com")).toBe(true);
   });
 
   it("mixed list works for a wildcard match", () => {
-    process.env.OAUTH_ALLOWED_EMAILS = "user@example.com, *@example.com";
-    expect(isEmailAllowed("anyone@example.com")).toBe(true);
+    process.env.OAUTH_ALLOWED_EMAILS = "user@example.com, *@example.org";
+    expect(isEmailAllowed("anyone@example.org")).toBe(true);
   });
 
   it("mixed list rejects an email matching neither entry", () => {
-    process.env.OAUTH_ALLOWED_EMAILS = "user@example.com, *@example.com";
+    process.env.OAUTH_ALLOWED_EMAILS = "user@example.com, *@example.org";
     expect(isEmailAllowed("other@other.com")).toBe(false);
   });
 
   it("tolerates surrounding whitespace on entries", () => {
-    process.env.OAUTH_ALLOWED_EMAILS = "  user@example.com ,  *@example.com  ";
+    process.env.OAUTH_ALLOWED_EMAILS = "  user@example.com ,  *@example.org  ";
     expect(isEmailAllowed("user@example.com")).toBe(true);
-    expect(isEmailAllowed("foo@example.com")).toBe(true);
+    expect(isEmailAllowed("foo@example.org")).toBe(true);
   });
 
   it("skips malformed entry with no @ but still matches valid entries", () => {

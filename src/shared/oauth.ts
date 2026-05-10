@@ -514,10 +514,10 @@ const _warnedMalformedAllowEmail = new Set<string>();
 //
 // Each entry is either:
 //   - an exact email  e.g. user@example.com
-//   - a wildcard      e.g. *@example.com  (matches any local-part for that domain)
+//   - a wildcard      e.g. *@example.org  (matches any local-part for that domain)
 //
-// Wildcard matching is strict: *@example.com matches foo@example.com but NOT
-// foo@mail.example.com.  A malformed entry (no @, multiple @, wildcard not at
+// Wildcard matching is strict: *@example.org matches foo@example.org but NOT
+// foo@mail.example.org.  A malformed entry (no @, multiple @, wildcard not at
 // start, etc.) is skipped with a one-time console.warn.  If ALL entries are
 // malformed, the function falls back to allow-any but still logs the warning.
 

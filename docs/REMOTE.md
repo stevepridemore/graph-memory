@@ -321,10 +321,10 @@ When `OAUTH_REDIRECT_URI_HOSTS` is unset the production defaults above apply.
 As a second-layer guard on top of Cloudflare Access, you can restrict which verified identities are allowed to complete the OAuth flow:
 
 ```env
-OAUTH_ALLOWED_EMAILS=user@example.com,*@example.com
+OAUTH_ALLOWED_EMAILS=user@example.com,*@example.org
 ```
 
-Each entry is either an **exact email** (`user@example.com`) or a **domain wildcard** (`*@example.com`). Wildcard matching is strict: `*@example.com` matches `foo@example.com` but not `foo@mail.example.com` (no subdomain expansion). Matching is case-insensitive.
+Each entry is either an **exact email** (`user@example.com`) or a **domain wildcard** (`*@example.org`). Wildcard matching is strict: `*@example.org` matches `foo@example.org` but not `foo@mail.example.org` (no subdomain expansion). Matching is case-insensitive.
 
 When `OAUTH_ALLOWED_EMAILS` is **unset or empty**, any identity that passes Cloudflare Access is allowed through — the existing behaviour is preserved.
 
