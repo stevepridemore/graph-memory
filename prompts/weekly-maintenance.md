@@ -2,7 +2,24 @@
 
 You are running the weekly graph memory maintenance routine. Steps run in order; later steps depend on earlier ones succeeding.
 
-The shape: **backup → analyze → prune → report**. The backup is a safety net for the prune; if backup fails, prune does not run.
+The shape: **lock → backup → analyze → prune → report → unlock**. The backup is a safety net for the prune; if backup fails, prune does not run.
+
+## Step 0: Acquire the maintenance lock (mutually-exclusive with the nightly dream)
+
+The nightly dream and this weekly task both modify the graph; they share a lock file at `~/graph-memory/processed/dream.lock` so they never run concurrently.
+
+Check for the lock file. If it exists **and** was created less than 2 hours ago, **abort immediately** — another dream or maintenance process is running. Log the abort to `~/graph-memory/logs/weekly-maintenance-errors.log` with timestamp + reason ("lock held by <source> at <timestamp>") and exit.
+
+If no lock (or stale lock >2 hours), create the lock file:
+```json
+{
+  "pid": <your process id or 0>,
+  "timestamp": "<current ISO timestamp>",
+  "source": "scheduled-weekly"
+}
+```
+
+**You MUST release this lock (delete the file) when you finish, whether you succeed or fail.** Every exit path from this prompt — including the abort paths in step 1 (backup failed) and step 9 (prune sanity check tripped) — must delete the lock file before exiting.
 
 ## Step 1: Backup the graph (REQUIRED — abort all subsequent steps if this fails)
 
@@ -180,11 +197,17 @@ If a previous weekly report exists at `~/graph-memory/logs/weekly-reports/YYYY-M
 Specific, actionable items for the upcoming week.
 ```
 
+## Step 12: Release the lock
+
+Delete `~/graph-memory/processed/dream.lock`. This must happen on every exit path — successful completion, abort due to backup failure (step 1), abort due to prune-count sanity check (step 9), or any other failure. If the lock isn't released, future runs of either the nightly dream or the next weekly maintenance will see it as "held" until the 2-hour stale threshold expires.
+
 ## Rules
 
-1. **Backup is mandatory.** If step 1 fails, every subsequent step is skipped. The whole point of the safety net is "prune only with a fresh backup as recovery option."
-2. **Prune sanity check is mandatory.** Do not execute a prune of more than 50 nodes without manual review. The preview-then-execute split exists specifically to catch surprises.
-3. **Do not auto-resolve contradictions.** Report them; let the human decide.
-4. **Do not auto-merge duplicates.** Report them; let the human decide.
-5. **Report is append-only history.** Never overwrite a previous weekly report. Each Sunday produces a new dated file.
-6. **Audit trail.** Every modifying call (`graph_export`, `graph_prune`) should be logged via `graph_audit` with the appropriate event type so the dream-audit log captures the weekly maintenance activity alongside nightly extraction activity.
+1. **Lock acquisition is mandatory.** Both the nightly dream and this weekly task share `~/graph-memory/processed/dream.lock`. If you can't acquire the lock (held by another process less than 2 hours old), abort. Never run graph-modifying operations concurrently with the nightly dream.
+2. **Lock release is mandatory on every exit path.** Including aborts. A held-but-orphaned lock blocks the next 2 hours of scheduled runs.
+3. **Backup is mandatory.** If step 1 fails, every subsequent step is skipped (but still release the lock before exiting). The whole point of the safety net is "prune only with a fresh backup as recovery option."
+4. **Prune sanity check is mandatory.** Do not execute a prune of more than 50 nodes without manual review. The preview-then-execute split exists specifically to catch surprises.
+5. **Do not auto-resolve contradictions.** Report them; let the human decide.
+6. **Do not auto-merge duplicates.** Report them; let the human decide.
+7. **Report is append-only history.** Never overwrite a previous weekly report. Each Sunday produces a new dated file.
+8. **Audit trail.** Every modifying call (`graph_export`, `graph_prune`) should be logged via `graph_audit` with the appropriate event type so the dream-audit log captures the weekly maintenance activity alongside nightly extraction activity.
