@@ -8,10 +8,6 @@ on:
   push:
     tags:
       - 'v*'
-    # TEMP: also build on the install-test branch so we can dogfood the
-    # release flow end-to-end before tagging. Remove before merging to main.
-    branches:
-      - 'install-test'
 
 permissions:
   contents: read
@@ -38,12 +34,8 @@ jobs:
         with:
           context: .
           push: true
-          # Branch builds (install-test) tag the image with the branch name
-          # only — don't move :latest. Tag builds tag both the version and
-          # :latest. github.ref_name resolves to the tag name on tag pushes
-          # and the branch name on branch pushes.
           tags: |
             ghcr.io/stevepridemore/graph-memory-mcp:${{ github.ref_name }}
-            ${{ startsWith(github.ref, 'refs/tags/v') && 'ghcr.io/stevepridemore/graph-memory-mcp:latest' || '' }}
+            ghcr.io/stevepridemore/graph-memory-mcp:latest
           cache-from: type=gha
           cache-to: type=gha,mode=max
