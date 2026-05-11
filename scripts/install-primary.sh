@@ -26,14 +26,25 @@ fi
 
 REPO="stevepridemore/graph-memory"
 RAW="https://raw.githubusercontent.com/$REPO/$VERSION"
-TARBALL="https://github.com/$REPO/archive/refs/tags/$VERSION.tar.gz"
-# 'latest' isn't a tag — fall back to main branch tarball
-if [ "$VERSION" = "latest" ]; then
-  TARBALL="https://github.com/$REPO/archive/refs/heads/main.tar.gz"
-  TARBALL_PREFIX="graph-memory-main"
-else
-  TARBALL_PREFIX="graph-memory-${VERSION#v}"
-fi
+
+# Resolve $VERSION to the right tarball URL. Tags (v*) come from refs/tags;
+# 'latest' resolves to refs/heads/main; anything else is assumed to be a
+# branch name. This makes pre-release dogfooding on a branch work without
+# any further config.
+case "$VERSION" in
+  v*)
+    TARBALL="https://github.com/$REPO/archive/refs/tags/$VERSION.tar.gz"
+    TARBALL_PREFIX="graph-memory-${VERSION#v}"
+    ;;
+  latest)
+    TARBALL="https://github.com/$REPO/archive/refs/heads/main.tar.gz"
+    TARBALL_PREFIX="graph-memory-main"
+    ;;
+  *)
+    TARBALL="https://github.com/$REPO/archive/refs/heads/$VERSION.tar.gz"
+    TARBALL_PREFIX="graph-memory-$VERSION"
+    ;;
+esac
 
 echo "[install-primary] graph-memory $VERSION"
 

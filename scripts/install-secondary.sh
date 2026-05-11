@@ -30,13 +30,20 @@ fi
 
 REPO="stevepridemore/graph-memory"
 RAW="https://raw.githubusercontent.com/$REPO/$VERSION"
-TARBALL="https://github.com/$REPO/archive/refs/tags/$VERSION.tar.gz"
-if [ "$VERSION" = "latest" ]; then
-  TARBALL="https://github.com/$REPO/archive/refs/heads/main.tar.gz"
-  TARBALL_PREFIX="graph-memory-main"
-else
-  TARBALL_PREFIX="graph-memory-${VERSION#v}"
-fi
+case "$VERSION" in
+  v*)
+    TARBALL="https://github.com/$REPO/archive/refs/tags/$VERSION.tar.gz"
+    TARBALL_PREFIX="graph-memory-${VERSION#v}"
+    ;;
+  latest)
+    TARBALL="https://github.com/$REPO/archive/refs/heads/main.tar.gz"
+    TARBALL_PREFIX="graph-memory-main"
+    ;;
+  *)
+    TARBALL="https://github.com/$REPO/archive/refs/heads/$VERSION.tar.gz"
+    TARBALL_PREFIX="graph-memory-$VERSION"
+    ;;
+esac
 
 echo "[install-secondary] graph-memory $VERSION → $HOST"
 
