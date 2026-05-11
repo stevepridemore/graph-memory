@@ -1,15 +1,21 @@
 """
-Sync canonical scheduled-task prompts in prompts/ to live SKILL.md files
-under ~/.claude/scheduled-tasks/<task-id>/SKILL.md, substituting absolute
+Sync canonical scheduled-task prompts to live SKILL.md files under
+~/.claude/scheduled-tasks/<task-id>/SKILL.md, substituting absolute
 Windows paths for the portable ~/ placeholders. Run after editing any
 canonical prompt.
 
+Source prompt files are resolved relative to --prompts-dir (default
+"prompts" — i.e. the repo's prompts/ when run from the repo root). The
+installer for non-developer users passes --prompts-dir ~/graph-memory/prompts
+so the substitution reads from the entrypoint-seeded copy on the host.
+
 Currently syncs:
-  - prompts/dream-nightly.md   → scheduled-tasks/nightly-graph-dream/SKILL.md
-  - prompts/weekly-maintenance.md → scheduled-tasks/weekly-graph-maintenance/SKILL.md
+  - <prompts-dir>/dream-nightly.md   → scheduled-tasks/nightly-graph-dream/SKILL.md
+  - <prompts-dir>/weekly-maintenance.md → scheduled-tasks/weekly-graph-maintenance/SKILL.md
 
 Usage:
   python3 scripts/sync-dream-skill.py [--user-home <path>] [--task <id>]
+                                       [--prompts-dir <path>]
 
 Without --task, syncs all known tasks. With --task <id>, syncs only that one.
 """
@@ -25,12 +31,13 @@ DEFAULT_USER_HOME = os.path.expanduser("~")
 PATH_RE = re.compile(r"~/(graph-memory|\.claude/projects)/[\w./<>*-]*")
 
 
-# Each entry: (task_id, source_prompt_path, frontmatter_block)
+# Each entry: (task_id, source_prompt_filename, frontmatter_block)
+# Filenames are resolved against --prompts-dir at runtime.
 # The frontmatter is what Claude Code's scheduled-task runner expects in SKILL.md.
 TASKS = [
     (
         "nightly-graph-dream",
-        "prompts/dream-nightly.md",
+        "dream-nightly.md",
         """---
 name: nightly-graph-dream
 description: Nightly graph memory dream process — ingest transcripts and documents, update knowledge graph, run decay maintenance. Hook errors (check-pending.js MODULE_NOT_FOUND) at session start are expected and harmless in remote sessions.
@@ -40,7 +47,7 @@ description: Nightly graph memory dream process — ingest transcripts and docum
     ),
     (
         "weekly-graph-maintenance",
-        "prompts/weekly-maintenance.md",
+        "weekly-maintenance.md",
         """---
 name: weekly-graph-maintenance
 description: Weekly graph memory maintenance — backup, health analysis, and prune (gated on backup success and a sanity check on prune count).
@@ -51,23 +58,42 @@ description: Weekly graph memory maintenance — backup, health analysis, and pr
 ]
 
 
-def winify(home_dir: str):
-    """Return a substitution callable that turns ~/<dir>/<rest> into
-    <home>\\<dir>\\<rest> (Windows backslashes throughout)."""
+def make_substituter(home_dir: str, use_backslashes: bool):
+    """Return a substitution callable that expands ~/<dir>/<rest> to an
+    absolute path under home_dir, using the OS-appropriate separator.
+
+    - On Windows, use_backslashes=True produces e.g. C:\\Users\\you\\graph-memory\\...
+    - On macOS/Linux, use_backslashes=False keeps forward slashes throughout
+      and produces e.g. /Users/you/graph-memory/... or /home/you/graph-memory/...
+    """
+
+    sep = "\\" if use_backslashes else "/"
 
     def _sub(match):
         s = match.group(0)
         if s.startswith("~/graph-memory/"):
-            s = f"{home_dir}\\graph-memory\\" + s[len("~/graph-memory/") :]
+            rest = s[len("~/graph-memory/") :]
+            s = f"{home_dir}{sep}graph-memory{sep}" + rest
         elif s.startswith("~/.claude/projects/"):
-            s = f"{home_dir}\\.claude\\projects\\" + s[len("~/.claude/projects/") :]
-        return s.replace("/", "\\")
+            rest = s[len("~/.claude/projects/") :]
+            s = f"{home_dir}{sep}.claude{sep}projects{sep}" + rest
+        # Normalize internal separators
+        if use_backslashes:
+            return s.replace("/", "\\")
+        return s.replace("\\", "/")
 
     return _sub
 
 
-def sync_one(task_id: str, src_path: str, frontmatter: str, user_home: str) -> int:
-    src = Path(src_path).resolve()
+def sync_one(
+    task_id: str,
+    src_filename: str,
+    frontmatter: str,
+    user_home: str,
+    prompts_dir: Path,
+    use_backslashes: bool,
+) -> int:
+    src = (prompts_dir / src_filename).resolve()
     dst = Path(
         os.path.join(user_home, ".claude", "scheduled-tasks", task_id, "SKILL.md")
     )
@@ -82,8 +108,8 @@ def sync_one(task_id: str, src_path: str, frontmatter: str, user_home: str) -> i
     lines = content.splitlines(keepends=True)
     body = "".join(lines[1:]).lstrip("\n")
 
-    # Substitute portable paths with absolute ones
-    body = PATH_RE.sub(winify(user_home), body)
+    # Substitute portable paths with absolute ones (OS-specific separators)
+    body = PATH_RE.sub(make_substituter(user_home, use_backslashes), body)
 
     dst.parent.mkdir(parents=True, exist_ok=True)
     # IMPORTANT: write LF line endings even on Windows. Claude Desktop's
@@ -107,7 +133,23 @@ def main():
         default=None,
         help="Sync only the named task (e.g. nightly-graph-dream, weekly-graph-maintenance). Default: all.",
     )
+    parser.add_argument(
+        "--prompts-dir",
+        default="prompts",
+        help="Directory containing canonical prompt .md files. Default: 'prompts' (repo-relative). The installer passes '~/graph-memory/prompts' for end-user installs.",
+    )
+    parser.add_argument(
+        "--os",
+        choices=["auto", "windows", "unix"],
+        default="auto",
+        help="Path separator style. 'auto' (default) detects from the runtime platform. Use 'windows' to force backslashes (e.g. when running this script inside Linux Docker on behalf of a Windows host) or 'unix' to force forward slashes.",
+    )
     args = parser.parse_args()
+    prompts_dir = Path(os.path.expanduser(args.prompts_dir)).resolve()
+    if args.os == "auto":
+        use_backslashes = os.name == "nt"
+    else:
+        use_backslashes = args.os == "windows"
 
     targets = TASKS if args.task is None else [t for t in TASKS if t[0] == args.task]
     if args.task is not None and not targets:
@@ -116,8 +158,15 @@ def main():
         return 2
 
     rc = 0
-    for task_id, src_path, frontmatter in targets:
-        rc |= sync_one(task_id, src_path, frontmatter, args.user_home)
+    for task_id, src_filename, frontmatter in targets:
+        rc |= sync_one(
+            task_id,
+            src_filename,
+            frontmatter,
+            args.user_home,
+            prompts_dir,
+            use_backslashes,
+        )
     return rc
 
 

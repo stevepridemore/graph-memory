@@ -394,7 +394,7 @@ Dream process extracts 8 entities and 15 relationships from a transcript
 ├── docker-compose.yml     # Neo4j + MCP container definitions
 ├── docs/
 │   ├── ARCHITECTURE.md    # This file
-│   ├── SCHEMA.md
+│   ├── GRAPH_SCHEMA_REFERENCE.md
 │   ├── MCP_SERVER.md
 │   ├── DREAM_PROCESS.md
 │   ├── REMOTE.md          # Cloudflare Tunnel + OAuth setup

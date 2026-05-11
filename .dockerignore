@@ -1,0 +1,35 @@
+# Keep the build context lean. The multi-stage Dockerfile only needs
+# package*.json, tsconfig.json, src/, schema/, prompts/, and scripts/.
+
+node_modules
+dist
+coverage
+
+# Local state and secrets — never bake into the image
+.env
+.env.*
+!.env.example
+.mcp.json
+.claude
+.git
+.github
+
+# Docs and internal — not needed at runtime
+docs
+*.md
+!README.md
+!CLAUDE.md
+!GRAPH_SCHEMA.md
+
+# Local backup / data dirs (in case anyone keeps one inside the repo)
+backups
+graph-memory
+
+# Test output
+test-results
+
+# Editor / OS
+.DS_Store
+Thumbs.db
+.vscode
+.idea

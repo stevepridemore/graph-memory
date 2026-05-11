@@ -1,0 +1,41 @@
+name: Release
+
+# Publishes the graph-memory-mcp container image to GHCR on every v* tag push,
+# tagged with both the version and `latest`. The image is what the
+# install-primary.sh script pulls — no clone or local build required for users.
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  publish-image:
+    name: Publish container image
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: |
+            ghcr.io/stevepridemore/graph-memory-mcp:${{ github.ref_name }}
+            ghcr.io/stevepridemore/graph-memory-mcp:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

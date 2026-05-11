@@ -41,8 +41,11 @@ services:
         max-file: "5"
 
   graph-memory-mcp:
-    build: .
-    image: graph-memory-mcp:latest
+    # Production default: pull the pre-built image from GHCR. Pin a specific
+    # tag via MCP_IMAGE_TAG in .env (e.g. MCP_IMAGE_TAG=v0.3.0); defaults to
+    # `latest`. To build locally from source instead, use the dev override:
+    #   docker compose -f docker-compose.yml -f docker-compose.dev.yml up -d
+    image: ghcr.io/stevepridemore/graph-memory-mcp:${MCP_IMAGE_TAG:-latest}
     container_name: graph-memory-mcp
     restart: unless-stopped
     ports:
