@@ -62,7 +62,7 @@ Every node and edge carries:
 - `embedding` (nodes) — 384-dim vector for semantic search
 - `valid_at` / `invalid_at` / `ingested_at` (edges) — bi-temporal tracking
 
-Full schema in [`docs/SCHEMA.md`](docs/SCHEMA.md).
+Concise vocabulary in [`GRAPH_SCHEMA.md`](GRAPH_SCHEMA.md). Full reference (weights, decay, validity windows, init Cypher) in [`docs/GRAPH_SCHEMA_REFERENCE.md`](docs/GRAPH_SCHEMA_REFERENCE.md).
 
 ## Tools
 
@@ -93,38 +93,71 @@ Slash-command wrappers (`/graph`, `/graph-ask`, `/graph-search`, `/graph-stats`,
 - **[cloudflared](https://github.com/cloudflare/cloudflared)** + a Cloudflare account — only needed for the multi-device / claude.ai web setup described in [`docs/REMOTE.md`](docs/REMOTE.md). Local-only deployments don't need it.
 - **Python 3.10+** — required only by MarkItDown and by `scripts/sync-dream-skill.py`.
 
-## Quick start (single-machine, local only)
+## Install
 
-For just running the graph on your laptop with stdio access from Claude Code:
+graph-memory has exactly one "primary device" — the machine that **runs the two Docker containers** (Neo4j + the MCP server) **and** runs the nightly dream + weekly maintenance scheduled tasks. Every other device is a "secondary device" that talks to the primary over HTTPS + OAuth — secondaries don't run their own containers and don't run their own dream process. Pick the install path that matches the role of the device you're sitting at right now.
+
+### Install — Primary Device (this device runs the containers)
+
+Use this on the machine that will host Neo4j + the MCP server. This is also where the nightly dream and weekly maintenance scheduled tasks run, so the Claude Code transcripts you want extracted should live on this device.
+
+**Linux / macOS / Windows with Git Bash or WSL:**
 
 ```bash
-git clone <this-repo>
+curl -fsSL https://raw.githubusercontent.com/stevepridemore/graph-memory/v0.3.0/scripts/install-primary.sh \
+  | bash -s v0.3.0
+# edit ~/graph-memory/.env (NEO4J_PASSWORD, GRAPH_MEMORY_HOME, CLAUDE_PROJECTS_DIR)
+cd ~/graph-memory && docker compose up -d
+```
+
+**Windows PowerShell (no bash needed):**
+
+```powershell
+$v = 'v0.3.0'
+iwr "https://raw.githubusercontent.com/stevepridemore/graph-memory/$v/scripts/install-primary.ps1" -UseBasicParsing -OutFile $env:TEMP\gm-install.ps1
+& $env:TEMP\gm-install.ps1 -Version $v
+# edit $HOME\graph-memory\.env
+cd $HOME\graph-memory; docker compose up -d
+```
+
+Verify with `/graph-stats` in any Claude Code session.
+
+Optional: see [`docs/REMOTE.md`](docs/REMOTE.md) for the Cloudflare Tunnel + Access setup that lets secondary devices and claude.ai web reach this graph remotely.
+
+### Install — Secondary Device (this device just talks to the primary)
+
+Use this on every additional laptop, work computer, or phone. No Docker, no Neo4j — just the slash commands and an MCP client config pointed at the primary device's Cloudflare Tunnel URL. The primary device must already have the tunnel set up per [`docs/REMOTE.md`](docs/REMOTE.md).
+
+**Linux / macOS / Windows with Git Bash or WSL:**
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/stevepridemore/graph-memory/v0.3.0/scripts/install-secondary.sh \
+  | bash -s v0.3.0 your-tunnel-host.example.com
+```
+
+**Windows PowerShell (no bash needed):**
+
+```powershell
+$v = 'v0.3.0'
+iwr "https://raw.githubusercontent.com/stevepridemore/graph-memory/$v/scripts/install-secondary.ps1" -UseBasicParsing -OutFile $env:TEMP\gm-install.ps1
+& $env:TEMP\gm-install.ps1 -Version $v -TunnelHost your-tunnel-host.example.com
+```
+
+First `/graph-stats` call triggers the OAuth browser flow once; subsequent calls use the cached bearer token.
+
+### Install — Developer (build from source)
+
+Use this if you want to modify graph-memory itself. Requires Node 22+ and Docker.
+
+```bash
+git clone https://github.com/stevepridemore/graph-memory
 cd graph-memory
-cp .env.example .env
-# Edit .env — set NEO4J_PASSWORD to anything ≥8 chars,
-# GRAPH_MEMORY_HOME to your data root (e.g. C:\Users\you\graph-memory or ~/graph-memory),
-# and CLAUDE_PROJECTS_DIR to your Claude transcripts folder
-# (e.g. C:\Users\you\.claude\projects or ~/.claude/projects)
-npm install
-npm run build
-docker compose up -d
+cp .env.example .env  # edit as above
+npm install && npm run build
+docker compose -f docker-compose.yml -f docker-compose.dev.yml up -d
 ```
 
-Then add to `.mcp.json` (project-local) or `~/.claude/.mcp.json` (global). A ready-to-copy template is included at [`.mcp.json.example`](.mcp.json.example):
-
-```json
-{
-  "mcpServers": {
-    "graph-memory": {
-      "command": "docker",
-      "args": ["exec", "-i", "-e", "MCP_TRANSPORT=stdio",
-               "graph-memory-mcp", "node", "/app/dist/mcp-server/index.js"]
-    }
-  }
-}
-```
-
-Verify with `/graph-stats` in any Claude Code conversation.
+The `docker-compose.dev.yml` override switches the MCP service from the published GHCR image to a local `build: .` so your edits get picked up on rebuild.
 
 ## Multi-device / claude.ai web access
 
@@ -206,7 +239,8 @@ Currently steady-state. Active development is opportunistic; the system runs una
 ## Documentation
 
 - [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) — system design, data flows, component responsibilities
-- [`docs/SCHEMA.md`](docs/SCHEMA.md) — node types, relationship types, decay functions, weight semantics
+- [`GRAPH_SCHEMA.md`](GRAPH_SCHEMA.md) — concise vocabulary (node types + edge verbs) for both agent and humans
+- [`docs/GRAPH_SCHEMA_REFERENCE.md`](docs/GRAPH_SCHEMA_REFERENCE.md) — full reference (decay functions, weight semantics, validity windows, example queries)
 - [`docs/MCP_SERVER.md`](docs/MCP_SERVER.md) — every MCP tool with input/output schemas
 - [`docs/DREAM_PROCESS.md`](docs/DREAM_PROCESS.md) — extraction pipeline, manifest format, changelog structure
 - [`docs/SKILLS.md`](docs/SKILLS.md) — slash command definitions

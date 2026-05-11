@@ -1,0 +1,15 @@
+# Dev override: builds the graph-memory-mcp image locally from the working
+# tree instead of pulling from GHCR. Use this when iterating on server code.
+#
+# Usage from a clone:
+#   docker compose -f docker-compose.yml -f docker-compose.dev.yml up -d
+#
+# The build re-runs whenever you change source files. For a one-line dev
+# command, you can alias this:
+#   alias dgm='docker compose -f docker-compose.yml -f docker-compose.dev.yml'
+#   dgm up -d --build
+
+services:
+  graph-memory-mcp:
+    build: .
+    image: graph-memory-mcp:dev
