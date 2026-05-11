@@ -84,7 +84,7 @@ Slash-command wrappers (`/graph`, `/graph-ask`, `/graph-search`, `/graph-stats`,
 **Required:**
 - **Node.js 22+** and npm
 - **Docker** (Desktop on Windows/macOS, or Docker Engine on Linux) with Docker Compose v2
-- **Claude Code** and/or **Claude Desktop** with a **Max** subscription — the dream process runs as a scheduled Claude session, so you need a plan that covers extended sessions without per-token billing
+- **Claude Code** and/or **Claude Desktop** with a Claude plan that covers Claude Code access — Pro, Max, Team, Enterprise, or Console all work (the free Claude.ai plan does not include Claude Code). Pro is fine for light/exploratory use; **Max is recommended for daily-use deployments** because the nightly dream process can be transcript-heavy on a busy day, and an unattended run that exhausts Pro's 5-hour window will abort mid-extraction and skip that night.
 - A few hundred MB of disk for Neo4j + embeddings model
 
 **Optional:**
