@@ -38,15 +38,13 @@ You MAY write to the graph during conversation for **high-confidence, explicit**
 | Mentioned in context but not stated directly | **don't write** — let dream handle at 0.3 |
 
 ### Use specific relationship types — not just RELATED_TO
-| Relationship | When to use |
-|-------------|-------------|
-| WORKS_ON | Person → Project |
-| USES / USES_TECH | Person/Project → Technology |
-| KNOWS_ABOUT | Person → Concept/Technology |
-| PREFERS | Person → Preference |
-| DECIDED_FOR | Person/Project → Decision |
-| PARTICIPATED_IN | Person → Event |
-| RELATED_TO | Only when nothing else fits |
+
+The full vocabulary (node types and edge verbs) lives in
+[`GRAPH_SCHEMA.md`](GRAPH_SCHEMA.md) at the project root. Read that
+file before writing edges so you pick a specific verb (`ABOUT`,
+`PART_OF`, `IMPLEMENTS`, `INSPIRED_BY`, `DEPENDS_ON`, etc.) over
+generic `RELATED_TO`. `RELATED_TO` is the fallback only — use it when
+no specific verb fits.
 
 ### Always include provenance
 - `source_type`: `"conversation"`
