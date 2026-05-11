@@ -231,10 +231,23 @@ All planned phases shipped:
 - ✅ OAuth 2.1 hardening: PKCE-S256 mandatory, public clients only, RFC 7009 revocation, jti tracking, refresh-token TTL 30d, redirect-URI allowlist, optional email allowlist, body-size caps (64 KB OAuth / 4 MB MCP), structured event logging
 - ✅ Internal threat model fully resolved (16 of 16 findings closed)
 - ✅ npm audit clean (0 vulnerabilities)
+- ✅ Pre-built GHCR images + curl-pipeable installers (no clone or local build required for end users)
 
-Current release: [`v0.2.1`](https://github.com/stevepridemore/graph-memory/releases/tag/v0.2.1).
+Current release: [`v0.3.0`](https://github.com/stevepridemore/graph-memory/releases/tag/v0.3.0).
 
 Currently steady-state. Active development is opportunistic; the system runs unattended via the nightly dream process.
+
+## Releases
+
+Newest first. Each tag publishes `ghcr.io/stevepridemore/graph-memory-mcp:<tag>` and moves `:latest`.
+
+| Version | Date | Summary |
+|---|---|---|
+| [`v0.3.0`](https://github.com/stevepridemore/graph-memory/releases/tag/v0.3.0) | 2026-05-10 | Curl-pipeable primary/secondary device installers + pre-built GHCR image. Multi-stage Dockerfile, auto-cert generation on first run, vendored slash commands. End users no longer need to clone or build from source. |
+| [`v0.2.1`](https://github.com/stevepridemore/graph-memory/releases/tag/v0.2.1) | 2026-05-09 | STRIDE threat model fully closed (16 of 16 findings). Hardens OAuth 2.1: PKCE-S256, RFC 7009 revocation, jti tracking, refresh-token TTL, redirect-URI allowlist, email allowlist, body-size caps. |
+| [`v0.2.0`](https://github.com/stevepridemore/graph-memory/releases/tag/v0.2.0) | 2026-05-09 | OAuth 2.1 security hardening pass. Public clients only, mandatory PKCE, body-size caps, structured event logging. |
+| [`v0.1.1`](https://github.com/stevepridemore/graph-memory/releases/tag/v0.1.1) | 2026-05-08 | Decay correctness + test coverage. Vitest in CI, decay function bug fixes. |
+| [`v0.1.0`](https://github.com/stevepridemore/graph-memory/releases/tag/v0.1.0) | 2026-05-07 | Initial public release. MCP server, dream process, slash commands, bi-temporal modeling, semantic search, OAuth multi-device. |
 
 ## Documentation
 
