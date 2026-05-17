@@ -41,7 +41,7 @@ init Cypher, example queries) see
 | `Technology` ✅ 🤔 | A specific tool, language, library, or platform | Overlaps with `Concept`. Currently a categorized Concept; the live graph uses both. Convention going forward: prefer `Technology` for concrete tech (React, Neo4j); `Concept` for abstractions (LLM-wiki-pattern, MVC). |
 | `Decision` ✅ | A choice made or position taken | Often emitted by the dream extractor from "we decided…" / "I chose…" statements. |
 | `Reasoning` ✅ | The why behind a Decision | Pairs with Decision via `LED_TO`; lighter than Decision itself. |
-| `Preference` ✅ | A stated user preference or rule | Person `PREFERS` Preference. Has `domain`, `key`, `value` properties. |
+| `Preference` ✅ | A stated user preference | Person `PREFERS` Preference. Has `domain`, `key`, `value` properties. Use `subtype: 'rule'` for permanent/hard-rule preferences ("never X", "always Y") — these are pinned at `confidence: 1.0` and exempt from decay and pruning. They change only on explicit user statement. |
 | `Event` ✅ | A point-in-time happening | Meeting, milestone, release, incident |
 | `Fact` ✅ | A standalone piece of knowledge | Description-heavy. Best paired with `ABOUT` to whatever it's a fact *about*. |
 | `Artifact` ✅ | A created/authored output (doc, file, transcript, gist) | Subtype of Object — distinct because authorship matters. Pair with `AUTHORED` / `PRODUCED`. |

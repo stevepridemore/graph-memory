@@ -23,6 +23,7 @@ Walk the conversation (or the slice indicated by `--since-message` / `--topic`) 
 - **Projects** worked on, evaluated, or referenced with meaningful context
 - **Technologies / Concepts** the user used, evaluated, decided about, or expressed a preference toward
 - **Preferences** explicitly stated ("I prefer X", "always use Y") or strongly implied through repeated choice
+  - **Rule subtype**: when the user states a hard, permanent constraint with no expected sunset ("never X", "always Y", "X must never appear in Z"), capture as a Preference with `subtype: 'rule'`, `confidence: 1.0`, and a `PREFERS` edge weight of `1.0`. Rules are exempt from decay and pruning and only change on explicit user statement. Reserve this for genuinely permanent constraints, not soft preferences.
 - **Decisions** made with reasoning ("we decided X because Y") — both explicit and clear inferred decisions
 - **Facts** about infrastructure, processes, configuration, or the user's environment
 - **Events** — meetings, deployments, incidents, milestones with dates or outcomes
