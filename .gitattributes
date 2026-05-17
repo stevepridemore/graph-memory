@@ -1,0 +1,7 @@
+# Force LF line endings on shell scripts and Dockerfile so Windows
+# checkouts don't break the entrypoint shim when copied into a Linux
+# container. (Symptom: `/usr/bin/env: 'bash\r': No such file or directory`
+# on container start.)
+*.sh        text eol=lf
+Dockerfile  text eol=lf
+*.cypher    text eol=lf
