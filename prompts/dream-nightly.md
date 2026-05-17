@@ -103,6 +103,7 @@ Focus on **knowledge**, not conversation mechanics. Skip "let me read that file"
 - **Projects** discussed, worked on, or referenced
 - **Technologies/Concepts** used, evaluated, or discussed
 - **Preferences** stated or confirmed ("I prefer X", "always use Y")
+  - **Rule subtype**: when the user states a hard, permanent constraint ("never X", "always Y" — no expected sunset), capture as a Preference with `subtype: 'rule'`, `confidence: 1.0`, and `PREFERS` edge weight `1.0`. Rules are exempt from decay/prune and only change on explicit user statement. Reserve for permanent constraints, not soft preferences.
 - **Decisions** made with reasoning ("we decided to X because Y")
 - **Facts** about infrastructure, processes, or configuration
 - **Events** — meetings, deployments, incidents, milestones

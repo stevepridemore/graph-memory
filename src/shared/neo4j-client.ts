@@ -881,6 +881,7 @@ export class Neo4jClient {
           `
           MATCH (n:\`${type}\` {tenant_id: $tenantId})
           WHERE n.last_seen < datetime() - duration('P1D')
+            AND (n.subtype IS NULL OR n.subtype <> 'rule')
           RETURN count(n) AS count
           `,
           { tenantId },
@@ -893,9 +894,12 @@ export class Neo4jClient {
           `
           MATCH (n:\`${type}\` {tenant_id: $tenantId})
           WHERE n.last_seen < datetime() - duration('P1D')
+            AND (n.subtype IS NULL OR n.subtype <> 'rule')
           // duration.inDays() forces an all-days representation; using .days
           // on the normalized duration.between() would drop the months
           // component (30 days back → "1 month + 0 days" → 0-day decay).
+          // Nodes with subtype='rule' (permanent preferences) are exempt
+          // from decay entirely — they only change on explicit user statement.
           WITH n, n.confidence * ($rate ^ duration.inDays(n.last_seen, datetime()).days) AS new_conf
           SET n.confidence = CASE WHEN new_conf < 0.01 THEN 0.01 ELSE new_conf END
           RETURN count(n) AS decayed
@@ -905,12 +909,16 @@ export class Neo4jClient {
         totalNodesDecayed += Number(rows[0]?.["decayed"] ?? 0);
       }
 
-      // Decay edges (both endpoints must be in tenant)
+      // Decay edges (both endpoints must be in tenant). Edges touching a
+      // subtype='rule' node on either side are exempt — otherwise a rule's
+      // anchor PREFERS edge would slowly decay and orphan the rule.
       const edgeRows = await this.run(
         `
         MATCH (a:Entity {tenant_id: $tenantId})-[r]->(b:Entity {tenant_id: $tenantId})
         WHERE r.last_confirmed < datetime() - duration('P1D')
           AND r.weight IS NOT NULL
+          AND (a.subtype IS NULL OR a.subtype <> 'rule')
+          AND (b.subtype IS NULL OR b.subtype <> 'rule')
         WITH r, r.weight * ($rate ^ duration.inDays(r.last_confirmed, datetime()).days) AS new_weight
         SET r.weight = CASE WHEN new_weight < 0.01 THEN 0.01 ELSE new_weight END
         RETURN count(r) AS decayed
@@ -920,11 +928,14 @@ export class Neo4jClient {
       totalEdgesDecayed = Number(edgeRows[0]?.["decayed"] ?? 0);
     }
 
-    // Count nodes flagged for pruning (tenant-scoped)
+    // Count nodes flagged for pruning (tenant-scoped). Rule-subtype nodes
+    // are pinned at confidence 1.0 so they'd never cross the threshold,
+    // but we filter them explicitly for clarity and defense-in-depth.
     const pruneRows = await this.run(
       `
       MATCH (n:Entity {tenant_id: $tenantId})
       WHERE n.confidence < $threshold
+        AND (n.subtype IS NULL OR n.subtype <> 'rule')
       OPTIONAL MATCH (n)-[r]-(other:Entity {tenant_id: $tenantId})
       WITH n, max(r.weight) AS max_edge_weight
       WHERE max_edge_weight IS NULL OR max_edge_weight < $edgeThreshold
@@ -1230,11 +1241,13 @@ export class Neo4jClient {
     const includeOrphans = options.include_orphans ?? true;
     const maxAgeDays = options.max_age_days ?? config.decay.prune_orphan_days;
 
-    // Find pruneable nodes (tenant-scoped)
+    // Find pruneable nodes (tenant-scoped). Rule-subtype nodes are
+    // permanent and exempt from pruning regardless of confidence.
     const nodeRows = await this.run(
       `
       MATCH (n:Entity {tenant_id: $tenantId})
       WHERE n.confidence < $nodeThreshold
+        AND (n.subtype IS NULL OR n.subtype <> 'rule')
       OPTIONAL MATCH (n)-[r]-(other:Entity {tenant_id: $tenantId})
       WITH n, labels(n) AS labels, max(r.weight) AS maxEdge
       WHERE maxEdge IS NULL OR maxEdge < $edgeThreshold
@@ -1245,7 +1258,9 @@ export class Neo4jClient {
       { tenantId, nodeThreshold, edgeThreshold },
     );
 
-    // Find orphans if requested
+    // Find orphans if requested. Rule-subtype nodes are exempt even if
+    // they become disconnected — a stranded rule should be reconnected,
+    // not deleted.
     let orphanRows: Row[] = [];
     if (includeOrphans) {
       orphanRows = await this.run(
@@ -1254,6 +1269,7 @@ export class Neo4jClient {
         WHERE NOT (n)-[]-()
           AND n.last_seen < datetime() - duration({days: $maxAgeDays})
           AND n.confidence >= $nodeThreshold
+          AND (n.subtype IS NULL OR n.subtype <> 'rule')
         RETURN n.id AS id, n.name AS name,
                [l IN labels(n) WHERE l <> 'Entity'][0] AS type,
                n.confidence AS confidence
@@ -1262,11 +1278,14 @@ export class Neo4jClient {
       );
     }
 
-    // Find pruneable edges (both endpoints in tenant)
+    // Find pruneable edges (both endpoints in tenant). Edges touching a
+    // rule-subtype node on either side are exempt.
     const edgeRows = await this.run(
       `
       MATCH (a:Entity {tenant_id: $tenantId})-[r]->(b:Entity {tenant_id: $tenantId})
       WHERE r.weight < $edgeThreshold
+        AND (a.subtype IS NULL OR a.subtype <> 'rule')
+        AND (b.subtype IS NULL OR b.subtype <> 'rule')
       RETURN a.id AS fromId, b.id AS toId, type(r) AS relType, r.weight AS weight
       `,
       { tenantId, edgeThreshold },
