@@ -29,3 +29,7 @@ coverage/
 # OS
 .DS_Store
 Thumbs.db
+
+# Local admin helper: mints its own tokens with the server private key and
+# hard-codes the owner email. Never commit it (see PR #32).
+graph-call.mjs
