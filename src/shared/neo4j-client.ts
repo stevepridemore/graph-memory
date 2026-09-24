@@ -14,6 +14,18 @@ import type {
   BatchInput,
 } from "./types.js";
 import { embedText, buildEmbedText } from "./embeddings.js";
+import {
+  InvalidIdentifierError,
+  assertSafeIdentifier,
+  normalizeEntityType,
+  normalizeRelation,
+  existingRelation,
+  isSupersedable,
+  sanitizeProperties,
+  clampUnit,
+  checkValidAt,
+  slugify,
+} from "./vocabulary.js";
 
 function debugLogClient(msg: string): void {
   process.stderr.write(`[graph-memory] ${msg}\n`);
@@ -25,6 +37,10 @@ export type { EntityNode, RelationshipEdge, QueryResult };
 // ─── Type helpers ───
 
 type Row = Record<string, unknown>;
+
+/** A query function bound to either an auto-commit session or an open
+ *  transaction, so the same helper can run inside or outside a batch. */
+export type QueryFn = (cypher: string, params?: Record<string, unknown>) => Promise<Row[]>;
 
 /** Convert a neo4j-driver value to a plain JS value. */
 function toPlain(value: unknown): unknown {
@@ -179,21 +195,46 @@ export class Neo4jClient {
     );
   }
 
-  /** Public read-only query — for use by validation and export tools. */
+  /** Public read-only query — for use by validation and export tools.
+   *  Runs in a READ transaction, so a write in the query text fails rather
+   *  than executing. (It previously used a write session despite the name.) */
   async runReadQuery(cypher: string, params: Record<string, unknown> = {}): Promise<Row[]> {
-    return this.run(cypher, params);
+    return this.runReadOnly(cypher, params);
+  }
+
+  private static toRows(records: Array<{ keys: PropertyKey[]; get(key: string): unknown }>): Row[] {
+    return records.map((rec) => {
+      const obj: Row = {};
+      for (const key of rec.keys) {
+        obj[key as string] = toPlain(rec.get(key as string));
+      }
+      return obj;
+    });
   }
 
   private async run(cypher: string, params: Record<string, unknown> = {}): Promise<Row[]> {
     const session = this.driver.session({ defaultAccessMode: neo4j.session.WRITE, database: this.database });
     try {
       const result = await session.run(cypher, intifyParams(params) as Record<string, unknown>);
-      return result.records.map((rec) => {
-        const obj: Row = {};
-        for (const key of rec.keys) {
-          obj[key as string] = toPlain(rec.get(key as string));
-        }
-        return obj;
+      return Neo4jClient.toRows(result.records);
+    } finally {
+      await session.close();
+    }
+  }
+
+  /** Run `fn` inside a single write transaction: every query it issues commits
+   *  together or not at all. The driver may retry `fn` on a transient error,
+   *  so `fn` must keep its own state (counters, maps) local to each call.
+   *  Protected so tests can wrap the query function to inject a failure. */
+  protected async withWriteTx<T>(fn: (q: QueryFn) => Promise<T>): Promise<T> {
+    const session = this.driver.session({ defaultAccessMode: neo4j.session.WRITE, database: this.database });
+    try {
+      return await session.executeWrite(async (tx) => {
+        const q: QueryFn = async (cypher, params = {}) => {
+          const result = await tx.run(cypher, intifyParams(params) as Record<string, unknown>);
+          return Neo4jClient.toRows(result.records);
+        };
+        return fn(q);
       });
     } finally {
       await session.close();
@@ -211,13 +252,7 @@ export class Neo4jClient {
         (tx) => tx.run(cypher, intifyParams(params) as Record<string, unknown>),
         { timeout: options.timeoutMs ?? 30_000 },
       );
-      return result.records.map((rec) => {
-        const obj: Row = {};
-        for (const key of rec.keys) {
-          obj[key as string] = toPlain(rec.get(key as string));
-        }
-        return obj;
-      });
+      return Neo4jClient.toRows(result.records);
     } finally {
       await session.close();
     }
@@ -276,6 +311,17 @@ export class Neo4jClient {
     );
   }
 
+  /** Backdate a node's `last_decayed` by N days, to simulate decay having last
+   *  run N days ago. Used to verify decay accrues once per elapsed interval. */
+  async setNodeLastDecayed(tenantId: string, id: string, daysAgo: number): Promise<void> {
+    const target = new Date(Date.now() - daysAgo * 86_400_000).toISOString();
+    await this.run(
+      `MATCH (n:Entity {tenant_id: $tenantId, id: $id})
+       SET n.last_decayed = datetime($target)`,
+      { tenantId, id, target },
+    );
+  }
+
   /** Backdate an edge's `last_confirmed` by N days. Same purpose as
    *  setNodeLastSeen but for edges; decay weighs both ends. */
   async setEdgeLastConfirmed(
@@ -286,8 +332,9 @@ export class Neo4jClient {
     daysAgo: number,
   ): Promise<void> {
     const target = new Date(Date.now() - daysAgo * 86_400_000).toISOString();
+    const rel = existingRelation(relation);
     await this.run(
-      `MATCH (a:Entity {tenant_id: $tenantId, id: $fromId})-[r:\`${relation}\`]->(b:Entity {tenant_id: $tenantId, id: $toId})
+      `MATCH (a:Entity {tenant_id: $tenantId, id: $fromId})-[r:\`${rel}\`]->(b:Entity {tenant_id: $tenantId, id: $toId})
        SET r.last_confirmed = datetime($target)`,
       { tenantId, fromId, toId, target },
     );
@@ -302,8 +349,9 @@ export class Neo4jClient {
     relation: RelationshipType,
     isoString: string,
   ): Promise<void> {
+    const rel = existingRelation(relation);
     await this.run(
-      `MATCH (a:Entity {tenant_id: $tenantId, id: $fromId})-[r:\`${relation}\`]->(b:Entity {tenant_id: $tenantId, id: $toId})
+      `MATCH (a:Entity {tenant_id: $tenantId, id: $fromId})-[r:\`${rel}\`]->(b:Entity {tenant_id: $tenantId, id: $toId})
        SET r.invalid_at = datetime($isoString)`,
       { tenantId, fromId, toId, isoString },
     );
@@ -382,20 +430,35 @@ export class Neo4jClient {
     confidence = 0.5,
   ): Promise<EntityNode> {
     const now = new Date().toISOString();
+    // Validate before the type reaches query text (it is interpolated as a
+    // label), and map it onto the documented vocabulary.
+    const t = normalizeEntityType(type);
+    const { clean } = sanitizeProperties(properties, "node");
+    if (t.unknown && t.coercedFrom) clean.proposed_type = t.coercedFrom;
+    const safeConfidence = clampUnit(confidence, 0.5);
+
     // Embed name + type + select properties for semantic search. Best-effort —
     // if embedder fails, we still create the entity and let the backfill catch it.
     let embedding: number[] | null = null;
     try {
-      embedding = await embedText(buildEmbedText(name, type, properties));
+      embedding = await embedText(buildEmbedText(name, t.value, clean));
     } catch (err) {
       debugLogClient(`embedText failed for "${name}": ${err instanceof Error ? err.message : String(err)}`);
     }
-    // MERGE includes tenant_id in the merge key — different tenants may have
-    // entities with the same canonical id and they remain distinct nodes.
+    // MERGE on (tenant_id, id) only, matching the uniqueness constraint. The
+    // type label used to be part of the pattern, so re-mentioning an entity
+    // under a different type could never match it and collided with the
+    // constraint instead. The label is now set on create; an existing
+    // entity keeps its type.
+    //
+    // The name is also set on create only. Overwriting it on every match let
+    // a node's display name drift to whichever spelling was used last, so a
+    // single lowercase mention could rename a properly capitalized entity.
     const rows = await this.run(
       `
-      MERGE (n:Entity:\`${type}\` {tenant_id: $tenantId, id: $id})
+      MERGE (n:Entity {tenant_id: $tenantId, id: $id})
       ON CREATE SET
+        n:\`${t.value}\`,
         n.name = $name,
         n.confidence = $confidence,
         n.times_mentioned = 1,
@@ -403,21 +466,21 @@ export class Neo4jClient {
         n.last_seen = datetime($now),
         n.embedding = $embedding
       ON MATCH SET
-        n.name = $name,
         n.confidence = CASE WHEN $confidence > n.confidence THEN $confidence ELSE n.confidence END,
-        n.times_mentioned = n.times_mentioned + 1,
+        n.times_mentioned = coalesce(n.times_mentioned, 0) + 1,
         n.last_seen = datetime($now)
       SET n += $properties
       RETURN n, labels(n) AS labels
       `,
-      { tenantId, id, name, confidence, now, properties, embedding },
+      { tenantId, id, name, confidence: safeConfidence, now, properties: clean, embedding },
     );
     const row = rows[0];
     const nodeObj = row["n"] as { labels: string[]; properties: Record<string, unknown> };
     return recordToEntity(nodeObj.properties, nodeObj.labels);
   }
 
-  /** Look up an entity's ID by its exact name within a tenant. Returns null if not found. */
+  /** Look up an entity's ID by its exact name within a tenant. Returns null if
+   *  not found. Prefer resolveEntityId, which also handles case and aliases. */
   async findEntityIdByName(tenantId: string, name: string): Promise<string | null> {
     const rows = await this.run(
       `MATCH (n:Entity {tenant_id: $tenantId}) WHERE n.name = $name RETURN n.id AS id LIMIT 1`,
@@ -425,6 +488,84 @@ export class Neo4jClient {
     );
     if (rows.length === 0) return null;
     return String(rows[0]["id"]);
+  }
+
+  /** Resolve a name to an existing entity id within a tenant, or null.
+   *
+   *  The one resolver for every write path. There used to be three: single-mode
+   *  graph_relate matched the exact name, batch entities never looked at all
+   *  and went straight to a slug, and batch relation refs matched case-
+   *  insensitively. The batch path is the one the dream process uses, and it
+   *  is what forked duplicate nodes.
+   *
+   *  Order: exact name (uses the tenant+name index), then case-insensitive
+   *  name, then a case-insensitive match against the node's `aliases` list,
+   *  then the slug as an id. */
+  async resolveEntityId(tenantId: string, name: string): Promise<string | null> {
+    return this.resolveWith((c, p) => this.run(c, p), tenantId, name);
+  }
+
+  /** Add alternate names that resolve to this entity. Aliases are the one
+   *  property ordinary writes cannot set (it is reserved in
+   *  sanitizeProperties): an alias redirects every future write that uses
+   *  that name, so a stray one from an extraction could silently attach facts
+   *  about one person to another. Only this deliberate call adds them.
+   *  Returns the entity's full alias list, or null if it does not exist. */
+  async addAliases(tenantId: string, id: string, names: string[]): Promise<string[] | null> {
+    const add = [...new Set(names.map((n) => n.trim()).filter(Boolean))];
+    const rows = await this.run(
+      `MATCH (n:Entity {tenant_id: $tenantId, id: $id})
+       WITH n, coalesce(n.aliases, []) AS current
+       WITH n, current + [a IN $add WHERE NOT toLower(a) IN [c IN current | toLower(c)]
+                                     AND toLower(a) <> toLower(n.name)] AS merged
+       SET n.aliases = merged
+       RETURN n.aliases AS aliases`,
+      { tenantId, id, add },
+    );
+    return rows.length > 0 ? (rows[0]["aliases"] as string[]) : null;
+  }
+
+  /** Remove aliases (case-insensitive). Returns the remaining list, or null
+   *  if the entity does not exist. */
+  async removeAliases(tenantId: string, id: string, names: string[]): Promise<string[] | null> {
+    const drop = names.map((n) => n.trim().toLowerCase()).filter(Boolean);
+    const rows = await this.run(
+      `MATCH (n:Entity {tenant_id: $tenantId, id: $id})
+       SET n.aliases = [a IN coalesce(n.aliases, []) WHERE NOT toLower(a) IN $drop]
+       RETURN n.aliases AS aliases`,
+      { tenantId, id, drop },
+    );
+    return rows.length > 0 ? (rows[0]["aliases"] as string[]) : null;
+  }
+
+  private async resolveWith(q: QueryFn, tenantId: string, name: string): Promise<string | null> {
+    if (!name) return null;
+
+    const exact = await q(
+      `MATCH (n:Entity {tenant_id: $tenantId, name: $name}) RETURN n.id AS id ORDER BY n.id LIMIT 1`,
+      { tenantId, name },
+    );
+    if (exact.length > 0) return String(exact[0]["id"]);
+
+    const loose = await q(
+      `MATCH (n:Entity {tenant_id: $tenantId})
+       WHERE toLower(n.name) = toLower($name)
+          OR ANY(a IN coalesce(n.aliases, []) WHERE toLower(a) = toLower($name))
+       RETURN n.id AS id,
+              CASE WHEN toLower(n.name) = toLower($name) THEN 0 ELSE 1 END AS rank
+       ORDER BY rank, n.id
+       LIMIT 1`,
+      { tenantId, name },
+    );
+    if (loose.length > 0) return String(loose[0]["id"]);
+
+    const slug = slugify(name);
+    if (!slug) return null;
+    const bySlug = await q(
+      `MATCH (n:Entity {tenant_id: $tenantId, id: $id}) RETURN n.id AS id LIMIT 1`,
+      { tenantId, id: slug },
+    );
+    return bySlug.length > 0 ? String(bySlug[0]["id"]) : null;
   }
 
   async getEntity(tenantId: string, id: string): Promise<EntityNode | null> {
@@ -457,12 +598,27 @@ export class Neo4jClient {
     properties: Record<string, unknown> = {},
     provenance?: { source_session?: string; source_transcript?: string; source_type?: string; source_tenant?: string },
     validAt?: string,
-  ): Promise<RelationshipEdge> {
+  ): Promise<RelationshipEdge & { created: boolean; relation_coerced_from?: string }> {
     const now = new Date().toISOString();
-    const supersede = validAt !== undefined && validAt !== null;
-    const supersedeAt = validAt ?? now;
+    // Validate before the verb reaches query text, and map it onto the
+    // documented vocabulary. An unknown verb is written as RELATED_TO with the
+    // original kept in `proposed_relations`, so no meaning is lost and no new
+    // relationship type is created.
+    const rel = normalizeRelation(type);
+    const proposed = rel.unknown && rel.value === "RELATED_TO" ? rel.coercedFrom ?? null : null;
+    const validAtChecked = checkValidAt(validAt);
+    const safeWeight = clampUnit(weight, 0.5);
+
+    // `valid_at` means "this replaces the previous value": sibling edges of the
+    // same type from this source are marked invalid. That is right for
+    // single-valued facts and destructive for multi-valued ones, so it never
+    // applies to verbs like FAMILY_OF, where dating one child's birth must not
+    // retire every other child.
+    const supersede = validAtChecked !== null && isSupersedable(rel.value);
+    const supersedeAt = validAtChecked ?? now;
+    const { clean } = sanitizeProperties(properties, "edge");
     const allProps = {
-      ...properties,
+      ...clean,
       tenant_id: tenantId, // edges carry the tenant of the relationship for audit/export
       ...(provenance?.source_session && { source_session: provenance.source_session }),
       ...(provenance?.source_transcript && { source_transcript: provenance.source_transcript }),
@@ -472,20 +628,28 @@ export class Neo4jClient {
 
     // Both endpoints must belong to the same tenant — cross-tenant edges are
     // disallowed at this layer (the data model assumes per-tenant graphs).
+    //
+    // The superseded edges are collected into a list before the MERGE. Setting
+    // them straight off the OPTIONAL MATCH fanned the query out to one row per
+    // predecessor, which ran the MERGE's ON MATCH once per extra row and
+    // inflated the new edge's weight by 0.05 each time.
+    //
+    // Re-assertion adds 0.05 but is clamped at 1.0, as boost() always was.
+    // `created` compares ingested_at, which only ON CREATE sets to $now.
     const rows = await this.run(
       `
       MATCH (a:Entity {tenant_id: $tenantId, id: $fromId})
       MATCH (b:Entity {tenant_id: $tenantId, id: $toId})
 
       WITH a, b
-      OPTIONAL MATCH (a)-[old:\`${type}\`]->(other:Entity)
+      OPTIONAL MATCH (a)-[old:\`${rel.value}\`]->(other:Entity)
       WHERE $supersede = true
         AND other.id <> $toId
         AND old.invalid_at IS NULL
-      SET old.invalid_at = datetime($supersedeAt)
+      WITH a, b, collect(old) AS superseded
+      FOREACH (o IN superseded | SET o.invalid_at = datetime($supersedeAt))
 
-      WITH a, b
-      MERGE (a)-[r:\`${type}\`]->(b)
+      MERGE (a)-[r:\`${rel.value}\`]->(b)
       ON CREATE SET
         r.weight = $weight,
         r.last_confirmed = datetime($now),
@@ -495,21 +659,37 @@ export class Neo4jClient {
       ON MATCH SET
         r.weight = CASE
           WHEN $weight > r.weight THEN $weight
+          WHEN r.weight + 0.05 > 1.0 THEN 1.0
           ELSE r.weight + 0.05
         END,
         r.last_confirmed = datetime($now),
         r.valid_at = CASE WHEN $validAt IS NOT NULL THEN datetime($validAt) ELSE r.valid_at END,
         r += $allProps
-      RETURN r, a.id AS fromId, b.id AS toId, type(r) AS relType
+      WITH r, a, b
+      SET r.proposed_relations = CASE
+        WHEN $proposed IS NULL THEN r.proposed_relations
+        WHEN $proposed IN coalesce(r.proposed_relations, []) THEN r.proposed_relations
+        ELSE coalesce(r.proposed_relations, []) + $proposed
+      END
+      RETURN r, a.id AS fromId, b.id AS toId, type(r) AS relType,
+             coalesce(r.ingested_at = datetime($now), false) AS created
       `,
-      { tenantId, fromId, toId, weight, now, allProps, supersede, supersedeAt, validAt: validAt ?? null },
+      {
+        tenantId, fromId, toId, weight: safeWeight, now, allProps,
+        supersede, supersedeAt, validAt: validAtChecked, proposed,
+      },
     );
     const row = rows[0];
     if (!row) {
       throw new Error(`Failed to create relationship: entities ${fromId} or ${toId} not found in tenant ${tenantId}`);
     }
     const relObj = row["r"] as { type: string; properties: Record<string, unknown> };
-    return recordToEdge(relObj.properties, String(row["relType"]), String(row["fromId"]), String(row["toId"]));
+    const edge = recordToEdge(relObj.properties, String(row["relType"]), String(row["fromId"]), String(row["toId"]));
+    return {
+      ...edge,
+      created: row["created"] === true,
+      ...(rel.coercedFrom ? { relation_coerced_from: rel.coercedFrom } : {}),
+    };
   }
 
   async getRelationships(tenantId: string, entityId: string, direction: "in" | "out" | "both" = "both"): Promise<RelationshipEdge[]> {
@@ -548,9 +728,10 @@ export class Neo4jClient {
   ): Promise<{ previous_weight: number; new_weight: number }> {
     const config = getConfig();
     const boostAmount = amount ?? config.weights.boost_on_confirm;
+    const rel = existingRelation(type);
     const rows = await this.run(
       `
-      MATCH (a:Entity {tenant_id: $tenantId, id: $fromId})-[r:\`${type}\`]->(b:Entity {tenant_id: $tenantId, id: $toId})
+      MATCH (a:Entity {tenant_id: $tenantId, id: $fromId})-[r:\`${rel}\`]->(b:Entity {tenant_id: $tenantId, id: $toId})
       WITH r, r.weight AS old_weight
       SET r.weight = CASE WHEN r.weight + $amount > 1.0 THEN 1.0 ELSE r.weight + $amount END,
           r.last_confirmed = datetime()
@@ -575,9 +756,10 @@ export class Neo4jClient {
   ): Promise<{ previous_weight: number; new_weight: number }> {
     const config = getConfig();
     const weakenAmount = amount ?? config.weights.weaken_on_correct;
+    const rel = existingRelation(type);
     const rows = await this.run(
       `
-      MATCH (a:Entity {tenant_id: $tenantId, id: $fromId})-[r:\`${type}\`]->(b:Entity {tenant_id: $tenantId, id: $toId})
+      MATCH (a:Entity {tenant_id: $tenantId, id: $fromId})-[r:\`${rel}\`]->(b:Entity {tenant_id: $tenantId, id: $toId})
       WITH r, r.weight AS old_weight
       SET r.weight = CASE WHEN r.weight - $amount < 0.0 THEN 0.0 ELSE r.weight - $amount END,
           r.last_confirmed = datetime()
@@ -608,7 +790,10 @@ export class Neo4jClient {
     } = {},
   ): Promise<QueryResult> {
     const config = getConfig();
-    const maxHops = options.max_hops ?? config.query.default_max_hops;
+    // Interpolated into a variable-length pattern, so it must be a small
+    // integer. Unbounded, a deep query from a hub (the owner node has ~250
+    // edges) enumerates an enormous path set before LIMIT applies.
+    const maxHops = Math.max(0, Math.min(4, Math.trunc(Number(options.max_hops ?? config.query.default_max_hops) || 0)));
     const minWeight = options.min_weight ?? config.query.default_min_weight;
     const limit = options.limit ?? config.query.default_limit;
     const currentOnly = options.current_only ?? true;
@@ -750,6 +935,9 @@ export class Neo4jClient {
     } = {},
   ): Promise<{ entities: EntityNode[]; total: number }> {
     const limit = options.limit ?? 20;
+    // The type is interpolated as a label below. Validate it; don't enforce the
+    // vocabulary, since filtering by a legacy label is a legitimate read.
+    const typeLabel = options.type ? assertSafeIdentifier("entity type", options.type) : undefined;
     let cypher: string;
     let params: Record<string, unknown>;
 
@@ -775,7 +963,7 @@ export class Neo4jClient {
         ...(options.min_confidence != null ? { minConf: options.min_confidence } : {}),
       };
     } else {
-      const typeMatch = options.type ? `(n:\`${options.type}\` {tenant_id: $tenantId})` : "(n:Entity {tenant_id: $tenantId})";
+      const typeMatch = typeLabel ? `(n:\`${typeLabel}\` {tenant_id: $tenantId})` : "(n:Entity {tenant_id: $tenantId})";
       const confFilter = options.min_confidence != null ? `WHERE n.confidence >= $minConf` : "";
       const orderBy =
         options.sort_by === "last_seen"
@@ -800,7 +988,9 @@ export class Neo4jClient {
       };
     }
 
-    const rows = await this.run(cypher, params);
+    // graph_entities is annotated readOnlyHint, so clients may run it without
+    // asking. It now runs in a read transaction to match that promise.
+    const rows = await this.runReadOnly(cypher, params);
 
     const entities = rows.map((row) => {
       const nodeObj = row["node"] as { labels: string[]; properties: Record<string, unknown> };
@@ -810,10 +1000,10 @@ export class Neo4jClient {
     });
 
     // Tenant-scoped total count
-    const countCypher = options.type
-      ? `MATCH (n:\`${options.type}\` {tenant_id: $tenantId}) RETURN count(n) AS total`
+    const countCypher = typeLabel
+      ? `MATCH (n:\`${typeLabel}\` {tenant_id: $tenantId}) RETURN count(n) AS total`
       : `MATCH (n:Entity {tenant_id: $tenantId}) RETURN count(n) AS total`;
-    const countRows = await this.run(countCypher, { tenantId });
+    const countRows = await this.runReadOnly(countCypher, { tenantId });
     const totalNum = Number(countRows[0]?.["total"] ?? 0);
 
     return { entities, total: totalNum };
@@ -875,13 +1065,43 @@ export class Neo4jClient {
     let totalNodesDecayed = 0;
     let totalEdgesDecayed = 0;
 
+    // Decay is measured from the most recent of last_seen (the last time the
+    // entity was confirmed or boosted) and last_decayed (the last time decay
+    // ran), and every run stamps last_decayed. That makes decay accrue ONCE per
+    // elapsed interval.
+    //
+    // Without it, every nightly run re-applied rate^(days since last_seen) to an
+    // already-decayed value with a growing exponent, so decay compounded to
+    // rate^(N(N+1)/2) instead of rate^N. That crushed average weight from 0.35
+    // to 0.26 before it was caught. It was fixed on 2026-07-01 by patching the
+    // compiled JavaScript inside the running container, which a rebuild from
+    // this source would have silently reverted; this is that fix, in source,
+    // with a regression test.
+    //
+    // duration.inDays() forces an all-days representation; using .days on a
+    // normalized duration.between() would drop the months component. Nodes
+    // with subtype='rule' are exempt: they only change on explicit statement.
+    const nodeBase = `
+          WITH n, CASE
+              WHEN n.last_decayed IS NULL THEN n.last_seen
+              WHEN n.last_seen IS NULL THEN n.last_decayed
+              WHEN n.last_decayed > n.last_seen THEN n.last_decayed
+              ELSE n.last_seen END AS base_ts
+          WHERE base_ts IS NOT NULL AND base_ts < datetime() - duration('P1D')`;
+
+    // Decay rates are keyed by label and interpolated, so validate the keys:
+    // they come from a user-editable config file.
+    const rates = Object.entries(config.decay.rates).map(
+      ([type, rate]) => [assertSafeIdentifier("decay rate type", type), rate] as const,
+    );
+
     if (dryRun) {
-      for (const [type] of Object.entries(config.decay.rates)) {
+      for (const [type] of rates) {
         const rows = await this.run(
           `
           MATCH (n:\`${type}\` {tenant_id: $tenantId})
-          WHERE n.last_seen < datetime() - duration('P1D')
-            AND (n.subtype IS NULL OR n.subtype <> 'rule')
+          WHERE (n.subtype IS NULL OR n.subtype <> 'rule')
+          ${nodeBase}
           RETURN count(n) AS count
           `,
           { tenantId },
@@ -889,19 +1109,15 @@ export class Neo4jClient {
         totalNodesDecayed += Number(rows[0]?.["count"] ?? 0);
       }
     } else {
-      for (const [type, rate] of Object.entries(config.decay.rates)) {
+      for (const [type, rate] of rates) {
         const rows = await this.run(
           `
           MATCH (n:\`${type}\` {tenant_id: $tenantId})
-          WHERE n.last_seen < datetime() - duration('P1D')
-            AND (n.subtype IS NULL OR n.subtype <> 'rule')
-          // duration.inDays() forces an all-days representation; using .days
-          // on the normalized duration.between() would drop the months
-          // component (30 days back → "1 month + 0 days" → 0-day decay).
-          // Nodes with subtype='rule' (permanent preferences) are exempt
-          // from decay entirely — they only change on explicit user statement.
-          WITH n, n.confidence * ($rate ^ duration.inDays(n.last_seen, datetime()).days) AS new_conf
-          SET n.confidence = CASE WHEN new_conf < 0.01 THEN 0.01 ELSE new_conf END
+          WHERE (n.subtype IS NULL OR n.subtype <> 'rule')
+          ${nodeBase}
+          WITH n, n.confidence * ($rate ^ duration.inDays(base_ts, datetime()).days) AS new_conf
+          SET n.confidence = CASE WHEN new_conf < 0.01 THEN 0.01 ELSE new_conf END,
+              n.last_decayed = datetime()
           RETURN count(n) AS decayed
           `,
           { tenantId, rate },
@@ -915,12 +1131,18 @@ export class Neo4jClient {
       const edgeRows = await this.run(
         `
         MATCH (a:Entity {tenant_id: $tenantId})-[r]->(b:Entity {tenant_id: $tenantId})
-        WHERE r.last_confirmed < datetime() - duration('P1D')
-          AND r.weight IS NOT NULL
+        WHERE r.weight IS NOT NULL
           AND (a.subtype IS NULL OR a.subtype <> 'rule')
           AND (b.subtype IS NULL OR b.subtype <> 'rule')
-        WITH r, r.weight * ($rate ^ duration.inDays(r.last_confirmed, datetime()).days) AS new_weight
-        SET r.weight = CASE WHEN new_weight < 0.01 THEN 0.01 ELSE new_weight END
+        WITH r, CASE
+            WHEN r.last_decayed IS NULL THEN r.last_confirmed
+            WHEN r.last_confirmed IS NULL THEN r.last_decayed
+            WHEN r.last_decayed > r.last_confirmed THEN r.last_decayed
+            ELSE r.last_confirmed END AS base_ts
+        WHERE base_ts IS NOT NULL AND base_ts < datetime() - duration('P1D')
+        WITH r, r.weight * ($rate ^ duration.inDays(base_ts, datetime()).days) AS new_weight
+        SET r.weight = CASE WHEN new_weight < 0.01 THEN 0.01 ELSE new_weight END,
+            r.last_decayed = datetime()
         RETURN count(r) AS decayed
         `,
         { tenantId, rate: config.decay.edge_rate },
@@ -958,37 +1180,27 @@ export class Neo4jClient {
 
   // ─── Batch Operations (for dream process) ───
 
-  /** Resolve a batch reference (rel.from / rel.to) to an actual entity id within
-   *  a tenant. Resolution order:
-   *    1. localId in this batch's idMap
-   *    2. Existing entity in this tenant by exact name (case-insensitive)
-   *    3. Slugified id lookup within this tenant
-   *    4. null (unresolvable)
-   */
-  private async resolveBatchRef(tenantId: string, idMap: Map<string, string>, ref: string): Promise<string | null> {
-    const fromBatch = idMap.get(ref);
-    if (fromBatch) return fromBatch;
-
-    // Try exact name (case-insensitive) within tenant
-    const byName = await this.run(
-      `MATCH (n:Entity {tenant_id: $tenantId}) WHERE toLower(n.name) = toLower($name) RETURN n.id AS id LIMIT 1`,
-      { tenantId, name: ref },
-    );
-    if (byName.length > 0) return String(byName[0]["id"]);
-
-    // Try slugified id within tenant
-    const slug = ref.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "");
-    if (slug) {
-      const bySlug = await this.run(
-        `MATCH (n:Entity {tenant_id: $tenantId, id: $id}) RETURN n.id AS id LIMIT 1`,
-        { tenantId, id: slug },
-      );
-      if (bySlug.length > 0) return String(bySlug[0]["id"]);
-    }
-
-    return null;
+  /** Resolve a batch reference (rel.from / rel.to): a localId in this batch
+   *  first, then the same resolver every other write path uses. */
+  private async resolveBatchRef(
+    q: QueryFn,
+    tenantId: string,
+    idMap: Map<string, string>,
+    ref: string,
+  ): Promise<string | null> {
+    return idMap.get(ref) ?? this.resolveWith(q, tenantId, ref);
   }
 
+  /** Create or merge a batch of entities and relationships in ONE transaction.
+   *
+   *  The tool description has always said batch mode is atomic. It was not:
+   *  every entity and edge was its own auto-commit statement, so a failure
+   *  part-way through left the earlier writes committed.
+   *
+   *  Input problems never abort the batch. An entity or relation with an
+   *  invalid type, verb or date is skipped and reported, and the rest is
+   *  written. Only a database error rolls the batch back, and then nothing
+   *  from it is kept. */
   async batchRelate(tenantId: string, batch: BatchInput): Promise<{
     entities_created: number;
     entities_merged: number;
@@ -996,141 +1208,197 @@ export class Neo4jClient {
     edges_strengthened: number;
     edges_failed: number;
     failed_refs: Array<{ from: string; to: string; relation: string; reason: string }>;
+    skipped_entities: Array<{ localId: string; name: string; reason: string }>;
+    coercions: Array<{ kind: "entity_type" | "relation"; from: string; to: string }>;
   }> {
     const now = new Date().toISOString();
-    let entitiesCreated = 0;
-    let entitiesMerged = 0;
+    const coercions: Array<{ kind: "entity_type" | "relation"; from: string; to: string }> = [];
+    const skippedEntities: Array<{ localId: string; name: string; reason: string }> = [];
+    const inputFailures: Array<{ from: string; to: string; relation: string; reason: string }> = [];
 
-    // Resolve localId → real id mapping
-    const idMap = new Map<string, string>();
+    // ── Validate everything before the transaction opens ──
+    const entities: Array<{
+      localId: string; name: string; type: string; properties: Record<string, unknown>;
+    }> = [];
+    for (const entity of batch.entities) {
+      try {
+        if (!slugify(entity.name ?? "")) throw new InvalidIdentifierError("name has no letters or digits");
+        const t = normalizeEntityType(entity.type);
+        if (t.coercedFrom) coercions.push({ kind: "entity_type", from: t.coercedFrom, to: t.value });
+        const { clean } = sanitizeProperties(entity.properties, "node");
+        if (t.unknown && t.coercedFrom) clean.proposed_type = t.coercedFrom;
+        entities.push({ localId: entity.localId, name: entity.name, type: t.value, properties: clean });
+      } catch (err) {
+        if (!(err instanceof InvalidIdentifierError)) throw err;
+        skippedEntities.push({ localId: entity.localId, name: String(entity.name), reason: err.message });
+      }
+    }
 
-    // Pre-compute embeddings for all batch entity names in parallel.
-    // 10ms per embed × N is too slow sequentially for big batches; parallelize.
+    const relations: Array<{
+      from: string; to: string; relation: string; original: string; proposed: string | null;
+      weight: number; validAt: string | null; props: Record<string, unknown>;
+    }> = [];
+    for (const rel of batch.relations) {
+      try {
+        const r = normalizeRelation(rel.relation);
+        if (r.coercedFrom) coercions.push({ kind: "relation", from: r.coercedFrom, to: r.value });
+        const { clean } = sanitizeProperties(rel.properties, "edge");
+        relations.push({
+          from: rel.from,
+          to: rel.to,
+          relation: r.value,
+          original: String(rel.relation),
+          proposed: r.unknown && r.value === "RELATED_TO" ? r.coercedFrom ?? null : null,
+          weight: clampUnit(rel.weight, 0.5),
+          validAt: checkValidAt(rel.valid_at),
+          props: {
+            ...clean,
+            tenant_id: tenantId,
+            ...(rel.evidence && { evidence: rel.evidence }),
+            ...(batch.source_session && { source_session: batch.source_session }),
+            ...(batch.source_transcript && { source_transcript: batch.source_transcript }),
+            ...(batch.source_type && { source_type: batch.source_type }),
+          },
+        });
+      } catch (err) {
+        if (!(err instanceof InvalidIdentifierError)) throw err;
+        inputFailures.push({ from: rel.from, to: rel.to, relation: String(rel.relation), reason: err.message });
+      }
+    }
+
+    // Embeddings are CPU work with no database access, so compute them before
+    // the transaction rather than holding it open. Parallel: 10ms per embed
+    // is too slow sequentially for big batches.
     const embeddings = await Promise.all(
-      batch.entities.map(async (entity) => {
+      entities.map(async (entity) => {
         try {
           return await embedText(buildEmbedText(entity.name, entity.type, entity.properties));
         } catch { return null; }
       }),
     );
 
-    // Create/merge all entities (tenant_id is part of the merge key)
-    for (let i = 0; i < batch.entities.length; i++) {
-      const entity = batch.entities[i];
-      const id = entity.name.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "");
-      idMap.set(entity.localId, id);
+    // ── One transaction for every write ──
+    // Counters live inside the callback: the driver may retry it on a
+    // transient error, and a retry must start from zero.
+    return this.withWriteTx(async (q) => {
+      let entitiesCreated = 0;
+      let entitiesMerged = 0;
+      let edgesCreated = 0;
+      let edgesStrengthened = 0;
+      const failedRefs = [...inputFailures];
+      const idMap = new Map<string, string>();
 
-      const rows = await this.run(
-        `
-        MERGE (n:Entity:\`${entity.type}\` {tenant_id: $tenantId, id: $id})
-        ON CREATE SET
-          n.name = $name,
-          n.confidence = 0.5,
-          n.times_mentioned = 1,
-          n.first_seen = datetime($now),
-          n.last_seen = datetime($now),
-          n.embedding = $embedding
-        ON MATCH SET
-          n.times_mentioned = n.times_mentioned + 1,
-          n.last_seen = datetime($now)
-        SET n += $properties
-        RETURN CASE WHEN n.times_mentioned = 1 THEN 'created' ELSE 'merged' END AS action
-        `,
-        {
-          tenantId,
-          id,
-          name: entity.name,
-          now,
-          properties: entity.properties ?? {},
-          embedding: embeddings[i],
-        },
-      );
-      const action = rows[0]?.["action"];
-      if (action === "created") entitiesCreated++;
-      else entitiesMerged++;
-    }
+      for (let i = 0; i < entities.length; i++) {
+        const entity = entities[i];
+        // Resolve against existing entities first, including ones created
+        // earlier in this same transaction. Only mint a slug id when the name
+        // matches nothing: that is what stops batches forking duplicates.
+        const id = (await this.resolveWith(q, tenantId, entity.name)) ?? slugify(entity.name);
+        idMap.set(entity.localId, id);
 
-    // Create/merge all relationships
-    let edgesCreated = 0;
-    let edgesStrengthened = 0;
-    let edgesFailed = 0;
-    const failedRefs: Array<{ from: string; to: string; relation: string; reason: string }> = [];
-
-    for (const rel of batch.relations) {
-      const fromId = await this.resolveBatchRef(tenantId, idMap, rel.from);
-      const toId = await this.resolveBatchRef(tenantId, idMap, rel.to);
-
-      if (!fromId || !toId) {
-        edgesFailed++;
-        failedRefs.push({
-          from: rel.from,
-          to: rel.to,
-          relation: rel.relation,
-          reason: !fromId
-            ? `from "${rel.from}" did not resolve to any entity in tenant ${tenantId} (not in batch, no name match, no id match)`
-            : `to "${rel.to}" did not resolve to any entity in tenant ${tenantId} (not in batch, no name match, no id match)`,
-        });
-        continue;
+        const rows = await q(
+          `
+          MERGE (n:Entity {tenant_id: $tenantId, id: $id})
+          ON CREATE SET
+            n:\`${entity.type}\`,
+            n.name = $name,
+            n.confidence = 0.5,
+            n.times_mentioned = 1,
+            n.first_seen = datetime($now),
+            n.last_seen = datetime($now),
+            n.embedding = $embedding
+          ON MATCH SET
+            n.times_mentioned = coalesce(n.times_mentioned, 0) + 1,
+            n.last_seen = datetime($now)
+          SET n += $properties
+          RETURN CASE WHEN n.first_seen = datetime($now) THEN 'created' ELSE 'merged' END AS action
+          `,
+          { tenantId, id, name: entity.name, now, properties: entity.properties, embedding: embeddings[i] },
+        );
+        if (rows[0]?.["action"] === "created") entitiesCreated++;
+        else entitiesMerged++;
       }
 
-      const batchValidAt = rel.valid_at ?? null;
-      const allProps: Record<string, unknown> = {
-        ...(rel.properties ?? {}),
-        tenant_id: tenantId,
-        ...(rel.evidence && { evidence: rel.evidence }),
-        ...(batch.source_session && { source_session: batch.source_session }),
-        ...(batch.source_transcript && { source_transcript: batch.source_transcript }),
-        ...(batch.source_type && { source_type: batch.source_type }),
+      for (const rel of relations) {
+        const fromId = await this.resolveBatchRef(q, tenantId, idMap, rel.from);
+        const toId = await this.resolveBatchRef(q, tenantId, idMap, rel.to);
+
+        if (!fromId || !toId) {
+          failedRefs.push({
+            from: rel.from,
+            to: rel.to,
+            relation: rel.original,
+            reason: !fromId
+              ? `from "${rel.from}" did not resolve to any entity in tenant ${tenantId} (not in batch, no name, alias or id match)`
+              : `to "${rel.to}" did not resolve to any entity in tenant ${tenantId} (not in batch, no name, alias or id match)`,
+          });
+          continue;
+        }
+
+        // `action` used to be derived from `r.weight = $weight`, which also
+        // holds when ON MATCH raised an existing edge to a stronger incoming
+        // weight, so those were miscounted as created. ingested_at is only
+        // ever set to $now by ON CREATE.
+        const rows = await q(
+          `
+          MATCH (a:Entity {tenant_id: $tenantId, id: $fromId})
+          MATCH (b:Entity {tenant_id: $tenantId, id: $toId})
+          MERGE (a)-[r:\`${rel.relation}\`]->(b)
+          ON CREATE SET
+            r.weight = $weight,
+            r.last_confirmed = datetime($now),
+            r.ingested_at = datetime($now),
+            r.valid_at = CASE WHEN $validAt IS NOT NULL THEN datetime($validAt) ELSE null END,
+            r += $props
+          ON MATCH SET
+            r.weight = CASE
+              WHEN $weight > r.weight THEN $weight
+              WHEN r.weight + 0.05 > 1.0 THEN 1.0
+              ELSE r.weight + 0.05
+            END,
+            r.last_confirmed = datetime($now),
+            r.valid_at = CASE WHEN $validAt IS NOT NULL THEN datetime($validAt) ELSE r.valid_at END,
+            r += $props
+          WITH r
+          SET r.proposed_relations = CASE
+            WHEN $proposed IS NULL THEN r.proposed_relations
+            WHEN $proposed IN coalesce(r.proposed_relations, []) THEN r.proposed_relations
+            ELSE coalesce(r.proposed_relations, []) + $proposed
+          END
+          RETURN CASE WHEN r.ingested_at = datetime($now) THEN 'created' ELSE 'strengthened' END AS action
+          `,
+          {
+            tenantId, fromId, toId, now,
+            weight: rel.weight, validAt: rel.validAt, props: rel.props, proposed: rel.proposed,
+          },
+        );
+        const action = rows[0]?.["action"];
+        if (!action) {
+          // Both endpoints resolved but the MERGE returned no rows — unexpected.
+          failedRefs.push({
+            from: rel.from,
+            to: rel.to,
+            relation: rel.original,
+            reason: `MERGE returned no rows for resolved ids ${fromId} -> ${toId} (unexpected)`,
+          });
+        } else if (action === "created") {
+          edgesCreated++;
+        } else {
+          edgesStrengthened++;
+        }
+      }
+
+      return {
+        entities_created: entitiesCreated,
+        entities_merged: entitiesMerged,
+        edges_created: edgesCreated,
+        edges_strengthened: edgesStrengthened,
+        edges_failed: failedRefs.length,
+        failed_refs: failedRefs,
+        skipped_entities: skippedEntities,
+        coercions,
       };
-
-      const rows = await this.run(
-        `
-        MATCH (a:Entity {tenant_id: $tenantId, id: $fromId})
-        MATCH (b:Entity {tenant_id: $tenantId, id: $toId})
-        MERGE (a)-[r:\`${rel.relation}\`]->(b)
-        ON CREATE SET
-          r.weight = $weight,
-          r.last_confirmed = datetime($now),
-          r.ingested_at = datetime($now),
-          r.valid_at = CASE WHEN $batchValidAt IS NOT NULL THEN datetime($batchValidAt) ELSE null END,
-          r += $allProps
-        ON MATCH SET
-          r.weight = CASE
-            WHEN $weight > r.weight THEN $weight
-            ELSE r.weight + 0.05
-          END,
-          r.last_confirmed = datetime($now),
-          r.valid_at = CASE WHEN $batchValidAt IS NOT NULL THEN datetime($batchValidAt) ELSE r.valid_at END,
-          r += $allProps
-        RETURN CASE WHEN r.weight = $weight THEN 'created' ELSE 'strengthened' END AS action
-        `,
-        { tenantId, fromId, toId, weight: rel.weight, now, allProps, batchValidAt },
-      );
-      const action = rows[0]?.["action"];
-      if (!action) {
-        edgesFailed++;
-        // Both endpoints resolved but the MERGE returned no rows — unexpected.
-        failedRefs.push({
-          from: rel.from,
-          to: rel.to,
-          relation: rel.relation,
-          reason: `MERGE returned no rows for resolved ids ${fromId} -> ${toId} (unexpected)`,
-        });
-      } else if (action === "created") {
-        edgesCreated++;
-      } else {
-        edgesStrengthened++;
-      }
-    }
-
-    return {
-      entities_created: entitiesCreated,
-      entities_merged: entitiesMerged,
-      edges_created: edgesCreated,
-      edges_strengthened: edgesStrengthened,
-      edges_failed: edgesFailed,
-      failed_refs: failedRefs,
-    };
+    });
   }
 
   // ─── Raw Cypher (read-only) ───
@@ -1352,13 +1620,21 @@ export class Neo4jClient {
     original: { id: string; remaining_edges: number };
     new_entity: { id: string; name: string; moved_edges: number };
   }> {
-    const newId = newEntityName.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "");
+    const newId = slugify(newEntityName);
     const now = new Date().toISOString();
+
+    // Validate every identifier before anything is written: the type and each
+    // relation are interpolated into query text, and failing on the third edge
+    // would otherwise leave a half-finished split behind. Relations name edges
+    // that already exist, so they are validated but not remapped.
+    const newType = normalizeEntityType(newEntityType).value;
+    const moves = edgesToMove.map((edge) => ({ ...edge, relation_type: existingRelation(edge.relation_type) }));
+    edgesToMove = moves;
 
     // Create the new entity in the same tenant
     await this.run(
       `
-      CREATE (n:Entity:\`${newEntityType}\` {
+      CREATE (n:Entity:\`${newType}\` {
         tenant_id: $tenantId,
         id: $newId,
         name: $newEntityName,
@@ -1523,7 +1799,8 @@ export class Neo4jClient {
       { tenantId, sourceId },
     );
     for (const row of outgoing) {
-      const rel = String(row["rel"]);
+      // Read back from the database, but still interpolated: validate it.
+      const rel = assertSafeIdentifier("relation", String(row["rel"]));
       const otherId = String(row["otherId"]);
       const props = (row["props"] as Record<string, unknown>) ?? {};
       const existing = await this.run(
@@ -1557,7 +1834,8 @@ export class Neo4jClient {
       { tenantId, sourceId },
     );
     for (const row of incoming) {
-      const rel = String(row["rel"]);
+      // Read back from the database, but still interpolated: validate it.
+      const rel = assertSafeIdentifier("relation", String(row["rel"]));
       const otherId = String(row["otherId"]);
       const props = (row["props"] as Record<string, unknown>) ?? {};
       const existing = await this.run(
@@ -2189,7 +2467,7 @@ export class Neo4jClient {
   }> {
     const threshold = options.weight_threshold ?? 0.4;
     const maxCommunities = options.max_communities ?? 10;
-    const maxHops = Math.max(1, Math.min(options.max_hops ?? 3, 4));
+    const maxHops = Math.max(1, Math.min(4, Math.trunc(Number(options.max_hops ?? 3) || 1)));
     const minSize = options.min_size ?? 2;
 
     // Step 1: rank nodes by strong-edge degree (tenant-scoped)

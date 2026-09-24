@@ -6,6 +6,7 @@ import { decodeJwt } from "jose";
 import { Neo4jClient } from "../shared/neo4j-client.js";
 import { GRAPH_MEMORY_HOME } from "../shared/config.js";
 import { ENTITY_TYPES, RELATIONSHIP_TYPES } from "../shared/types.js";
+import { normalizeEntityType, normalizeRelation, slugify } from "../shared/vocabulary.js";
 import type { EntityType, RelationshipType } from "../shared/types.js";
 import { parseTranscriptFile, getTextMessages } from "../shared/transcript-parser.js";
 import { appendAuditEvent } from "../shared/dream-audit.js";
@@ -19,6 +20,7 @@ import { AsyncLocalStorage } from "node:async_hooks";
 import {
   resolveTenantFromRequest,
   getStaticTenantId,
+  getTenantSource,
   isAdminTenant,
   TenantAuthError,
   BearerVerifyError,
@@ -69,7 +71,7 @@ function currentIdentity(): VerifiedAccessIdentity | undefined {
 
 // ─── Helpers ───
 
-const slugify = (s: string) => s.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "");
+// slugify lives in shared/vocabulary.ts so every path mints ids the same way.
 
 // ─── Debug file logger ───
 
@@ -107,6 +109,18 @@ const MCP_TRANSPORT_EARLY = process.env.MCP_TRANSPORT ?? "stdio";
 debugLog(`startup transport=${MCP_TRANSPORT_EARLY} pid=${process.pid}`);
 debugLog(`NEO4J_URI set=${!!process.env.NEO4J_URI} PASSWORD set=${!!process.env.NEO4J_PASSWORD} USER set=${!!process.env.NEO4J_USER}`);
 debugLog(`GRAPH_MEMORY_HOME=${GRAPH_MEMORY_HOME}`);
+
+// TENANT_ID_SOURCE defaults to "static", which gives every request the
+// bootstrap tenant, and the bootstrap tenant is admin. That is right for stdio
+// and wrong for anything reachable over the network. Not changed to a hard
+// failure, since existing installs may depend on it, but it must be loud.
+if (MCP_TRANSPORT_EARLY !== "stdio" && getTenantSource() === "static") {
+  debugLog(
+    "WARNING: HTTP transport with TENANT_ID_SOURCE=static. Every request is served as the " +
+      "admin bootstrap tenant with no authentication. Set TENANT_ID_SOURCE=oauth or cf-access " +
+      "unless this port is reachable only from a trusted host.",
+  );
+}
 
 const client = new Neo4jClient();
 const server = new McpServer({
@@ -169,7 +183,7 @@ server.registerTool("graph_query", {
   inputSchema: {
     entities: z.array(z.string()).describe("Entity names to search for"),
     entity_types: z.array(z.string()).optional().describe("Filter results to these entity types"),
-    max_hops: z.number().optional().default(2).describe("Max traversal depth (default: 2)"),
+    max_hops: z.number().optional().default(2).describe("Max traversal depth (default: 2, capped at 4)"),
     min_weight: z.number().optional().default(0.3).describe("Min edge weight to traverse (default: 0.3)"),
     limit: z.number().optional().default(20).describe("Max results (default: 20)"),
     project_context: z.string().optional().describe("Project directory or name for affinity scoring"),
@@ -217,7 +231,7 @@ server.registerTool("graph_query", {
 server.registerTool("graph_relate", {
   title: "Graph Relate",
   description:
-    "Create or strengthen a relationship between entities. Creates the endpoint entities if they don't exist. Use single mode (from_name/to_name/relation) for one fact at a time. Use batch mode when extracting from a transcript or document — it's atomic, so a partial failure won't leave dangling nodes. Idempotent: re-asserting an existing edge boosts its weight rather than duplicating.",
+    "Create or strengthen a relationship between entities. Creates the endpoint entities if they don't exist, matching existing ones by name, case-insensitive name, or alias first. Use single mode (from_name/to_name/relation) for one fact at a time. Use batch mode when extracting from a transcript or document: it runs in one transaction, so a database failure keeps nothing, while an invalid item is skipped and reported without blocking the rest. Types and relations must use the documented vocabulary (see GRAPH_SCHEMA.md); an unknown relation is stored as RELATED_TO with the original kept in proposed_relations, and an unknown type as Object with proposed_type. Idempotent: re-asserting an existing edge strengthens it (capped at 1.0) and reports action \"strengthened\".",
   inputSchema: {
     // Single mode
     from_name: z.string().optional().describe("Source entity name (single mode)"),
@@ -228,7 +242,7 @@ server.registerTool("graph_relate", {
     weight: z.number().optional().describe("Edge weight 0.0-1.0"),
     properties: z.record(z.string(), z.unknown()).optional().describe("Additional properties"),
     evidence: z.string().optional().describe("Why this relationship exists"),
-    valid_at: z.string().optional().describe("When this fact became true"),
+    valid_at: z.string().optional().describe("ISO-8601 date this fact became true. Also REPLACES the previous value: other edges of this type from the same source are marked invalid as of this date. Omit it for facts that can hold several values at once. FAMILY_OF, KNOWS, COLLABORATES_WITH, MENTOR_OF, ALIAS_OF, CONTRADICTS and RELATED_TO never supersede."),
     source_session: z.string().optional().describe("Session ID for provenance"),
     source_transcript: z.string().optional().describe("Transcript path for provenance"),
     source_type: z.string().optional().describe("Source type: conversation, ingest, manual, bootstrap"),
@@ -281,13 +295,23 @@ server.registerTool("graph_relate", {
       return toolError("Single mode requires from_name, from_type, to_name, to_type, and relation");
     }
 
-    // Prefer existing entity ID by name lookup over slug generation — prevents duplicate nodes
-    const fromId = (await client.findEntityIdByName(tenantId, args.from_name)) ?? slugify(args.from_name);
-    const toId = (await client.findEntityIdByName(tenantId, args.to_name)) ?? slugify(args.to_name);
+    // Validate the identifiers first so a bad relation is rejected before
+    // either endpoint entity is created.
+    const fromType = normalizeEntityType(args.from_type);
+    const toType = normalizeEntityType(args.to_type);
+    const relation = normalizeRelation(args.relation);
+
+    // Resolve by name, case-insensitive name, or alias before minting a slug:
+    // the same resolver batch mode uses, so the two paths can't disagree.
+    const fromId = (await client.resolveEntityId(tenantId, args.from_name)) ?? slugify(args.from_name);
+    const toId = (await client.resolveEntityId(tenantId, args.to_name)) ?? slugify(args.to_name);
+    if (!fromId || !toId) {
+      return toolError("from_name and to_name must each contain at least one letter or digit");
+    }
 
     // Ensure entities exist (within tenant)
-    await client.createEntity(tenantId, args.from_type as EntityType, fromId, args.from_name, {}, args.weight ?? 0.5);
-    await client.createEntity(tenantId, args.to_type as EntityType, toId, args.to_name, {}, args.weight ?? 0.5);
+    await client.createEntity(tenantId, fromType.value, fromId, args.from_name, {}, args.weight ?? 0.5);
+    await client.createEntity(tenantId, toType.value, toId, args.to_name, {}, args.weight ?? 0.5);
 
     const edge = await client.createRelationship(
       tenantId,
@@ -305,9 +329,18 @@ server.registerTool("graph_relate", {
       args.valid_at,
     );
 
+    // Report what actually happened. This always said "created", including
+    // when an existing edge was only strengthened.
+    const coercions = [
+      fromType.coercedFrom && { kind: "entity_type", from: fromType.coercedFrom, to: fromType.value },
+      toType.coercedFrom && { kind: "entity_type", from: toType.coercedFrom, to: toType.value },
+      relation.coercedFrom && { kind: "relation", from: relation.coercedFrom, to: relation.value },
+    ].filter(Boolean);
+
     return toolResult({
-      action: "created",
+      action: edge.created ? "created" : "strengthened",
       edge: { from: edge.from, to: edge.to, type: edge.type, weight: edge.weight },
+      ...(coercions.length > 0 && { coercions }),
     });
   } catch (err) {
     return toolError(`graph_relate failed: ${err instanceof Error ? err.message : String(err)}`);
@@ -336,6 +369,37 @@ server.registerTool("graph_delete", {
   }
 });
 
+// ─── Tool: graph_alias ───
+
+server.registerTool("graph_alias", {
+  title: "Graph Alias",
+  description:
+    "Add or remove alternate names for an entity, so future writes and lookups using those names resolve to it instead of creating a duplicate node. Use when the user says two names refer to the same person or thing: a nickname, a maiden or married name, a first name used alone. Case-insensitive. An exact entity name always takes precedence over an alias. With neither add nor remove, lists the current aliases.",
+  inputSchema: {
+    entity: z.string().describe("Entity name or ID to attach the aliases to"),
+    add: z.array(z.string()).optional().describe("Names to add as aliases"),
+    remove: z.array(z.string()).optional().describe("Aliases to remove"),
+  },
+  annotations: { idempotentHint: true },
+}, async (args) => {
+  try {
+    const tenantId = currentTenant();
+    const id = await client.resolveEntityId(tenantId, args.entity);
+    if (!id) return toolError(`No entity found for "${args.entity}"`);
+
+    let aliases: string[] | null = null;
+    if (args.add?.length) aliases = await client.addAliases(tenantId, id, args.add);
+    if (args.remove?.length) aliases = await client.removeAliases(tenantId, id, args.remove);
+    if (!args.add?.length && !args.remove?.length) {
+      const entity = await client.getEntity(tenantId, id);
+      aliases = (entity?.properties.aliases as string[] | undefined) ?? [];
+    }
+    return toolResult({ id, aliases: aliases ?? [] });
+  } catch (err) {
+    return toolError(`graph_alias failed: ${err instanceof Error ? err.message : String(err)}`);
+  }
+});
+
 // ─── Tool: graph_boost ───
 
 server.registerTool("graph_boost", {
@@ -353,8 +417,8 @@ server.registerTool("graph_boost", {
 }, async (args) => {
   try {
     const tenantId = currentTenant();
-    const fromId = (await client.findEntityIdByName(tenantId, args.from_name)) ?? slugify(args.from_name);
-    const toId = (await client.findEntityIdByName(tenantId, args.to_name)) ?? slugify(args.to_name);
+    const fromId = (await client.resolveEntityId(tenantId, args.from_name)) ?? slugify(args.from_name);
+    const toId = (await client.resolveEntityId(tenantId, args.to_name)) ?? slugify(args.to_name);
     const result = await client.boost(tenantId, fromId, toId, args.relation as RelationshipType, args.amount);
     return toolResult({
       previous_weight: result.previous_weight,
@@ -383,8 +447,8 @@ server.registerTool("graph_weaken", {
 }, async (args) => {
   try {
     const tenantId = currentTenant();
-    const fromId = (await client.findEntityIdByName(tenantId, args.from_name)) ?? slugify(args.from_name);
-    const toId = (await client.findEntityIdByName(tenantId, args.to_name)) ?? slugify(args.to_name);
+    const fromId = (await client.resolveEntityId(tenantId, args.from_name)) ?? slugify(args.from_name);
+    const toId = (await client.resolveEntityId(tenantId, args.to_name)) ?? slugify(args.to_name);
     const result = await client.weaken(tenantId, fromId, toId, args.relation as RelationshipType, args.amount);
     return toolResult({
       previous_weight: result.previous_weight,
