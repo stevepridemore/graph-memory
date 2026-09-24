@@ -1,6 +1,7 @@
 import { describe, it, expect, beforeAll, afterAll, beforeEach } from "vitest";
 import { randomUUID } from "node:crypto";
-import { Neo4jClient } from "./neo4j-client.js";
+import { Neo4jClient, type QueryFn } from "./neo4j-client.js";
+import { InvalidIdentifierError } from "./vocabulary.js";
 
 // Integration tests — require a running Neo4j instance.
 //
@@ -481,7 +482,7 @@ describe("Merge", () => {
     await client.createRelationship(T, "anna", "gm", "WORKS_ON", 0.4);
     await client.createRelationship(T, "anne", "gm", "WORKS_ON", 0.7);     // overlap → consolidate
     await client.createRelationship(T, "anna", "cc", "WORKS_ON", 0.6);     // unique → move
-    await client.createRelationship(T, "bob",  "anna", "WORKS_WITH", 0.5); // incoming → re-target
+    await client.createRelationship(T, "bob",  "anna", "COLLABORATES_WITH", 0.5); // incoming → re-target
     await client.createRelationship(T, "anna", "anne", "ALIAS_OF", 0.9);   // self-loop → drop
   });
 
@@ -528,7 +529,7 @@ describe("Merge", () => {
 
     // Incoming bob→anne (re-targeted from bob→anna).
     const inn = await client.getRelationships(T, "anne", "in");
-    const bobAnn = inn.find((e) => e.type === "WORKS_WITH" && e.from === "bob");
+    const bobAnn = inn.find((e) => e.type === "COLLABORATES_WITH" && e.from === "bob");
     expect(bobAnn?.weight).toBe(0.5);
 
     // ALIAS_OF self-loop is gone.
@@ -927,5 +928,368 @@ describe("bi-temporal supersession", () => {
     } finally {
       await client.clearTenant(T2);
     }
+  });
+});
+
+// ─── Write-path hardening, 2026-09-23 ───────────────────────────────────────
+// One test per fix from the 2026-09-23 review. Each fails against the code as
+// it stood before that date.
+
+describe("Decay accrues once per interval (compounding regression)", () => {
+  it("a second run on the same day leaves node confidence unchanged", async () => {
+    await client.createEntity(T, "Person", "dc-node", "DC Node", {}, 0.8);
+    await client.setNodeLastSeen(T, "dc-node", 30);
+
+    await client.applyDecay(T);
+    const first = (await client.getEntity(T, "dc-node"))!.confidence;
+    expect(first).toBeCloseTo(0.8 * Math.pow(DECAY_RATES.Person, 30), 4);
+
+    // The compounding bug re-applied rate^30 here, every run.
+    await client.applyDecay(T);
+    const second = (await client.getEntity(T, "dc-node"))!.confidence;
+    expect(second).toBeCloseTo(first, 10);
+  });
+
+  it("the next day applies exactly one more day of decay, not rate^(days since last seen)", async () => {
+    await client.createEntity(T, "Person", "dc-lin", "DC Linear", {}, 0.8);
+    await client.setNodeLastSeen(T, "dc-lin", 30);
+    await client.applyDecay(T);
+    const first = (await client.getEntity(T, "dc-lin"))!.confidence;
+
+    await client.setNodeLastDecayed(T, "dc-lin", 1);
+    await client.applyDecay(T);
+    const next = (await client.getEntity(T, "dc-lin"))!.confidence;
+    expect(next).toBeCloseTo(first * DECAY_RATES.Person, 6);
+  });
+
+  it("a second run on the same day leaves edge weight unchanged", async () => {
+    await client.createEntity(T, "Person", "dc-a", "DC A", {}, 0.9);
+    await client.createEntity(T, "Project", "dc-b", "DC B", {}, 0.9);
+    await client.createRelationship(T, "dc-a", "dc-b", "WORKS_ON", 0.8);
+    await client.setEdgeLastConfirmed(T, "dc-a", "dc-b", "WORKS_ON", 50);
+
+    await client.applyDecay(T);
+    const first = (await client.getRelationships(T, "dc-a", "out"))[0].weight;
+    expect(first).toBeCloseTo(0.8 * Math.pow(EDGE_DECAY_RATE, 50), 4);
+
+    await client.applyDecay(T);
+    const second = (await client.getRelationships(T, "dc-a", "out"))[0].weight;
+    expect(second).toBeCloseTo(first, 10);
+  });
+});
+
+describe("Identifier injection", () => {
+  // Closes the backtick, then appends a statement. Fails at validation, before
+  // any query is built.
+  const PAYLOAD = "WORKS_ON`]->(x) WITH 1 AS z MATCH (n) DETACH DELETE n //";
+
+  it("createRelationship rejects an injected relation and writes nothing", async () => {
+    await client.createEntity(T, "Person", "inj-a", "Inj A");
+    await client.createEntity(T, "Project", "inj-b", "Inj B");
+    await expect(
+      client.createRelationship(T, "inj-a", "inj-b", PAYLOAD as never, 0.5),
+    ).rejects.toThrow(InvalidIdentifierError);
+    expect(await client.getEntity(T, "inj-b")).not.toBeNull();
+    expect(await client.getRelationships(T, "inj-a")).toHaveLength(0);
+  });
+
+  it("createEntity rejects an injected type and creates nothing", async () => {
+    await expect(
+      client.createEntity(T, "Person`) DETACH DELETE (x" as never, "inj-c", "Inj C"),
+    ).rejects.toThrow(InvalidIdentifierError);
+    expect(await client.getEntity(T, "inj-c")).toBeNull();
+  });
+
+  it("boost, weaken and the entity search filter reject injected identifiers", async () => {
+    await client.createEntity(T, "Person", "inj-d", "Inj D");
+    await client.createEntity(T, "Project", "inj-e", "Inj E");
+    await client.createRelationship(T, "inj-d", "inj-e", "WORKS_ON", 0.5);
+    await expect(client.boost(T, "inj-d", "inj-e", PAYLOAD as never, 0.1)).rejects.toThrow(InvalidIdentifierError);
+    await expect(client.weaken(T, "inj-d", "inj-e", PAYLOAD as never, 0.1)).rejects.toThrow(InvalidIdentifierError);
+    await expect(
+      client.searchEntities(T, { type: "Person`) DETACH DELETE (n" as never }),
+    ).rejects.toThrow(InvalidIdentifierError);
+    expect((await client.getRelationships(T, "inj-d", "out"))[0].weight).toBe(0.5);
+  });
+
+  it("unmerge rejects an injected relation before creating the new entity", async () => {
+    await client.createEntity(T, "Person", "um-a", "UM A");
+    await expect(
+      client.unmerge(T, "um-a", "UM B", "Person",
+        [{ other_entity_id: "x", relation_type: PAYLOAD as never, direction: "out" }], "test"),
+    ).rejects.toThrow(InvalidIdentifierError);
+    expect(await client.getEntity(T, "um-b")).toBeNull();
+  });
+
+  it("batch mode skips an injected relation, reports it, and writes the rest", async () => {
+    const r = await client.batchRelate(T, {
+      entities: [
+        { localId: "a", name: "Batch A", type: "Person" },
+        { localId: "b", name: "Batch B", type: "Project" },
+      ],
+      relations: [
+        { from: "a", to: "b", relation: PAYLOAD as never, weight: 0.5 },
+        { from: "a", to: "b", relation: "WORKS_ON", weight: 0.5 },
+      ],
+    });
+    expect(r.edges_created).toBe(1);
+    expect(r.failed_refs).toHaveLength(1);
+    expect(r.failed_refs[0].reason).toMatch(/invalid relation/);
+    const edges = await client.getRelationships(T, "batch-a", "out");
+    expect(edges.map((e) => e.type)).toEqual(["WORKS_ON"]);
+  });
+
+  it("runReadQuery is genuinely read-only", async () => {
+    await expect(
+      client.runReadQuery("CREATE (n:Entity {tenant_id: $t, id: 'rw-probe'})", { t: T }),
+    ).rejects.toThrow();
+    expect(await client.getEntity(T, "rw-probe")).toBeNull();
+  });
+});
+
+describe("Batch atomicity", () => {
+  // A subclass that fails the first relationship write, after every entity in
+  // the batch has already been MERGEd inside the same transaction.
+  class FailingClient extends Neo4jClient {
+    protected override async withWriteTx<R>(fn: (q: QueryFn) => Promise<R>): Promise<R> {
+      return super.withWriteTx((q) =>
+        fn(async (cypher, params) => {
+          if (cypher.includes("MERGE (a)-[r:")) throw new Error("injected database failure");
+          return q(cypher, params);
+        }),
+      );
+    }
+  }
+
+  it("a database failure mid-batch keeps nothing from the batch", async () => {
+    const failing = new FailingClient(
+      process.env.NEO4J_URI ?? "bolt://localhost:7687",
+      process.env.NEO4J_USER ?? "neo4j",
+      process.env.NEO4J_PASSWORD ?? "graph-memory-local",
+    );
+    try {
+      await expect(
+        failing.batchRelate(T, {
+          entities: [
+            { localId: "a", name: "Atomic A", type: "Person" },
+            { localId: "b", name: "Atomic B", type: "Project" },
+          ],
+          relations: [{ from: "a", to: "b", relation: "WORKS_ON", weight: 0.5 }],
+        }),
+      ).rejects.toThrow(/injected database failure/);
+    } finally {
+      await failing.close();
+    }
+    // Before 2026-09-23 both entities were already committed at this point.
+    expect(await client.getEntity(T, "atomic-a")).toBeNull();
+    expect(await client.getEntity(T, "atomic-b")).toBeNull();
+  });
+
+  it("an invalid item does not block the rest of the batch", async () => {
+    const r = await client.batchRelate(T, {
+      entities: [
+        { localId: "ok", name: "Fine Entity", type: "Person" },
+        { localId: "bad", name: "Broken Entity", type: "Per`son" as never },
+      ],
+      relations: [{ from: "ok", to: "ok", relation: "KNOWS", weight: 0.5, valid_at: "last spring" }],
+    });
+    expect(r.entities_created).toBe(1);
+    expect(r.skipped_entities).toHaveLength(1);
+    expect(r.failed_refs[0].reason).toMatch(/valid_at/);
+    expect(await client.getEntity(T, "fine-entity")).not.toBeNull();
+  });
+});
+
+describe("Edge weights and reported actions", () => {
+  beforeEach(async () => {
+    await client.createEntity(T, "Person", "w-a", "W A");
+    await client.createEntity(T, "Project", "w-b", "W B");
+  });
+
+  it("re-asserting an edge never raises its weight above 1.0", async () => {
+    for (let i = 0; i < 5; i++) await client.createRelationship(T, "w-a", "w-b", "WORKS_ON", 0.99);
+    const w = (await client.getRelationships(T, "w-a", "out"))[0].weight;
+    expect(w).toBe(1.0);
+  });
+
+  it("reports created, then strengthened", async () => {
+    const first = await client.createRelationship(T, "w-a", "w-b", "WORKS_ON", 0.5);
+    const again = await client.createRelationship(T, "w-a", "w-b", "WORKS_ON", 0.5);
+    expect(first.created).toBe(true);
+    expect(again.created).toBe(false);
+  });
+
+  it("batch counts an edge raised to a stronger weight as strengthened, not created", async () => {
+    const batch = (weight: number) => ({
+      entities: [
+        { localId: "a", name: "W A", type: "Person" as const },
+        { localId: "b", name: "W B", type: "Project" as const },
+      ],
+      relations: [{ from: "a", to: "b", relation: "WORKS_ON" as const, weight }],
+    });
+    expect((await client.batchRelate(T, batch(0.3))).edges_created).toBe(1);
+    const raised = await client.batchRelate(T, batch(0.9));
+    expect(raised.edges_created).toBe(0);
+    expect(raised.edges_strengthened).toBe(1);
+  });
+});
+
+describe("Supersession", () => {
+  beforeEach(async () => {
+    for (const id of ["s-a", "s-b", "s-c", "s-d"]) {
+      await client.createEntity(T, "Person", id, id.toUpperCase());
+    }
+  });
+
+  it("superseding several predecessors does not inflate the new edge's weight", async () => {
+    await client.createRelationship(T, "s-a", "s-b", "USES", 0.7);
+    await client.createRelationship(T, "s-a", "s-c", "USES", 0.7);
+    // Two current predecessors: the old query fanned out to two rows and ran
+    // ON MATCH on the second, leaving 0.75.
+    await client.createRelationship(T, "s-a", "s-d", "USES", 0.7, {}, undefined, "2025-01-01T00:00:00Z");
+    const all = await client.getRelationships(T, "s-a", "out");
+    expect(all.find((e) => e.to === "s-d")!.weight).toBe(0.7);
+    expect(all.filter((e) => e.invalid_at == null).map((e) => e.to)).toEqual(["s-d"]);
+  });
+
+  it("FAMILY_OF with valid_at never supersedes siblings", async () => {
+    await client.createRelationship(T, "s-a", "s-b", "FAMILY_OF", 0.7, { role: "son" }, undefined, "1985-01-01T00:00:00Z");
+    await client.createRelationship(T, "s-a", "s-c", "FAMILY_OF", 0.7, { role: "daughter" }, undefined, "1990-12-01T00:00:00Z");
+    const current = (await client.getRelationships(T, "s-a", "out")).filter((e) => e.invalid_at == null);
+    expect(current.map((e) => e.to).sort()).toEqual(["s-b", "s-c"]);
+  });
+
+  it("rejects an unparseable valid_at instead of throwing mid-query", async () => {
+    await expect(
+      client.createRelationship(T, "s-a", "s-b", "USES", 0.7, {}, undefined, "last spring"),
+    ).rejects.toThrow(InvalidIdentifierError);
+  });
+});
+
+describe("One resolver for every write path", () => {
+  it("batch resolves a name through an alias instead of forking a node", async () => {
+    await client.createEntity(T, "Person", "sam-rivera", "Sam Rivera");
+    await client.addAliases(T, "sam-rivera", ["sam"]);
+
+    await client.batchRelate(T, {
+      entities: [
+        { localId: "s", name: "sam", type: "Person" },
+        { localId: "p", name: "Graph Memory", type: "Project" },
+      ],
+      relations: [{ from: "s", to: "p", relation: "WORKS_ON", weight: 0.7 }],
+    });
+
+    expect(await client.getEntity(T, "sam")).toBeNull();
+    const owner = await client.getEntity(T, "sam-rivera");
+    expect(owner!.name).toBe("Sam Rivera");
+    const out = await client.getRelationships(T, "sam-rivera", "out");
+    expect(out.find((e) => e.type === "WORKS_ON" && e.to === "graph-memory")).toBeDefined();
+  });
+
+  it("batch matches an existing entity case-insensitively even when its id is not the slug", async () => {
+    await client.createEntity(T, "Person", "alex", "Alex Morgan");
+    await client.batchRelate(T, {
+      entities: [{ localId: "a", name: "alex morgan", type: "Person" }],
+      relations: [],
+    });
+    expect(await client.getEntity(T, "alex-morgan")).toBeNull();
+    expect((await client.getEntity(T, "alex"))!.times_mentioned).toBe(2);
+  });
+
+  it("resolveEntityId: exact name, then case, then alias, then slug", async () => {
+    await client.createEntity(T, "Person", "robin", "Robin");
+    await client.addAliases(T, "robin", ["Robbie"]);
+    expect(await client.resolveEntityId(T, "Robin")).toBe("robin");
+    expect(await client.resolveEntityId(T, "ROBIN")).toBe("robin");
+    expect(await client.resolveEntityId(T, "robbie")).toBe("robin");
+    expect(await client.resolveEntityId(T, "nobody")).toBeNull();
+  });
+
+  it("aliases cannot be set through ordinary properties", async () => {
+    await client.createEntity(T, "Person", "casey", "Casey", { aliases: ["Someone Else"] });
+    expect(await client.resolveEntityId(T, "Someone Else")).toBeNull();
+  });
+
+  it("a match does not overwrite the stored name", async () => {
+    await client.createEntity(T, "Person", "name-keep", "Original Name");
+    await client.createEntity(T, "Person", "name-keep", "original name");
+    expect((await client.getEntity(T, "name-keep"))!.name).toBe("Original Name");
+  });
+
+  it("re-mentioning an entity under a different type keeps it instead of throwing", async () => {
+    await client.createEntity(T, "Person", "type-keep", "Type Keep");
+    await expect(client.createEntity(T, "Project", "type-keep", "Type Keep")).resolves.toBeDefined();
+    expect((await client.getEntity(T, "type-keep"))!.type).toBe("Person");
+  });
+});
+
+describe("Vocabulary enforcement", () => {
+  beforeEach(async () => {
+    await client.createEntity(T, "Person", "v-a", "V A");
+    await client.createEntity(T, "Project", "v-b", "V B");
+  });
+
+  it("stores a lower-case verb upper-case", async () => {
+    const e = await client.createRelationship(T, "v-a", "v-b", "works_on" as never, 0.5);
+    expect(e.type).toBe("WORKS_ON");
+  });
+
+  it("maps a known alias to the documented verb", async () => {
+    const e = await client.createRelationship(T, "v-a", "v-b", "USES_TECHNOLOGY" as never, 0.5);
+    expect(e.type).toBe("USES_TECH");
+    expect(e.relation_coerced_from).toBe("USES_TECHNOLOGY");
+  });
+
+  it("stores an unknown verb as RELATED_TO and keeps every original", async () => {
+    await client.createRelationship(T, "v-a", "v-b", "OWNS" as never, 0.5);
+    await client.createRelationship(T, "v-a", "v-b", "MANAGES" as never, 0.5);
+    const edges = await client.getRelationships(T, "v-a", "out");
+    expect(edges).toHaveLength(1);
+    expect(edges[0].type).toBe("RELATED_TO");
+    expect(edges[0].properties.proposed_relations).toEqual(["OWNS", "MANAGES"]);
+  });
+
+  it("maps entity type aliases and keeps an unknown type as proposed_type", async () => {
+    await client.createEntity(T, "tool" as never, "v-tool", "Some Tool");
+    await client.createEntity(T, "Gizmo" as never, "v-gizmo", "Some Gizmo");
+    expect((await client.getEntity(T, "v-tool"))!.type).toBe("Technology");
+    const gizmo = await client.getEntity(T, "v-gizmo");
+    expect(gizmo!.type).toBe("Object");
+    expect(gizmo!.properties.proposed_type).toBe("Gizmo");
+  });
+});
+
+describe("Caller properties", () => {
+  it("cannot move a node to another tenant, rewrite its id, or put prose in confidence", async () => {
+    await client.batchRelate(T, {
+      entities: [{
+        localId: "e", name: "Sneaky", type: "Person",
+        properties: { tenant_id: `${T}-victim`, id: "hijack", confidence: "about ninety percent" },
+      }],
+      relations: [],
+    });
+    const e = await client.getEntity(T, "sneaky");
+    expect(e).not.toBeNull();
+    expect(e!.confidence).toBe(0.5);
+    expect(e!.properties.confidence_note).toBe("about ninety percent");
+    expect(await client.getEntity(`${T}-victim`, "sneaky")).toBeNull();
+    expect(await client.getEntity(T, "hijack")).toBeNull();
+  });
+
+  it("stores nested values as JSON instead of failing the whole batch", async () => {
+    const r = await client.batchRelate(T, {
+      entities: [{ localId: "n", name: "Nested", type: "Fact", properties: { detail: { a: 1, b: [2, 3] } } }],
+      relations: [],
+    });
+    expect(r.entities_created).toBe(1);
+    expect((await client.getEntity(T, "nested"))!.properties.detail).toBe(JSON.stringify({ a: 1, b: [2, 3] }));
+  });
+});
+
+describe("Query bounds", () => {
+  it("tolerates fractional and oversized max_hops", async () => {
+    await client.createEntity(T, "Person", "hop-a", "Hop A");
+    await expect(client.query(T, ["Hop A"], { max_hops: 2.5 })).resolves.toBeDefined();
+    await expect(client.query(T, ["Hop A"], { max_hops: 50 })).resolves.toBeDefined();
   });
 });
