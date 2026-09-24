@@ -14,7 +14,11 @@ interface Manifest {
 
 function loadManifest(): Manifest {
   try {
-    const raw = readFileSync(join(GRAPH_MEMORY_HOME, "processed", "manifest.json"), "utf-8");
+    // Strip a UTF-8 BOM if present: a maintenance step that rewrites the
+    // manifest via PowerShell can prepend one, which made JSON.parse throw
+    // and silently zeroed out last_dream_run and the processed set.
+    const rawFile = readFileSync(join(GRAPH_MEMORY_HOME, "processed", "manifest.json"), "utf-8");
+    const raw = rawFile.charCodeAt(0) === 0xFEFF ? rawFile.slice(1) : rawFile;
     return JSON.parse(raw) as Manifest;
   } catch {
     return { last_dream_run: null, processed: {} };

@@ -48,7 +48,26 @@ init Cypher, example queries) see
 | `Object` ✅ 🤔 | A "thing in the world" that isn't covered by a more specific type | Heavy overlap with `Resource` and `Infrastructure`. The live graph leans on this as a catch-all; consider whether your case is really `Resource`, `Infrastructure`, or `Artifact` first. |
 | `Resource` ✅ 🤔 | A consumable or referenceable thing | Overlaps with `Object`. Currently rare in graph (1 node). Candidate for merge into `Object` unless it earns its keep. |
 | `Infrastructure` ✅ 🤔 | A server, host, network device, deployment target | Overlaps with `Object`. Currently rare (1 node). Candidate for merge into `Object` with `subtype: infrastructure`. |
-| `Alias` ✅ | An alternate name pointing at a canonical entity | Used by alias resolution; rarely created directly. |
+| `Alias` ✅ | An alternate name pointing at a canonical entity | Legacy: no code ever resolved through `Alias` nodes. Alternate names now live in an `aliases` list on the entity itself, managed with `graph_alias`, and every write path resolves through it (exact name, then case-insensitive name, then alias, then slug). `aliases` cannot be set through ordinary properties. |
+| `Location` ✅ 🆕 | A place: city, county, region, or address | Target of `LOCATED_IN`. The verb table already referenced this as "Place"; named `Location` here to match the nodes in the live graph. |
+| `Issue` ✅ 🆕 | A bug, defect, or open problem | Endpoint for `BLOCKS` / `BLOCKED_BY` / `RESOLVED_BY`, which referenced it before it was defined here. |
+| `Task` ✅ 🆕 | A discrete unit of work to be done | Endpoint for `BLOCKS` / `BLOCKED_BY`, which referenced it before it was defined here. |
+
+**Types the verb table still references but does not define:** `Policy`
+(in `GOVERNS`) and `Class` (in `EXTENDS` / `IMPLEMENTS`). Neither has any
+nodes in the live graph. Either define them or reword those verbs to use
+`Decision` and `Object`.
+
+**Retyping campaign 2026-09-23.** 23 nodes carrying undocumented labels
+were normalized onto the types above: `Tool`→`Technology` (6),
+`Document`→`Artifact` (3), `Topic`→`Concept` (3), `System`→`Infrastructure`
+(2), `Account`→`Object` (2), `Product`→`Object` (3), `Domain`→`Object` (1),
+`LegalAsset`→`Object` (1), `Automation`→`Object` (1), `Milestone`→`Event`
+(1). Each retyped node carries `retyped_from` and `retyped_at` so the change
+is auditable and reversible. `AuditEvent` nodes were left alone: they are
+audit-log bookkeeping, not knowledge, and carry no `:Entity` label content.
+Drift will return unless writes validate the type against this table, which
+is the same failure mode as the lowercase edge verbs.
 
 **Consolidation summary:** `Object` / `Resource` / `Infrastructure`
 overlap heavily — the latter two have only 1–2 nodes each. A future
@@ -195,7 +214,13 @@ See the rules in [`CLAUDE.md`](CLAUDE.md). Short version:
 1. Decide whether it's rare enough to warrant `RELATED_TO` (or
    `Object`), or whether it deserves a name.
 2. If it deserves a name, add it here with status 🆕, direction, and a
-   one-sentence "use when."
+   one-sentence "use when." **Also add it to `ENTITY_TYPES` or
+   `RELATIONSHIP_TYPES` in `src/shared/types.ts`.** Since 2026-09-23 the
+   write path enforces that list: anything not on it is stored as `Object`
+   or `RELATED_TO`, with the original kept in `proposed_type` or
+   `proposed_relations` (see `SCHEMA_ENFORCEMENT`). Those properties are a
+   ready-made queue of candidates: verbs that keep turning up there are
+   the ones worth adding.
 3. Update `~/.claude/GRAPH_SCHEMA.md` if the new type is genuinely
    universal (applies in any project), not just this one.
 4. After it sees real use across multiple sessions, change status to ✅.

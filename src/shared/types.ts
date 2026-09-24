@@ -1,42 +1,56 @@
+// The documented vocabulary. GRAPH_SCHEMA.md is the human-readable source;
+// these lists are what the write path enforces, so keep the two in step.
+// Before 2026-09-23 these were compile-time types only and nothing checked
+// them at runtime, which let the live graph grow to 29 node labels and 238
+// relationship types.
+
 export const ENTITY_TYPES = [
   "Person",
+  "Organization",
   "Project",
-  "Preference",
+  "Feature",
   "Concept",
+  "Technology",
   "Decision",
-  "Fact",
-  "Event",
-  "Object",
   "Reasoning",
+  "Preference",
+  "Event",
+  "Fact",
+  "Artifact",
+  "Object",
+  "Resource",
+  "Infrastructure",
+  "Alias",
+  "Location",
+  "Issue",
+  "Task",
 ] as const;
 
 export type EntityType = (typeof ENTITY_TYPES)[number];
 
 export const RELATIONSHIP_TYPES = [
-  "WORKS_ON",
-  "PREFERS",
-  "KNOWS_ABOUT",
-  "DEPENDS_ON",
-  "USES_TECH",
-  "DECIDED_FOR",
-  "SUPERSEDES",
-  "CONTRADICTS",
-  "RELATED_TO",
-  "ALIAS_OF",
-  "PARTICIPATED_IN",
-  "OCCURRED_DURING",
-  "PRODUCED",
-  "TRIGGERED_BY",
-  "USES",
-  "HOSTED_ON",
-  "PRODUCED_BY",
-  // Reasoning trace edges (Reasoning -> any)
-  "LED_TO",       // Reasoning -> Decision/Event/Fact (this thinking led to that outcome)
-  "INVOLVED_IN",  // Reasoning -> Person/Project/Concept/Object (these entities took part in the reasoning)
-  // Organizational relationships (added 2026-05-06 after claude.ai introduced them)
-  "WORKS_AT",     // Person -> Organization (employment / membership)
-  "REPORTS_TO",   // Person -> Person (org hierarchy)
-  "STAKEHOLDER_IN", // Person -> Decision/Project/Event (interested party, not necessarily decider)
+  // People and roles
+  "WORKS_ON", "WORKS_AT", "REPORTS_TO", "STAKEHOLDER_IN",
+  "KNOWS", "COLLABORATES_WITH", "FAMILY_OF", "MENTOR_OF",
+  // Knowledge, preferences, decisions
+  "KNOWS_ABOUT", "PREFERS", "DECIDED_FOR", "LED_TO", "INVOLVED_IN",
+  // Tech and dependencies
+  "USES", "USES_TECH", "DEPENDS_ON", "IMPLEMENTS", "EXTENDS",
+  "INSPIRED_BY", "BUILDS_ON", "DERIVED_FROM", "HOSTED_ON",
+  // Composition and taxonomy
+  "CONTAINS", "PART_OF", "INSTANCE_OF", "CATEGORIZED_AS",
+  // Reference and description
+  "ABOUT", "DESCRIBES", "DOCUMENTS", "ATTRIBUTED_TO",
+  // Authorship, production, governance
+  "PRODUCED", "PRODUCED_BY", "AUTHORED", "CREATED", "AFFECTS", "GOVERNS",
+  // Lifecycle and ordering
+  "SUPERSEDES", "REPLACES", "DEPRECATED_BY", "BLOCKS", "BLOCKED_BY", "RESOLVED_BY",
+  // Place and runtime
+  "LOCATED_IN", "DEPLOYED_TO",
+  // Events and temporal
+  "PARTICIPATED_IN", "OCCURRED_DURING", "TRIGGERED_BY",
+  // Identity and contradiction
+  "ALIAS_OF", "CONTRADICTS", "RELATED_TO",
 ] as const;
 
 export type RelationshipType = (typeof RELATIONSHIP_TYPES)[number];
