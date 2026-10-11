@@ -130,9 +130,20 @@ export function parseTranscriptFile(filePath: string): ParseResult {
   const lines = raw.split("\n").filter((l) => l.trim().length > 0);
   const lineCount = lines.length;
 
+  // Scan for the v1 signature well past the head of the file. A transcript can
+  // open with an arbitrary run of non-message records (queue-operation,
+  // attachment, last-prompt, custom-title, agent-name, cost-state,
+  // file-history-*), so a 5-line window gave false "unknown format" verdicts
+  // on valid transcripts. The dream skips anything it cannot identify and
+  // marks it processed, so a false verdict drops a real session. Stop at the
+  // first match.
+  const DETECT_SCAN_LIMIT = 500;
   const sample: unknown[] = [];
-  for (const line of lines.slice(0, 5)) {
-    try { sample.push(JSON.parse(line)); } catch { /* skip */ }
+  for (const line of lines.slice(0, DETECT_SCAN_LIMIT)) {
+    let parsed: unknown;
+    try { parsed = JSON.parse(line); } catch { continue; }
+    sample.push(parsed);
+    if (detectFormatVersion([parsed]) === "v1") break;
   }
   const formatVersion = detectFormatVersion(sample);
 
