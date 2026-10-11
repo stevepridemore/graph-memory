@@ -104,8 +104,8 @@ Use this on the machine that will host Neo4j + the MCP server. This is also wher
 **Linux / macOS / Windows with Git Bash or WSL:**
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/stevepridemore/graph-memory/v0.3.0/scripts/install-primary.sh \
-  | bash -s v0.3.0
+curl -fsSL https://raw.githubusercontent.com/stevepridemore/graph-memory/v0.4.0/scripts/install-primary.sh \
+  | bash -s v0.4.0
 # edit ~/graph-memory/.env (NEO4J_PASSWORD, GRAPH_MEMORY_HOME, CLAUDE_PROJECTS_DIR)
 cd ~/graph-memory && docker compose up -d
 ```
@@ -113,7 +113,7 @@ cd ~/graph-memory && docker compose up -d
 **Windows PowerShell (no bash needed):**
 
 ```powershell
-$v = 'v0.3.0'
+$v = 'v0.4.0'
 iwr "https://raw.githubusercontent.com/stevepridemore/graph-memory/$v/scripts/install-primary.ps1" -UseBasicParsing -OutFile $env:TEMP\gm-install.ps1
 & $env:TEMP\gm-install.ps1 -Version $v
 # edit $HOME\graph-memory\.env
@@ -131,14 +131,14 @@ Use this on every additional laptop, work computer, or phone. No Docker, no Neo4
 **Linux / macOS / Windows with Git Bash or WSL:**
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/stevepridemore/graph-memory/v0.3.0/scripts/install-secondary.sh \
-  | bash -s v0.3.0 your-tunnel-host.example.com
+curl -fsSL https://raw.githubusercontent.com/stevepridemore/graph-memory/v0.4.0/scripts/install-secondary.sh \
+  | bash -s v0.4.0 your-tunnel-host.example.com
 ```
 
 **Windows PowerShell (no bash needed):**
 
 ```powershell
-$v = 'v0.3.0'
+$v = 'v0.4.0'
 iwr "https://raw.githubusercontent.com/stevepridemore/graph-memory/$v/scripts/install-secondary.ps1" -UseBasicParsing -OutFile $env:TEMP\gm-install.ps1
 & $env:TEMP\gm-install.ps1 -Version $v -TunnelHost your-tunnel-host.example.com
 ```
@@ -233,7 +233,7 @@ All planned phases shipped:
 - ✅ npm audit clean (0 vulnerabilities)
 - ✅ Pre-built GHCR images + curl-pipeable installers (no clone or local build required for end users)
 
-Current release: [`v0.3.0`](https://github.com/stevepridemore/graph-memory/releases/tag/v0.3.0).
+Current release: [`v0.4.0`](https://github.com/stevepridemore/graph-memory/releases/tag/v0.4.0).
 
 Currently steady-state. Active development is opportunistic; the system runs unattended via the nightly dream process.
 
@@ -243,6 +243,8 @@ Newest first. Each tag publishes `ghcr.io/stevepridemore/graph-memory-mcp:<tag>`
 
 | Version | Date | Summary |
 |---|---|---|
+| [`v0.4.0`](https://github.com/stevepridemore/graph-memory/releases/tag/v0.4.0) | 2026-10-11 | Security and data-integrity release. Fixes Cypher injection through relation and type names, and a `tenant_id` overwrite through caller-supplied properties. Fixes compounding decay, makes batch writes atomic, routes every write through one entity resolver, and adds the `graph_alias` tool. Types and relations are now checked against the documented vocabulary (see `SCHEMA_ENFORCEMENT`). Transcript format detection no longer misreads transcripts that open with metadata records. |
+| [`v0.3.1`](https://github.com/stevepridemore/graph-memory/releases/tag/v0.3.1) | 2026-05-17 | Rule subtype for permanent preferences, exempt from decay and pruning. `.gitattributes` forces LF on shell scripts and the Dockerfile so a Windows clone builds a working image. |
 | [`v0.3.0`](https://github.com/stevepridemore/graph-memory/releases/tag/v0.3.0) | 2026-05-10 | Curl-pipeable primary/secondary device installers + pre-built GHCR image. Multi-stage Dockerfile, auto-cert generation on first run, vendored slash commands. End users no longer need to clone or build from source. |
 | [`v0.2.1`](https://github.com/stevepridemore/graph-memory/releases/tag/v0.2.1) | 2026-05-09 | STRIDE threat model fully closed (16 of 16 findings). Hardens OAuth 2.1: PKCE-S256, RFC 7009 revocation, jti tracking, refresh-token TTL, redirect-URI allowlist, email allowlist, body-size caps. |
 | [`v0.2.0`](https://github.com/stevepridemore/graph-memory/releases/tag/v0.2.0) | 2026-05-09 | OAuth 2.1 security hardening pass. Public clients only, mandatory PKCE, body-size caps, structured event logging. |
