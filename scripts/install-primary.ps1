@@ -2,11 +2,11 @@
 # without bash/WSL/Git Bash). Mirrors scripts/install-primary.sh.
 #
 # Usage:
-#   iwr -UseBasicParsing https://raw.githubusercontent.com/stevepridemore/graph-memory/v0.3.0/scripts/install-primary.ps1 `
+#   iwr -UseBasicParsing https://raw.githubusercontent.com/stevepridemore/graph-memory/v0.4.0/scripts/install-primary.ps1 `
 #     | iex
 #   ...wait, that pattern only works without arguments. For tagged installs:
 #
-#   $v = 'v0.3.0'
+#   $v = 'v0.4.0'
 #   iwr "https://raw.githubusercontent.com/stevepridemore/graph-memory/$v/scripts/install-primary.ps1" -UseBasicParsing -OutFile $env:TEMP\gm-install.ps1
 #   & $env:TEMP\gm-install.ps1 -Version $v
 

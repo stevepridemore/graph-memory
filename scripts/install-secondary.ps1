@@ -2,7 +2,7 @@
 # without bash/WSL/Git Bash). Mirrors scripts/install-secondary.sh.
 #
 # Usage:
-#   $v = 'v0.3.0'
+#   $v = 'v0.4.0'
 #   iwr "https://raw.githubusercontent.com/stevepridemore/graph-memory/$v/scripts/install-secondary.ps1" -UseBasicParsing -OutFile $env:TEMP\gm-install.ps1
 #   & $env:TEMP\gm-install.ps1 -Version $v -TunnelHost graph.example.com
 

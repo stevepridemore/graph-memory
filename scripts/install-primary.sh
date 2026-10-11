@@ -11,8 +11,8 @@
 #     | bash -s <version>
 #
 # Example:
-#   curl -fsSL https://raw.githubusercontent.com/stevepridemore/graph-memory/v0.3.0/scripts/install-primary.sh \
-#     | bash -s v0.3.0
+#   curl -fsSL https://raw.githubusercontent.com/stevepridemore/graph-memory/v0.4.0/scripts/install-primary.sh \
+#     | bash -s v0.4.0
 #
 # Then: edit ~/graph-memory/.env, cd ~/graph-memory, docker compose up -d.
 
@@ -20,7 +20,7 @@ set -euo pipefail
 
 VERSION="${1:-}"
 if [ -z "$VERSION" ]; then
-  echo "usage: install-primary.sh <version>   (e.g. v0.3.0 or 'latest' for main)" >&2
+  echo "usage: install-primary.sh <version>   (e.g. v0.4.0 or 'latest' for main)" >&2
   exit 2
 fi
 
