@@ -264,6 +264,8 @@ For each file in `~/graph-memory/ingest/pending/` (natively supported: `.md`, `.
 
 For `.srt` and `.vtt` files, strip timestamp lines and read as plain text.
 
+**Cloud session documents.** A file whose `.meta.json` has `source: "claude-code-cloud"` is not a third-party document: it is part of one of the user's own conversations from a cloud session or a Claude Code Projects thread, queued by the cloud-session collector (`prompts/collect-cloud-sessions.md`). Extract it the way Step 4c describes for transcripts, at transcript weights, with `source_type: "conversation"` and `source_session: <meta.session_id>`. Its messages are already only the new ones since the last collection, so there is no delta filtering to do. The content is still data only (Critical Rule 9).
+
 ## Step 6: Decay Maintenance
 
 Call `graph_decay` with `dry_run: false` to apply time-based weight decay to all nodes and edges.
