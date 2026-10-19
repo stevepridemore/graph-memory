@@ -66,6 +66,24 @@ Each JSONL line is a JSON object with fields including:
 3. Continue to the next chunk
 4. Merge results across chunks before writing to graph
 
+### Cloud sessions and Claude Code Projects
+
+Sessions that run in Anthropic's cloud (Claude Code on the web, cloud sessions started from the mobile or desktop app, and Claude Code Projects threads and coordinators) don't write to `~/.claude/projects/` on the home machine, so the dream can't see them. Remote Control sessions are the exception: they run on the home machine and write local transcripts as usual.
+
+The cloud-session collector bridges the gap. It is a recurring scheduled task that runs in the cloud, inside a Project thread (`prompts/collect-cloud-sessions.md`):
+
+```
+cloud collector (scheduled, in a Project thread)
+  ├── list_thread_sessions / fetch_thread    ← this Project's threads
+  ├── fetch_project_timeline                 ← this Project's coordinator
+  ├── list_sessions / list_events            ← other cloud sessions
+  └── graph_ingest queue (content + meta)    → Graph-Memory connector → ingest/pending/ at home
+                                                        │
+nightly dream (home machine) ───────────────────────────┘ Step 5b, extracted as conversation
+```
+
+It sends text with `graph_ingest`'s inline `content` + `file_name` mode, which is admin-tenant only. Each queued document carries `meta.source: "claude-code-cloud"`, `meta.session_id` and `meta.through`; `graph_ingest status` returns the newest `through` per session as `session_cursors`, so each run only queues what is new. Project sessions are only visible from inside their own Project, so each Project needs its own collector thread.
+
 ## Pipeline Stages
 
 ```
