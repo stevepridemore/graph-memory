@@ -565,6 +565,22 @@ If the graph is empty or Neo4j is not running, say so and suggest running /graph
 
 ---
 
+## /plain-tech-docs
+
+**Purpose:** Check Markdown docs and runbooks for AI-sounding prose, then tighten it. Unlike the other skills it doesn't touch the graph.
+
+**Location:** `~/.claude/skills/plain-tech-docs/` (`SKILL.md`, `references/word-list.md`, `scripts/check_docs.py`)
+
+**Usage:**
+```
+/plain-tech-docs README.md docs/
+python3 ~/.claude/skills/plain-tech-docs/scripts/check_docs.py docs --ignore hedge --max-words 40
+```
+
+The script is stdlib Python. It reports `file:line:col: [category] "match" -> suggestion`, skips code blocks, inline code and link targets, and exits 1 when it finds anything. The patterns live in `references/word-list.md`, so add or drop entries there.
+
+---
+
 ## Summary
 
 | Command | Purpose | MCP Tool(s) Used |
@@ -577,6 +593,7 @@ If the graph is empty or Neo4j is not running, say so and suggest running /graph
 | `/graph-briefing` | Session briefing with context | `graph_stats`, `graph_query`, `graph_contradictions` |
 | `/graph-find <pattern>` | Audit/review graph | `graph_contradictions`, `graph_entities` |
 | `/graph-boost` | Adjust edge weights | `graph_boost`, `graph_weaken` |
+| `/plain-tech-docs [paths]` | Flag and fix AI-sounding prose in docs | none (local script) |
 
 All skills run in Claude Code sessions (Max plan). No external API calls needed.
 
