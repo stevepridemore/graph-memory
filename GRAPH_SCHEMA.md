@@ -34,7 +34,7 @@ init Cypher, example queries) see
 | Type | Use when | Notes |
 |---|---|---|
 | `Person` ✅ | A human (user, colleague, family, contact) | Subtypes: `individual`, `contact`, `group` |
-| `Organization` ✅ | A company, agency, team, or institution | E.g. FBBE, Anthropic |
+| `Organization` ✅ | A company, agency, team, or institution | E.g. Acme Corp, Anthropic |
 | `Project` ✅ | A bounded body of work, initiative, or codebase | Subtypes: `active`, `paused`, `completed`, `abandoned` |
 | `Feature` ✅ 🤔 | A sub-component of a Project | Overlaps with `Project`; use only when the feature has its own lifecycle worth tracking separately. Otherwise prefer Project + describe the feature in properties. |
 | `Concept` ✅ | An abstract idea, pattern, framework, or technology category | The fallback for "named thing that isn't an instance" |
