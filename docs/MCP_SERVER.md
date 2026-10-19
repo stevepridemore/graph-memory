@@ -338,15 +338,22 @@ The `localId` field allows referencing entities within the same batch call befor
 {
   "action": "queue" | "status",
   "file_path": "string",
+  "content": "string",
+  "file_name": "string",
   "meta": {
     "source": "string",
     "author": "string",
     "date": "string",
     "topic_hints": ["string"],
-    "weight_override": 0.6
+    "weight_override": 0.6,
+    "session_id": "string",
+    "through": "ISO timestamp",
+    "last_event_id": "string"
   }
 }
 ```
+
+For `queue`, give either `file_path` (a file on the server, copied into `pending/`) or `content` + `file_name` (text written straight into `pending/`). Inline content is for remote callers that can't reach the server's filesystem, such as the cloud-session collector. It is admin-tenant only, capped at 2 MB, and `file_name` must be a plain basename ending `.md`, `.txt` or `.json`.
 
 **Note:** `action: "process"` (immediate ingestion) is handled by the `/ingest --now` skill, which runs entity extraction in the Claude Code session and calls `graph_relate` directly. The MCP tool only handles queueing (filesystem copy) and status (filesystem read). No LLM needed.
 
@@ -370,9 +377,14 @@ The `localId` field allows referencing entities within the same batch call befor
     { "file": "karpathy-llm-wiki.srt", "processed_at": "2026-04-06T23:00:00Z", "entities": 12, "edges": 18 }
   ],
   "pending_count": 1,
-  "completed_count": 5
+  "completed_count": 5,
+  "session_cursors": {
+    "session_01abc": { "through": "2026-10-19T04:58:00Z", "last_event_id": "cmsg_01...", "file": "cloud-session_01abc-20261019045800.md" }
+  }
 }
 ```
+
+`session_cursors` lists, per session, the newest `meta.through` among `pending/` and `completed/` sidecars whose `meta.source` is `"claude-code-cloud"`. The cloud-session collector uses it to queue only new messages.
 
 ---
 

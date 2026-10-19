@@ -47,6 +47,7 @@ import {
 } from "../shared/oauth.js";
 import { appendOAuthEventLog, pickClientIp, type ClientIpReq } from "../shared/oauth-events.js";
 import { readBody, PayloadTooLargeError, READ_BODY_CAP_OAUTH, READ_BODY_CAP_MCP } from "./read-body.js";
+import { MAX_INGEST_CONTENT_BYTES, validateIngestName, readSessionCursors } from "./ingest-content.js";
 
 // ─── Tenant request context ──────────────────────────────────────────────────
 // Threaded into every tool handler via AsyncLocalStorage. The HTTP request
@@ -514,16 +515,23 @@ server.registerTool("graph_contradictions", {
 server.registerTool("graph_ingest", {
   title: "Graph Ingest",
   description:
-    "Queue a document for asynchronous extraction into the memory graph (mode='queue'), or check the ingest backlog (mode='status'). Use this when you have a file the user wants summarized into the graph but doesn't need it reflected in the same conversation — the nightly dream process picks queued documents up. For inline assertions during a conversation, call graph_relate directly instead. Idempotent: queueing the same file twice overwrites the prior copy in the pending dir.",
+    "Queue a document for asynchronous extraction into the memory graph (mode='queue'), or check the ingest backlog (mode='status'). Use this when you have a file the user wants summarized into the graph but doesn't need it reflected in the same conversation — the nightly dream process picks queued documents up. For inline assertions during a conversation, call graph_relate directly instead. Idempotent: queueing the same file twice overwrites the prior copy in the pending dir. " +
+    "Remote callers (e.g. a cloud session collecting its own transcripts) can't name a file on this machine, so they pass content + file_name instead of file_path (admin tenant only). " +
+    "status also returns session_cursors: for each cloud session queued with meta.source='claude-code-cloud', the newest meta.through already queued or dreamed.",
   inputSchema: {
     action: z.enum(["queue", "status"]).describe("queue: add file to pending. status: check queue."),
-    file_path: z.string().optional().describe("Path to file to queue (required for queue action)"),
+    file_path: z.string().optional().describe("Path to a file on the server to queue. For queue, give file_path or content + file_name."),
+    content: z.string().optional().describe("Document text to queue inline, for callers that can't reach the server's filesystem. Requires file_name. Admin tenant only."),
+    file_name: z.string().optional().describe("Name for inline content in the pending dir: plain basename ending .md, .txt or .json."),
     meta: z.object({
       source: z.string().optional(),
       author: z.string().optional(),
       date: z.string().optional(),
       topic_hints: z.array(z.string()).optional(),
       weight_override: z.number().optional(),
+      session_id: z.string().optional().describe("Cloud session this document came from (with source='claude-code-cloud')"),
+      through: z.string().optional().describe("ISO timestamp of the newest session event included in this document"),
+      last_event_id: z.string().optional().describe("ID of the newest session event included in this document"),
     }).optional().describe("Optional metadata for the queued document"),
   },
   annotations: { idempotentHint: true },
@@ -561,18 +569,41 @@ server.registerTool("graph_ingest", {
         recently_completed: recentlyCompleted,
         pending_count: pending.length,
         completed_count: recentlyCompleted.length,
+        session_cursors: readSessionCursors([pendingDir, completedDir]),
       });
     }
 
     // Queue action
-    if (!args.file_path) {
-      return toolError("file_path is required for queue action");
+    let destName: string;
+    let destPath: string;
+    if (args.content !== undefined) {
+      // Queued documents are dreamed into the bootstrap tenant's graph, so
+      // only that tenant may push arbitrary text into the queue.
+      if (!isAdminTenant(currentTenant())) {
+        return toolError("Queueing inline content is admin-only (bootstrap tenant).");
+      }
+      if (args.file_path) {
+        return toolError("Give either file_path or content, not both");
+      }
+      if (!args.file_name) {
+        return toolError("file_name is required with content");
+      }
+      if (Buffer.byteLength(args.content, "utf-8") > MAX_INGEST_CONTENT_BYTES) {
+        return toolError(`content is over ${MAX_INGEST_CONTENT_BYTES} bytes; split it into several documents`);
+      }
+      destName = validateIngestName(args.file_name);
+      mkdirSync(pendingDir, { recursive: true });
+      destPath = join(pendingDir, destName);
+      writeFileSync(destPath, args.content, "utf-8");
+    } else {
+      if (!args.file_path) {
+        return toolError("file_path (or content + file_name) is required for queue action");
+      }
+      mkdirSync(pendingDir, { recursive: true });
+      destName = basename(args.file_path);
+      destPath = join(pendingDir, destName);
+      copyFileSync(args.file_path, destPath);
     }
-
-    mkdirSync(pendingDir, { recursive: true });
-    const destName = basename(args.file_path);
-    const destPath = join(pendingDir, destName);
-    copyFileSync(args.file_path, destPath);
 
     if (args.meta) {
       const metaPath = join(pendingDir, `${destName}.meta.json`);
