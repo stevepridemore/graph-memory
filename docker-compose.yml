@@ -42,7 +42,7 @@ services:
 
   graph-memory-mcp:
     # Production default: pull the pre-built image from GHCR. Pin a specific
-    # tag via MCP_IMAGE_TAG in .env (e.g. MCP_IMAGE_TAG=v0.5.0); defaults to
+    # tag via MCP_IMAGE_TAG in .env (e.g. MCP_IMAGE_TAG=v0.6.0); defaults to
     # `latest`. To build locally from source instead, use the dev override:
     #   docker compose -f docker-compose.yml -f docker-compose.dev.yml up -d
     image: ghcr.io/stevepridemore/graph-memory-mcp:${MCP_IMAGE_TAG:-latest}
@@ -96,12 +96,17 @@ services:
       # Comma-separated exact emails or *@domain wildcards. Unset → allow any
       # identity that passes Cloudflare Access.
       - OAUTH_ALLOWED_EMAILS=${OAUTH_ALLOWED_EMAILS:-}
+      # TypeSafe Jev (optional): verb selection for edges that would be stored
+      # as RELATED_TO. Off unless JEV_VERB_SELECT=on in .env. The key is read
+      # from this mounted file; set JEV_API_KEY_HOST_FILE in .env to its host path.
+      - JEV_API_KEY_FILE=${JEV_API_KEY_HOST_FILE:+/run/secrets/jev_api_key}
     volumes:
       - ${GRAPH_MEMORY_HOME}:/root/graph-memory
       # Read-only mount of Claude Code project transcripts so the dream process
       # can ingest them. Set CLAUDE_PROJECTS_DIR in .env to your local path
       # (e.g. C:\Users\you\.claude\projects on Windows, ~/.claude/projects elsewhere).
       - ${CLAUDE_PROJECTS_DIR}:/root/.claude/projects:ro
+      - ${JEV_API_KEY_HOST_FILE:-./.jev-api-key}:/run/secrets/jev_api_key:ro
     logging:
       driver: json-file
       options:
@@ -154,11 +159,16 @@ services:
       # gws-mcp's NOTIFY_TOKEN_HOST_FILE uses).
       - DREAM_NOTIFY_URL=${DREAM_NOTIFY_URL:-http://gws-mcp:3849/notify}
       - DREAM_NOTIFY_TOKEN_FILE=${DREAM_NOTIFY_TOKEN_HOST_FILE:+/run/secrets/notify_token}
+      # TypeSafe Jev (optional): the log-only duplicate check after each nightly
+      # run (JEV_DUPLICATE_CHECK=on) and verb selection in the graph server the
+      # runner starts (JEV_VERB_SELECT=on). Same key file as graph-memory-mcp.
+      - JEV_API_KEY_FILE=${JEV_API_KEY_HOST_FILE:+/run/secrets/jev_api_key}
     volumes:
       - ${GRAPH_MEMORY_HOME}:/root/graph-memory
       - ${CLAUDE_PROJECTS_DIR}:/root/.claude/projects:ro
       - ${ANTHROPIC_API_KEY_HOST_FILE:-./.anthropic-api-key}:/run/secrets/anthropic_api_key:ro
       - ${DREAM_NOTIFY_TOKEN_HOST_FILE:-./.notify-token}:/run/secrets/notify_token:ro
+      - ${JEV_API_KEY_HOST_FILE:-./.jev-api-key}:/run/secrets/jev_api_key:ro
     networks:
       - default
       - mcp-notify
