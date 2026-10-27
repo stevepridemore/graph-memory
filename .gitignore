@@ -38,6 +38,7 @@ graph-call.mjs
 # these patterns are a backstop.
 .anthropic-api-key
 .notify-token
+.jev-api-key
 *notify-token*
 *api-key*
 !src/dream-runner/api-key.ts

@@ -453,3 +453,28 @@ Defaults when a task file leaves them out (`task.ts`): `model` `claude-sonnet-5-
 ### What stays on the subscription
 
 The cloud-session collector (`prompts/collect-cloud-sessions.md`) still runs inside a Claude Code Projects thread, because the tools that list cloud sessions only exist there. It only queues text into `ingest/pending/`; the extraction itself happens in the nightly dream, which is the part this runner moves to the API key.
+
+## Jev judgments (optional)
+
+Two opt-in features use [TypeSafe's Jev](https://docs.typesafe.ai), a model that returns typed judgments (a choice, a probability, a score) instead of text. Input tokens cost $0.042 per million and output is free, so a judgment costs a few hundredths of a cent. Both features are off by default, both have a cost cap, and both keep anything that looks like a personal identifier (an email address, SSN, date of birth or card number) on the machine.
+
+The key is read at run time from the file named by `JEV_API_KEY_FILE` (a bare key, or a `JEV_API_KEY=...` line). In compose, set `JEV_API_KEY_HOST_FILE` in `.env` to the file's host path. It is mounted read-only into `graph-memory-mcp` and `graph-dream`, and `JEV_API_KEY_FILE` is set for you. The key is never logged.
+
+### Verb selection (`JEV_VERB_SELECT=on`)
+
+When `graph_relate` (single or batch) is about to store an edge as `RELATED_TO`, because the writer asked for it or because it asked for a verb outside the vocabulary, Jev picks from the documented verbs in `src/shared/types.ts`, with an explicit "keep RELATED_TO" option. The chosen verb is used only when all of these hold:
+
+- it is in `RELATIONSHIP_TYPES`, and isn't `ALIAS_OF`, `CONTRADICTS` or `SUPERSEDES` (identity-level verbs stay a human call)
+- its Choice confidence is at least `JEV_VERB_MIN_CONFIDENCE` (0.55)
+- Jev's separate judgment that the evidence names a specific relationship is at least 0.5
+- the verb is defined for the source node's type (for example `WORKS_AT` only from a `Person`)
+
+Otherwise the edge is stored as `RELATED_TO`, exactly as before. That includes a timeout (`JEV_TIMEOUT_MS`, 8 s), an HTTP error and a spent cap (`JEV_VERB_MAX_COST_USD_PER_DAY`, $0.05 per server process, reset daily). A relabelled edge carries `verb_selected_by: "jev"`, `verb_selection_confidence` and, when an unknown verb was asked for, `verb_requested`. The tool result lists each decision under `verb_selection` (single) or `verb_selections` (batch). The dream runner's graph server inherits the setting from the `graph-dream` container, so nightly writes use it too.
+
+### Duplicate check (`JEV_DUPLICATE_CHECK=on`)
+
+After a nightly API-runner dream completes, the runner takes up to `JEV_DUPLICATE_LIMIT` (30) candidate pairs from `graph_merge_suggestions` at `JEV_DUPLICATE_MIN_SCORE` (0.6). It reads each entity's description, aliases and relationships with `graph_query`, and asks Jev four questions: `link_state` (a 0-2 score from "different things" to "the same thing"), `one_contains_other`, `name_variant` and `only_shares_context`. A pair is flagged `likely_duplicate` when `link_state >= JEV_DUPLICATE_LINK_FLOOR` (0.3) and `one_contains_other <= JEV_DUPLICATE_CONTAINS_CEILING` (0.4). Those defaults were fitted on a small labelled set, so check them against your own pairs before you rely on them.
+
+Every judged pair is appended to `~/graph-memory/logs/jev-duplicates.jsonl` with its scores and verdict. **Nothing is merged or aliased.** Review the file and use `graph_merge` or `graph_alias` yourself. The run log gets a one-line summary. A failure here is logged and never changes the dream run's outcome. The cap is `JEV_DUPLICATE_MAX_COST_USD` ($0.02 per run).
+
+To run only the check: `docker compose run --rm graph-dream node dist/dream-runner/index.js --job duplicates`. It is read-only and needs no Anthropic key.

@@ -7,6 +7,7 @@ import { Neo4jClient } from "../shared/neo4j-client.js";
 import { GRAPH_MEMORY_HOME } from "../shared/config.js";
 import { ENTITY_TYPES, RELATIONSHIP_TYPES } from "../shared/types.js";
 import { normalizeEntityType, normalizeRelation, slugify } from "../shared/vocabulary.js";
+import { applyVerbSelection, verbSelectorFromEnv, type SelectionReport } from "../shared/verb-select.js";
 import type { EntityType, RelationshipType } from "../shared/types.js";
 import { parseTranscriptFile, getTextMessages } from "../shared/transcript-parser.js";
 import { appendAuditEvent } from "../shared/dream-audit.js";
@@ -229,6 +230,10 @@ server.registerTool("graph_query", {
 
 // ─── Tool: graph_relate ───
 
+// Opt-in (JEV_VERB_SELECT=on): edges that would be stored as RELATED_TO get a
+// documented verb from Jev when it is confident, and stay RELATED_TO otherwise.
+const verbSelector = verbSelectorFromEnv();
+
 server.registerTool("graph_relate", {
   title: "Graph Relate",
   description:
@@ -275,12 +280,22 @@ server.registerTool("graph_relate", {
     const tenantId = currentTenant();
     // Batch mode
     if (args.batch) {
+      let relations = args.batch.relations;
+      let verbSelections: SelectionReport[] | undefined;
+      if (verbSelector) {
+        const byLocalId = new Map(args.batch.entities.map((e) => [e.localId, { name: e.name, type: e.type }]));
+        ({ relations, selections: verbSelections } = await applyVerbSelection(
+          verbSelector,
+          relations,
+          (ref) => byLocalId.get(ref) ?? { name: ref },
+        ));
+      }
       const result = await client.batchRelate(tenantId, {
         entities: args.batch.entities.map((e) => ({
           ...e,
           type: e.type as EntityType,
         })),
-        relations: args.batch.relations.map((r) => ({
+        relations: relations.map((r) => ({
           ...r,
           relation: r.relation as RelationshipType,
         })),
@@ -288,7 +303,7 @@ server.registerTool("graph_relate", {
         source_transcript: args.batch.source_transcript,
         source_type: args.batch.source_type,
       });
-      return toolResult(result);
+      return toolResult(verbSelections?.length ? { ...result, verb_selections: verbSelections } : result);
     }
 
     // Single mode
@@ -301,6 +316,20 @@ server.registerTool("graph_relate", {
     const fromType = normalizeEntityType(args.from_type);
     const toType = normalizeEntityType(args.to_type);
     const relation = normalizeRelation(args.relation);
+
+    let relationToWrite = args.relation;
+    let edgeProperties = args.properties ?? {};
+    let verbSelection: SelectionReport | undefined;
+    if (verbSelector && relation.value === "RELATED_TO") {
+      const picked = await applyVerbSelection(
+        verbSelector,
+        [{ from: args.from_name, to: args.to_name, relation: args.relation, evidence: args.evidence, properties: edgeProperties }],
+        (ref) => (ref === args.from_name ? { name: ref, type: fromType.value } : { name: ref, type: toType.value }),
+      );
+      relationToWrite = picked.relations[0].relation;
+      edgeProperties = picked.relations[0].properties ?? {};
+      verbSelection = picked.selections[0];
+    }
 
     // Resolve by name, case-insensitive name, or alias before minting a slug:
     // the same resolver batch mode uses, so the two paths can't disagree.
@@ -318,9 +347,9 @@ server.registerTool("graph_relate", {
       tenantId,
       fromId,
       toId,
-      args.relation as RelationshipType,
+      relationToWrite as RelationshipType,
       args.weight ?? 0.5,
-      args.properties ?? {},
+      edgeProperties,
       {
         source_session: args.source_session,
         source_transcript: args.source_transcript,
@@ -342,6 +371,7 @@ server.registerTool("graph_relate", {
       action: edge.created ? "created" : "strengthened",
       edge: { from: edge.from, to: edge.to, type: edge.type, weight: edge.weight },
       ...(coercions.length > 0 && { coercions }),
+      ...(verbSelection && { verb_selection: verbSelection }),
     });
   } catch (err) {
     return toolError(`graph_relate failed: ${err instanceof Error ? err.message : String(err)}`);

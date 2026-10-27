@@ -5,6 +5,7 @@
 //
 //   node dist/dream-runner/index.js                # one nightly run, then exit
 //   node dist/dream-runner/index.js --job weekly   # one weekly maintenance run
+//   node dist/dream-runner/index.js --job duplicates  # only the Jev duplicate check
 //   node dist/dream-runner/index.js --daemon       # nightly at DREAM_SCHEDULE,
 //                                                  # weekly at DREAM_WEEKLY_SCHEDULE
 //
@@ -27,6 +28,8 @@ import { FILE_TOOLS, FILE_TOOL_NAMES, runFileTool, type FileRoots } from "./file
 import { findPendingWork, totalPending, type PendingWork } from "./pending.js";
 import { TRANSCRIPT_TOOLS, TRANSCRIPT_TOOL_NAMES, TranscriptTools } from "./transcript-tools.js";
 import { loadMailSettings, mailForRun, notifySender, type SendFn } from "./notify.js";
+import { duplicateCheckFromEnv, type CallTool } from "./duplicates.js";
+import { isOn } from "../shared/jev.js";
 
 const here = dirname(fileURLToPath(import.meta.url));
 
@@ -263,6 +266,16 @@ async function graphTools(mcp: Client, exclude: Set<string>): Promise<Anthropic.
   return tools.sort((a, b) => a.name.localeCompare(b.name));
 }
 
+/** Call a graph tool and parse its JSON result; throws on a tool error. */
+export function graphCaller(mcp: Client): CallTool {
+  return async (name, args) => {
+    const result = await mcp.callTool({ name, arguments: args });
+    const text = mcpResultText(result);
+    if (result.isError === true) throw new Error(text);
+    return JSON.parse(text);
+  };
+}
+
 export function mcpResultText(result: Awaited<ReturnType<Client["callTool"]>>): string {
   const content = Array.isArray(result.content) ? result.content : [];
   const parts = content.map((c: { type: string; text?: string }) =>
@@ -478,6 +491,12 @@ async function runJob(settings: RunnerSettings, deps: RunnerDeps, job: JobName):
       log(`stopped at the turn limit (${turnLimit})`);
       outcome = "turn_limit";
     }
+
+    // Opt-in, log-only: judges merge candidates and writes a report. Its
+    // failures are logged and never change the run's outcome.
+    if (!weekly && outcome === "completed" && isOn(process.env.JEV_DUPLICATE_CHECK)) {
+      await duplicateCheckFromEnv(graphCaller(mcp), settings.roots.graphHome, log);
+    }
   } catch (err) {
     log(`error: ${err instanceof Error ? err.message : String(err)}`);
     outcome = "error";
@@ -621,8 +640,16 @@ const isMain = process.argv[1] && fileURLToPath(import.meta.url) === process.arg
 if (isMain) {
   const settings = loadSettings();
   const jobArg = process.argv[process.argv.indexOf("--job") + 1];
-  if (process.argv.includes("--job") && jobArg !== "nightly" && jobArg !== "weekly") {
-    throw new Error(`--job must be nightly or weekly (got ${jobArg})`);
+  if (process.argv.includes("--job") && jobArg !== "nightly" && jobArg !== "weekly" && jobArg !== "duplicates") {
+    throw new Error(`--job must be nightly, weekly or duplicates (got ${jobArg})`);
+  }
+  if (process.argv.includes("--job") && jobArg === "duplicates") {
+    // Just the Jev duplicate check, without a dream run. Read-only.
+    const log = makeLogger(join(settings.roots.graphHome, "logs", "dream-runner", `${stamp()}-duplicates.log`));
+    const mcp = await connectGraphServer();
+    const summary = await duplicateCheckFromEnv(graphCaller(mcp), settings.roots.graphHome, log);
+    await mcp.close();
+    process.exit(summary ? 0 : 1);
   }
   const job: JobName = jobArg === "weekly" && process.argv.includes("--job") ? "weekly" : "nightly";
   if (process.argv.includes("--daemon")) {
