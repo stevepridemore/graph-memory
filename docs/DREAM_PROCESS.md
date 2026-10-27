@@ -428,6 +428,9 @@ The runner reads the key at run time from `ANTHROPIC_API_KEY`, or from the file 
 | `DREAM_WEEKLY_SCHEDULE` | `off` | Weekly maintenance in the daemon, e.g. `Sun 06:00` |
 | `DREAM_WEEKLY_MAX_COST_USD` | `1.5` | Weekly job's budget |
 | `DREAM_WEEKLY_EXCLUDE_TOOLS` | see Weekly maintenance | Graph tools hidden from the weekly job |
+| `DREAM_ALERT_TO` | none | Where reports and alerts go; email is off without it |
+| `DREAM_SMTP_USER` | none | SMTP login and From address |
+| `DREAM_SMTP_PASSWORD_HOST_FILE` | none | Host path of the app-password file (compose mounts it) |
 
 ### Running it
 
@@ -445,8 +448,18 @@ The same runner can run `prompts/weekly-maintenance.md` with `--job weekly`, or 
 - It always runs; there's no pending check.
 - It gets `graph_export`, `graph_cypher` and `graph_prune`, which the prompt's backup, analysis and prune steps need. `graph_merge` stays hidden, since merging is the reviewer's call (rule 6). Override with `DREAM_WEEKLY_EXCLUDE_TOOLS`.
 - Its own budget, `DREAM_WEEKLY_MAX_COST_USD` (default $1.50). Past the wrap-up point the model is told not to run the prune execute step.
-- **No email.** Step 12 needs a shell, Python and `gws`, which the runner doesn't have, so the report is written to `logs/weekly-reports/` and the report notes that the email was skipped. Keep the Claude Code weekly task if you rely on the email.
+- **Email comes from the runner, not the model.** Step 12 needs a shell, Python and `gws`, so the model skips it; once the run finishes, the runner emails the report it wrote (see Email below). The model never gets a mail tool.
 - The lock source is `api-runner-weekly`. In the daemon, when both jobs fall due together, the weekly runs first and the nightly right after.
+
+### Email
+
+With `DREAM_ALERT_TO`, `DREAM_SMTP_USER` and an SMTP password file set, the runner sends mail after a run (`notify.ts`):
+
+- **Weekly, completed:** the report from `logs/weekly-reports/`, subject `Weekly Graph Maintenance — <date> (<N> action items)`.
+- **Any run that doesn't finish cleanly** (error, budget stop, turn limit, refusal, lock held): a short alert with the outcome, cost and the last 40 log lines.
+- **Nothing** for a normal nightly or a quiet night.
+
+It uses plain SMTP (Gmail with an app password by default; `DREAM_SMTP_HOST` / `DREAM_SMTP_PORT` to change), read from a file like the API key, so it doesn't depend on any OAuth sign-in staying fresh. A failed send is logged and never fails the run. The report is plain text (it's Markdown, which reads fine as is).
 
 ### What stays on the subscription
 

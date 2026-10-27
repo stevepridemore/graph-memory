@@ -19,13 +19,20 @@ export function resolveApiKey(env: NodeJS.ProcessEnv = process.env): string {
   if (!keyPath) {
     throw new Error("No API key: set ANTHROPIC_API_KEY or ANTHROPIC_API_KEY_FILE");
   }
+  return readSecretFile(keyPath, "ANTHROPIC_API_KEY_FILE", /^(?:export\s+)?ANTHROPIC_API_KEY\s*=\s*(.+)$/);
+}
 
+/**
+ * Read a one-value secret file (the API key, the SMTP app password). Same
+ * shapes as above: bare value, or a NAME=value line matching `line`.
+ */
+export function readSecretFile(keyPath: string, label: string, line?: RegExp): string {
   let filePath = keyPath;
   let st;
   try {
     st = statSync(keyPath);
   } catch {
-    throw new Error(`ANTHROPIC_API_KEY_FILE does not exist: ${keyPath}`);
+    throw new Error(`${label} does not exist: ${keyPath}`);
   }
   if (st.isDirectory()) {
     const files = readdirSync(keyPath, { withFileTypes: true }).filter(
@@ -33,26 +40,29 @@ export function resolveApiKey(env: NodeJS.ProcessEnv = process.env): string {
     );
     if (files.length !== 1) {
       throw new Error(
-        `ANTHROPIC_API_KEY_FILE is a folder with ${files.length} files; point it at the key file itself: ${keyPath}`,
+        `${label} is a folder with ${files.length} files; point it at the file itself: ${keyPath}`,
       );
     }
     filePath = join(keyPath, files[0].name);
   }
 
-  const key = parseKeyFile(readFileSync(filePath, "utf-8"));
-  if (!key) throw new Error(`No API key found in ${filePath}`);
+  const key = parseKeyFile(readFileSync(filePath, "utf-8"), line);
+  if (!key) throw new Error(`No value found in ${filePath}`);
   return key;
 }
 
-/** Accepts a bare key, or KEY=value lines (first ANTHROPIC_API_KEY wins). */
-export function parseKeyFile(raw: string): string | null {
+/** Accepts a bare value, or NAME=value lines (first line matching `line` wins). */
+export function parseKeyFile(
+  raw: string,
+  line: RegExp = /^(?:export\s+)?ANTHROPIC_API_KEY\s*=\s*(.+)$/,
+): string | null {
   const text = raw.charCodeAt(0) === 0xfeff ? raw.slice(1) : raw;
   const lines = text
     .split(/\r?\n/)
     .map((l) => l.trim())
     .filter((l) => l && !l.startsWith("#"));
-  for (const line of lines) {
-    const m = /^(?:export\s+)?ANTHROPIC_API_KEY\s*=\s*(.+)$/.exec(line);
+  for (const l of lines) {
+    const m = line.exec(l);
     if (m) return stripQuotes(m[1].trim());
   }
   if (lines.length === 1 && !lines[0].includes("=")) return stripQuotes(lines[0]);

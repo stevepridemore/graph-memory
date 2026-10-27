@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeAll, afterAll } from "vitest";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { tmpdir } from "node:os";
 
 // dream-lock.ts and config.ts read HOME / GRAPH_MEMORY_HOME at import time,
@@ -17,6 +17,7 @@ const { findPendingWork, totalPending } = await import("./pending.js");
 const { resolvePath, runFileTool, FileToolError } = await import("./file-tools.js");
 const { estimateCostUsd, nextRunAt, loadSettings, runDream, kickoffMessage } = await import("./index.js");
 const { TranscriptTools } = await import("./transcript-tools.js");
+const { mailForRun, loadMailSettings } = await import("./notify.js");
 
 const roots = { graphHome, projectsDir };
 
@@ -48,7 +49,7 @@ describe("api key", () => {
     expect(() => resolveApiKey({})).toThrow(/ANTHROPIC_API_KEY_FILE/);
     const bad = join(root, "bad-key");
     writeFileSync(bad, "A=sk-secret\nB=2\n");
-    expect(() => resolveApiKey({ ANTHROPIC_API_KEY_FILE: bad })).toThrow(/No API key found/);
+    expect(() => resolveApiKey({ ANTHROPIC_API_KEY_FILE: bad })).toThrow(/No value found/);
     try { resolveApiKey({ ANTHROPIC_API_KEY_FILE: bad }); } catch (e) {
       expect(String(e)).not.toContain("sk-secret");
     }
@@ -175,6 +176,53 @@ describe("transcript tools", () => {
   });
 });
 
+describe("email", () => {
+  it("is off unless recipient, sender and password file are all set", () => {
+    expect(loadMailSettings({})).toBeNull();
+    expect(loadMailSettings({ DREAM_ALERT_TO: "a@x", DREAM_SMTP_USER: "b@x" })).toBeNull();
+    expect(loadMailSettings({ DREAM_ALERT_TO: "a@x", DREAM_SMTP_USER: "b@x", DREAM_SMTP_PASSWORD_FILE: "/p" })).toMatchObject({
+      host: "smtp.gmail.com",
+      port: 465,
+    });
+  });
+
+  it("sends the weekly report, alerts on trouble, stays quiet otherwise", () => {
+    const started = new Date(Date.now() - 5000);
+    const reports = join(graphHome, "logs", "weekly-reports");
+    mkdirSync(reports, { recursive: true });
+    writeFileSync(join(reports, "2026-11-01.md"), "# Weekly\n\n## Action Required\n- [ ] merge Milo\n- [ ] check X\n");
+    const logPath = join(graphHome, "logs", "dream-runner", "t.log");
+    mkdirSync(dirname(logPath), { recursive: true });
+    writeFileSync(logPath, "turn 1\nerror: boom\n");
+    const base = { started, turns: 3, costUsd: 0.4, logPath, graphHome };
+
+    const weekly = mailForRun({ ...base, job: "weekly", outcome: "completed" })!;
+    expect(weekly.subject).toMatch(/Weekly Graph Maintenance — .* \(2 action items\)/);
+    expect(weekly.text).toContain("merge Milo");
+
+    const failed = mailForRun({ ...base, job: "nightly", outcome: "error" })!;
+    expect(failed.subject).toMatch(/nightly run error/);
+    expect(failed.text).toContain("error: boom");
+
+    expect(mailForRun({ ...base, job: "nightly", outcome: "completed" })).toBeNull();
+    expect(mailForRun({ ...base, job: "nightly", outcome: "nothing_pending" })).toBeNull();
+  });
+
+  it("emails an alert when a run fails", async () => {
+    writeFileSync(join(graphHome, "ingest", "pending", "x.md"), "hi");
+    const sent: Array<{ subject: string }> = [];
+    const anthropic = { beta: { messages: { create: async () => { throw new Error("api down"); } } } };
+    const fakeMcp = { listTools: async () => ({ tools: [] }), callTool: async () => ({ content: [] }), close: async () => {} };
+    const outcome = await runDream({ ...loadSettings({}, []), roots }, {
+      anthropic: anthropic as never,
+      connect: async () => fakeMcp as never,
+      send: async (m) => { sent.push(m); },
+    });
+    expect(outcome).toBe("error");
+    expect(sent[0].subject).toMatch(/nightly run error/);
+  });
+});
+
 describe("schedule and cost", () => {
   it("picks today's slot if it's ahead, else tomorrow's", () => {
     const now = new Date(2026, 9, 27, 1, 0, 0);
@@ -278,7 +326,7 @@ describe("runDream loop", () => {
     expect(names).toEqual(expect.arrayContaining(["graph_export", "graph_prune", "graph_cypher"]));
     expect(names).not.toContain("graph_merge");
     expect(names).not.toContain("read_transcript");
-    expect(String(params!.system)).toContain("Step 12 (email) can't run here");
+    expect(String(params!.system)).toContain("Step 12 (email): skip it.");
     expect(String((params!.messages as Array<{ content: string }>)[0].content)).toContain("weekly graph maintenance");
   });
 

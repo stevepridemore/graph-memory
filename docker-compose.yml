@@ -146,10 +146,17 @@ services:
       - DREAM_MODEL=${DREAM_MODEL:-claude-opus-5-5}
       - DREAM_EFFORT=${DREAM_EFFORT:-medium}
       - DREAM_MAX_COST_USD=${DREAM_MAX_COST_USD:-3}
+      # Email (optional): the weekly report and alerts for runs that don't
+      # finish cleanly. Off unless DREAM_ALERT_TO and DREAM_SMTP_USER are set
+      # and the app-password file is mounted below.
+      - DREAM_ALERT_TO=${DREAM_ALERT_TO:-}
+      - DREAM_SMTP_USER=${DREAM_SMTP_USER:-}
+      - DREAM_SMTP_PASSWORD_FILE=/run/secrets/smtp_password
     volumes:
       - ${GRAPH_MEMORY_HOME}:/root/graph-memory
       - ${CLAUDE_PROJECTS_DIR}:/root/.claude/projects:ro
       - ${ANTHROPIC_API_KEY_HOST_FILE:-./.anthropic-api-key}:/run/secrets/anthropic_api_key:ro
+      - ${DREAM_SMTP_PASSWORD_HOST_FILE:-./.smtp-password}:/run/secrets/smtp_password:ro
     logging:
       driver: json-file
       options:

@@ -26,6 +26,7 @@ import { resolveApiKey } from "./api-key.js";
 import { FILE_TOOLS, FILE_TOOL_NAMES, runFileTool, type FileRoots } from "./file-tools.js";
 import { findPendingWork, totalPending, type PendingWork } from "./pending.js";
 import { TRANSCRIPT_TOOLS, TRANSCRIPT_TOOL_NAMES, TranscriptTools } from "./transcript-tools.js";
+import { loadMailSettings, mailForRun, smtpSender, type SendFn } from "./notify.js";
 
 const here = dirname(fileURLToPath(import.meta.url));
 
@@ -194,7 +195,7 @@ You are running from the standalone runner, not from Claude Code. Nobody is watc
 - **Lock.** The runner has already acquired ~/graph-memory/processed/dream.lock and releases it after you finish, so skip creating it in Step 0 and deleting it in Step 13. Every other step, including the backup-first and prune sanity-check rules, applies as written.
 - **Appending to a log** (weekly-maintenance.log, weekly-maintenance-errors.log): read the file, then write it back with your line added. If it doesn't exist yet, create it.
 - **Step 8.** manifest.json and dream-audit.jsonl are large. Read the start of the manifest for last_dream_run, and read only the last part of dream-audit.jsonl: stat_file it, then read_file with an offset near the end.
-- **Step 12 (email) can't run here:** there is no shell, Python or gws. Skip it, and add a line to the report's Notes saying the email was skipped because the API runner can't send mail, so the report is only on disk.
+- **Step 12 (email): skip it.** There is no shell, Python or gws here. The runner emails the report file you wrote in Step 11 after you finish, when email is set up, so make sure the report is complete before you end.
 - **Large results.** A tool result over the size limit is saved to a file and you get the start of it plus the path. Read the rest with read_file and an offset.
 - **Budget.** If a message tells you the run's budget is spent, skip any remaining analysis, write the report with what you have (say what was skipped), and stop. Never run the prune execute step after that message.
 - **Finish** with a short plain-text summary of what the run did. That ends the run.
@@ -275,10 +276,20 @@ function mcpResultText(result: Awaited<ReturnType<Client["callTool"]>>): string 
 
 export type RunOutcome = "nothing_pending" | "locked" | "completed" | "budget_stopped" | "turn_limit" | "refused" | "error";
 
-/** Seams for tests: a fake Messages client and a fake graph server. */
+/** Seams for tests: a fake Messages client, graph server and mail sender. */
 export interface RunnerDeps {
   anthropic?: Pick<Anthropic, "beta">;
   connect?: () => Promise<Client>;
+  /** null turns email off; undefined uses DREAM_ALERT_TO / DREAM_SMTP_* if set. */
+  send?: SendFn | null;
+}
+
+interface JobResult {
+  outcome: RunOutcome;
+  started: Date;
+  turns: number;
+  costUsd: number;
+  logPath: string;
 }
 
 export async function runDream(
@@ -286,10 +297,31 @@ export async function runDream(
   deps: RunnerDeps = {},
   job: JobName = "nightly",
 ): Promise<RunOutcome> {
+  const result = await runJob(settings, deps, job);
+  let send = deps.send;
+  if (send === undefined) {
+    const mail = loadMailSettings();
+    send = mail ? smtpSender(mail) : null;
+  }
+  const mail = send && mailForRun({ job, ...result, graphHome: settings.roots.graphHome });
+  if (send && mail) {
+    const log = makeLogger(result.logPath);
+    try {
+      await send(mail);
+      log(`emailed: ${mail.subject}`);
+    } catch (err) {
+      log(`email failed: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+  return result.outcome;
+}
+
+async function runJob(settings: RunnerSettings, deps: RunnerDeps, job: JobName): Promise<JobResult> {
   const started = new Date();
   const runId = job === "weekly" ? `${stamp(started)}-weekly` : stamp(started);
   const logDir = join(settings.roots.graphHome, "logs", "dream-runner");
-  const log = makeLogger(join(logDir, `${runId}.log`));
+  const logPath = join(logDir, `${runId}.log`);
+  const log = makeLogger(logPath);
   const weekly = job === "weekly";
   const maxCostUsd = weekly ? settings.weeklyMaxCostUsd : settings.maxCostUsd;
   const excludeTools = weekly ? settings.weeklyExcludeTools : settings.excludeTools;
@@ -301,7 +333,7 @@ export async function runDream(
   if (pending) {
     if (totalPending(pending) === 0 && !settings.force) {
       log("nothing pending; no API call made");
-      return "nothing_pending";
+      return { outcome: "nothing_pending", started, turns: 0, costUsd: 0, logPath };
     }
     log(
       `pending: ${pending.newTranscripts} new, ${pending.grownTranscripts} grown transcripts, ${pending.ingestFiles} ingest files` +
@@ -314,7 +346,7 @@ export async function runDream(
   mkdirSync(join(homedir(), "graph-memory", "processed"), { recursive: true });
   if (!acquireLock(weekly ? "api-runner-weekly" : "api-runner")) {
     log("dream.lock is held by another run; exiting");
-    return "locked";
+    return { outcome: "locked", started, turns: 0, costUsd: 0, logPath };
   }
 
   const spillDir = join(settings.roots.graphHome, "dream-runner", "spill", runId);
@@ -452,9 +484,9 @@ export async function runDream(
       estimated_cost_usd: Number(cost.toFixed(4)),
     };
     log(`done: ${outcome}, ${turns} turns, ~$${cost.toFixed(3)}`);
-    try { appendFileSync(join(logDir, "runs.jsonl"), JSON.stringify(summary) + "\n"); } catch { /* best-effort */ }
+    try { appendFileSync(join(logDir, "runs.jsonl"), JSON.stringify({ job, ...summary }) + "\n"); } catch { /* best-effort */ }
   }
-  return outcome;
+  return { outcome, started, turns, costUsd: estimateCostUsd(settings.model, usage), logPath };
 }
 
 async function runTool(
