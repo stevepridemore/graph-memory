@@ -162,6 +162,7 @@ describe("transcript tools", () => {
 
     writeFileSync(join(graphHome, "processed", "manifest.json"), JSON.stringify({ processed: { other: { line_count: 9 } }, extra: 1 }));
     tools.run("update_manifest", { session_id: "s-t", entities_extracted: 2, edges_created: 3 });
+    expect(tools.stats()).toEqual({ sessions: 1, entities: 2, edges: 3 });
     const manifest = JSON.parse(readFileSync(join(graphHome, "processed", "manifest.json"), "utf-8"));
     expect(manifest.extra).toBe(1);
     expect(manifest.processed.other).toEqual({ line_count: 9 });
@@ -215,15 +216,44 @@ describe("email", () => {
     const base = { started, turns: 3, costUsd: 0.4, logPath, graphHome };
 
     const weekly = mailForRun({ ...base, job: "weekly", outcome: "completed" })!;
-    expect(weekly.subject).toMatch(/Weekly Graph Maintenance — .* \(2 action items\)/);
+    expect(weekly.subject).toMatch(/Weekly Graph Maintenance — .* \(2 action items, ~\$0\.40\)/);
     expect(weekly.text).toContain("merge Milo");
 
     const failed = mailForRun({ ...base, job: "nightly", outcome: "error" })!;
     expect(failed.subject).toMatch(/nightly run error/);
     expect(failed.text).toContain("error: boom");
 
-    expect(mailForRun({ ...base, job: "nightly", outcome: "completed" })).toBeNull();
-    expect(mailForRun({ ...base, job: "nightly", outcome: "nothing_pending" })).toBeNull();
+    expect(weekly.subject).toContain("~$0.40");
+    expect(weekly.text.startsWith("Cost: ~$0.40 (3 turns")).toBe(true);
+    expect(failed.text).toContain("Cost: ~$0.40");
+
+    // runs.jsonl drives the month-to-date line; last month's runs don't count.
+    const runsPath = join(graphHome, "logs", "dream-runner", "runs.jsonl");
+    const lastMonth = new Date(started.getFullYear(), started.getMonth() - 1, 15).toISOString();
+    writeFileSync(
+      runsPath,
+      [
+        { started: started.toISOString(), estimated_cost_usd: 0.79 },
+        { started: started.toISOString(), estimated_cost_usd: 1.21 },
+        { started: lastMonth, estimated_cost_usd: 50 },
+      ].map((r) => JSON.stringify(r)).join("\n") + "\n",
+    );
+    const nightly = mailForRun({
+      ...base,
+      job: "nightly",
+      outcome: "completed",
+      model: "claude-opus-5-5",
+      summary: "Processed 2 sessions.",
+      stats: { sessions: 2, entities: 5, edges: 15 },
+      pending: { newTranscripts: 1, grownTranscripts: 1, ingestFiles: 0 },
+    })!;
+    expect(nightly.subject).toMatch(/Graph dream — .*: 2 sessions, 5 entities, 15 edges \(~\$0\.40\)/);
+    expect(nightly.text).toContain("Cost: ~$0.40 (3 turns, claude-opus-5-5)");
+    expect(nightly.text).toContain("API spend this month: ~$2.00 over 2 runs");
+    expect(nightly.text).toContain("Processed 2 sessions.");
+
+    const quiet = mailForRun({ ...base, job: "nightly", outcome: "nothing_pending", turns: 0, costUsd: 0 })!;
+    expect(quiet.subject).toMatch(/nothing new \(~\$0\.00\)/);
   });
 
   it("emails an alert when a run fails", async () => {

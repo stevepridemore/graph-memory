@@ -65,6 +65,7 @@ interface ParsedSession {
 
 export class TranscriptTools {
   private parsed = new Map<string, ParsedSession>();
+  private recorded = new Map<string, { entities: number; edges: number }>();
   private items: Map<string, PendingTranscript>;
 
   constructor(
@@ -145,6 +146,17 @@ export class TranscriptTools {
     });
   }
 
+  /** What update_manifest recorded this run, for the summary email. */
+  stats(): { sessions: number; entities: number; edges: number } {
+    let entities = 0;
+    let edges = 0;
+    for (const r of this.recorded.values()) {
+      entities += r.entities;
+      edges += r.edges;
+    }
+    return { sessions: this.recorded.size, entities, edges };
+  }
+
   private updateManifest(input: Record<string, unknown>): string {
     const item = this.item(input.session_id);
     let watermark: { readAt: string; sizeBytes: number; lineCount: number };
@@ -176,6 +188,10 @@ export class TranscriptTools {
     const tmp = `${target}.tmp`;
     writeFileSync(tmp, JSON.stringify(manifest, null, 2), "utf-8");
     renameSync(tmp, target);
+    this.recorded.set(item.session_id, {
+      entities: Number(input.entities_extracted ?? 0),
+      edges: Number(input.edges_created ?? 0),
+    });
     return `manifest updated for ${item.session_id} (processed_at ${watermark.readAt}, ${watermark.sizeBytes} bytes)`;
   }
 }
