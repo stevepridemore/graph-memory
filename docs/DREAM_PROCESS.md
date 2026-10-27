@@ -2,19 +2,17 @@
 
 ## Overview
 
-The dream process is a **Claude Code scheduled task** that reads conversation transcripts, extracts entities and relationships, and updates the graph. It runs AS a Claude Code session — meaning Claude itself does the extraction and reasoning, covered by the Max plan. **No separate API key needed.**
+The dream process is a **Claude Code scheduled task** that reads conversation transcripts, extracts entities and relationships, and updates the graph. It runs AS a Claude Code session — meaning Claude itself does the extraction and reasoning, covered by the Max plan. **No separate API key needed.** This is the default path. An optional [API-key runner](#api-key-runner) runs the same prompt through the Messages API instead.
 
 ## Key Architectural Decision
 
-The dream process is NOT a standalone script calling the Claude API. It's a scheduled task prompt that Claude executes as a session. This means:
+In the default setup, the dream process is NOT a standalone script calling the Claude API. It's a scheduled task prompt that Claude executes as a session. This means:
 - Entity extraction = Claude reading transcripts and reasoning (Max plan)
 - Graph updates = Claude calling MCP tools (graph_relate, graph_boost, etc.)
 - Changelog writing = Claude writing files (standard tool)
-- No `@anthropic-ai/sdk` dependency
-- No API key management
-- No token cost tracking
+- In the default scheduled task: no `@anthropic-ai/sdk` use, no API key management, no token cost tracking
 
-There is now one opt-in exception: the [API-key runner](#api-key-runner) runs the same prompt through the Messages API for people who want the dream billed to an API key instead of a Claude plan. The Claude Code scheduled task remains the default.
+The [API-key runner](#api-key-runner) is the opt-in exception. It runs the same prompt through the Messages API (it uses `@anthropic-ai/sdk`, reads an API key and estimates cost), for people who want the dream billed to an API key instead of a Claude plan. The Claude Code scheduled task remains the default.
 
 ## Trigger Model
 
@@ -22,7 +20,7 @@ There is now one opt-in exception: the [API-key runner](#api-key-runner) runs th
 
 Stored at `~/.claude/scheduled-tasks/graph-dream-nightly/SKILL.md`. Configured via Claude Desktop's Schedule UI or by asking Claude to schedule it. The SKILL.md file contains the prompt; the schedule (time, recurrence) is set in the Desktop UI. See the full prompt later in this document.
 
-1. Claude reads `~/.claude/graph-memory/processed/manifest.json`
+1. Claude reads `~/graph-memory/processed/manifest.json`
 2. If no unprocessed transcripts or ingest docs → exit early
 3. If pending → run full dream pipeline
 
@@ -107,7 +105,7 @@ It sends text with `graph_ingest`'s inline `content` + `file_name` mode, which i
 
 ### Stage 1a: Discover Transcripts
 
-Claude reads `~/.claude/graph-memory/processed/manifest.json`:
+Claude reads `~/graph-memory/processed/manifest.json`:
 
 ```json
 {
@@ -132,7 +130,7 @@ Claude lists JSONL files in `~/.claude/projects/`, compares against manifest, id
 
 ### Stage 1b: Discover Ingest Documents
 
-Claude checks `~/.claude/graph-memory/ingest/pending/` for any files.
+Claude checks `~/graph-memory/ingest/pending/` for any files.
 
 **Supported formats:**
 | Format | Handling |
@@ -178,7 +176,7 @@ For each transcript/document, Claude reads the content and extracts structured i
 
 For extremely large sessions (35MB+), Claude first samples ~100 lines spread evenly through the file to identify the main topics, then processes in chunks with that context. This prevents the same entity from being created multiple times across chunks because Claude knows what to expect.
 
-**Merge audit log:** Every entity merge (when Claude determines two entities are the same) is recorded in `~/.claude/graph-memory/logs/merge-audit.jsonl`:
+**Merge audit log:** Every entity merge (when Claude determines two entities are the same) is recorded in `~/graph-memory/logs/merge-audit.jsonl`:
 
 ```json
 {
@@ -246,85 +244,14 @@ Claude updates `manifest.json` **incrementally after each transcript** (not batc
 
 ## Scheduled Task Prompt
 
-The nightly dream task prompt (what Claude receives as its session instruction):
+The nightly prompt lives in [`prompts/dream-nightly.md`](../prompts/dream-nightly.md). That file is the source of truth; this document doesn't copy it. The API-key runner reads the same file as its system prompt. Its changelog path is `~/graph-memory/logs/YYYY-MM-DD-HHMMSS.md`, so each run gets its own file.
 
-```
-You are running the graph memory dream process. Your job is to process new conversation
-transcripts and ingest documents, extract knowledge, and update the memory graph.
-
-STEPS:
-
-1. READ the config at ~/.claude/graph-memory/config.json for runtime parameters
-   (chunk_size_lines, max_transcripts_per_run, etc.). Use hardcoded defaults if missing.
-
-2. READ the manifest at ~/.claude/graph-memory/processed/manifest.json
-   - Identify which conversation transcripts have not been processed
-   - Check ~/.claude/graph-memory/ingest/pending/ for new documents
-
-3. If nothing is pending, write "No pending work" and exit.
-
-4. For each unprocessed transcript (JSONL files in ~/.claude/projects/),
-   up to max_transcripts_per_run (default 10) — process oldest first:
-   a. Read the first few lines and verify expected fields exist (type, message,
-      timestamp, sessionId, cwd). If the format looks different, log a warning
-      and skip this transcript.
-   b. Read the file (for large files, process in chunks per config chunk_size_lines,
-      default 500 lines)
-   c. Extract: entities, relationships, reinforcements, corrections, contradictions
-   d. For each entity: check if it exists via graph_entities tool first
-   e. NEVER merge entities unless you are highly confident they are the same
-   f. Call graph_relate for new entities and relationships. Use batch mode when possible.
-      - Always pass provenance: source_session (the sessionId from the JSONL),
-        source_transcript (the file path), source_type ("conversation")
-      - Always pass valid_at (the timestamp from the JSONL line where the fact was stated)
-   g. Call graph_boost for reinforced relationships
-   h. Call graph_weaken for corrected information
-   i. When a fact supersedes an old one (e.g., tech stack changed), graph_relate handles
-      this automatically — it sets invalid_at on the old edge. Note the supersession
-      in the changelog.
-   j. Track the cwd field for project-context boosting (+0.10 for in-project entities)
-   k. For RELATED_TO edges, use only these relationship_type values:
-      similar_to, part_of, enables, impacts, depends_on, alternative_to,
-      derived_from, implements, extends, configured_by
-      If none fit, use the closest match. Do NOT invent new values.
-   l. UPDATE manifest.json IMMEDIATELY after each transcript (not batched at end).
-      This prevents reprocessing and weight inflation if the dream crashes mid-run.
-
-5. For each pending ingest document:
-   a. Read the file and any .meta.json sidecar
-   b. Extract entities and relationships (same rules as step 4)
-   c. Apply weight guidance from meta if provided
-   d. Pass provenance: source_type ("ingest"), source_transcript (the file path)
-   e. After processing, note it for moving to completed/
-
-6. Call graph_decay with dry_run: false to apply time-based decay
-
-7. Write a changelog to ~/.claude/graph-memory/logs/YYYY-MM-DD.md
-   If max_transcripts_per_run was reached and more transcripts remain, note this
-   in the changelog so the next run picks them up.
-
-8. Manifest was updated incrementally in step 4 — verify last_dream_run is current
-
-9. Move processed ingest files from pending/ to completed/
-
-10. Delete the lock file at ~/.claude/graph-memory/processed/dream.lock
-
-IMPORTANT RULES:
-- Do NOT auto-delete or prune entities. Only flag them in the changelog.
-- When in doubt about entity identity, create a new entity rather than merging.
-- Flag suspected duplicates in the changelog for user review.
-- If a transcript is very large, process in chunks per config (default 500 lines).
-- Always check for existing entities before creating new ones.
-- Stop after max_transcripts_per_run transcripts. Remaining work carries to next run.
-- NEVER extract API keys, passwords, tokens, secrets, or credentials into graph entities.
-  Note the existence of a credential but NEVER the value.
-- Always delete the lock file when done, even on failure.
-```
+The prompt covers these steps, in order: read `config.json`, read the manifest and check `ingest/pending/`, process up to `max_transcripts_per_run` transcripts oldest first (updating the manifest after each one), process pending ingest documents, call `graph_decay`, write the changelog, move ingest files to `completed/`, and release the lock. Its rules include: never auto-delete or prune, don't merge entities unless sure, and never store secret values.
 
 ## Configuration
 
 ```json
-// ~/.claude/graph-memory/config.json
+// ~/graph-memory/config.json
 {
   "dream": {
     "cooldown_hours": 4,
@@ -355,10 +282,6 @@ IMPORTANT RULES:
     "prune_node_threshold": 0.1,
     "prune_edge_threshold": 0.05,
     "prune_orphan_days": 30
-  },
-  "resolution": {
-    "merge_only_when_confident": true,
-    "flag_duplicates_in_changelog": true
   }
 }
 ```
@@ -373,14 +296,16 @@ Since the dream process IS a Claude Code session, error handling is conversation
 
 ## Weekly Deep Dream
 
-A separate scheduled task stored at `~/.claude/scheduled-tasks/graph-dream-weekly/SKILL.md`. Configured via the Claude Desktop Schedule UI on a weekly cadence.
+This is the Claude Code version. A separate scheduled task stored at `~/.claude/scheduled-tasks/graph-dream-weekly/SKILL.md`. Configured via the Claude Desktop Schedule UI on a weekly cadence. Its prompt is [`prompts/dream-weekly.md`](../prompts/dream-weekly.md).
 
 This session:
 - Calls `graph_stats` for overall health
 - Calls `graph_contradictions` to find all conflicts
 - Queries for stale entities, orphans, and weak clusters
-- Writes a weekly summary to `~/.claude/graph-memory/logs/weekly/`
-- Suggests consolidation or cleanup actions
+- Writes a weekly report to `~/graph-memory/logs/weekly/YYYY-MM-DD.md`
+- Suggests consolidation or cleanup actions. It doesn't modify the graph.
+
+The API-key runner has a different weekly job, `--job weekly`. It runs [`prompts/weekly-maintenance.md`](../prompts/weekly-maintenance.md), which also backs up and prunes, and writes `~/graph-memory/logs/weekly-reports/YYYY-MM-DD.md`. See [Weekly maintenance](#weekly-maintenance) below.
 
 ## API-key runner
 
@@ -403,7 +328,7 @@ graph-dream container (or a Task Scheduler job)
 - **Transcripts and manifest.** `read_transcript` pages through a pending session with the canonical parser and applies the delta filter (`since`) before anything reaches the model. `update_manifest` merges one entry into `manifest.json` on disk, with the size, line count and timestamp captured when the file was read. Both stand in for steps the prompt describes with `graph_read_transcript` and hand edits.
 - **Tools.** Every graph tool the MCP server lists, except the ones the nightly prompt never calls (`graph_cypher`, `graph_prune`, `graph_reembed`, `graph_export`, `graph_ingest`, `graph_unmerge`) and `graph_read_transcript`, which `read_transcript` replaces; override with `DREAM_EXCLUDE_TOOLS`. File access is `list_dir`, `stat_file`, `read_file`, `write_file`, `move_file` and `delete_file`. The lock file can't be written or deleted through them.
 - **Large results.** A tool result over `DREAM_MAX_TOOL_RESULT_CHARS` (default 40,000; transcript pages are 75% of it) is saved under `~/graph-memory/dream-runner/spill/` and the model gets the start plus the path to read on from. The spill folder is removed after the run.
-- **Cost controls.** No API call when nothing is pending. Prompt caching on the tools and system prompt. Old tool results are cleared server-side once the conversation gets long (context editing), since the manifest and changelog are on disk. A per-run estimate, `DREAM_MAX_COST_USD` (default $3): at 80% of it the model is told to finish the item in hand, write the changelog and stop, with 20 more turns allowed, and the run is cut off at 1.5x. `DREAM_MAX_TURNS` (default 200) is the hard stop.
+- **Cost controls.** No API call when nothing is pending. Prompt caching on the tools and system prompt. Old tool results are cleared server-side once the conversation gets long (context editing), since the manifest and changelog are on disk. A per-run estimate, `DREAM_MAX_COST_USD` (default $3): at 80% of it the model is told to finish the item in hand, write the changelog and stop, with 20 more turns allowed, and the run is cut off at 1.5x. `DREAM_MAX_TURNS` (default 200) limits API requests per run. The wrap-up allows 20 more requests, even past it.
 - **Binary ingest files** (PDF, Office, images) need MarkItDown, which the runner doesn't have. They stay in `pending/` and don't count as pending work, so they don't trigger paid runs on their own.
 - **Logs.** Each run writes `~/graph-memory/logs/dream-runner/<timestamp>.log` (one line per turn with the tools called and the running cost estimate) and appends a summary line to `logs/dream-runner/runs.jsonl`. The dream's own changelog and audit log are written as usual.
 
@@ -416,27 +341,38 @@ The runner reads the key at run time from `ANTHROPIC_API_KEY`, or from the file 
 | Variable | Default | Meaning |
 |---|---|---|
 | `ANTHROPIC_API_KEY_HOST_FILE` | none | Host path of the key file (compose only) |
+| `ANTHROPIC_API_KEY_FILE` | none | Runner: path to the key file (set by compose; outside compose, use this or `ANTHROPIC_API_KEY`) |
 | `DREAM_SCHEDULE` | `22:47` (compose), `02:30` (runner) | Daily run time for `--daemon`, 24-hour local time |
 | `DREAM_TZ` | `UTC` | IANA time zone the schedule is read in (compose sets `TZ` from it) |
 | `DREAM_MODEL` | `claude-opus-5-5` | `claude-sonnet-5-5` costs about half as much per token |
 | `DREAM_EFFORT` | `medium` | `low`, `medium`, `high`, `xhigh` or `max` |
-| `DREAM_MAX_COST_USD` | `3` | Per-run cost estimate at which the model is told to wrap up |
-| `DREAM_MAX_TURNS` | `200` | Hard limit on API requests per run |
+| `DREAM_MAX_COST_USD` | `3` | Per-run cost estimate. At 80% the model is told to wrap up; the run stops at 1.5x |
+| `DREAM_MAX_TURNS` | `200` | API requests per run. The wrap-up allows 20 more, even past this |
+| `DREAM_MAX_TOOL_RESULT_CHARS` | `40000` | Tool results over this are saved to a file; the model reads on from there |
+| `DREAM_PROMPT` | `~/graph-memory/prompts/dream-nightly.md`, else the copy in the image | Nightly system prompt file |
+| `DREAM_WEEKLY_PROMPT` | `~/graph-memory/prompts/weekly-maintenance.md`, else the copy in the image | Weekly system prompt file |
+| `DREAM_PROJECTS_DIR` | `~/.claude/projects` (compose: `/root/.claude/projects`) | Transcript folder; read-only to the runner |
+| `DREAM_MCP_SERVER` | `dist/mcp-server/index.js` next to the runner | MCP server the runner starts over stdio |
 | `DREAM_FALLBACKS` | on for Opus/Sonnet 5.x and Fable 5.1 | `off` disables server-side refusal fallbacks |
 | `DREAM_EXCLUDE_TOOLS` | see above | Comma-separated graph tools to hide; empty keeps all |
 | `DREAM_SKIP_ACTIVE_MINUTES` | `30` | Leave sessions modified this recently for the next run; `0` turns it off |
 | `DREAM_WEEKLY_SCHEDULE` | `off` | Weekly maintenance in the daemon, e.g. `Sun 06:00` |
-| `DREAM_WEEKLY_MAX_COST_USD` | `1.5` | Weekly job's budget |
+| `DREAM_WEEKLY_MAX_COST_USD` | `1.5` | Weekly job's budget (per-run estimate) |
 | `DREAM_WEEKLY_EXCLUDE_TOOLS` | see Weekly maintenance | Graph tools hidden from the weekly job |
-| `DREAM_NOTIFY_TOKEN_HOST_FILE` | none | Host path of the notify token file, shared with gws-mcp; email is off without it |
-| `DREAM_NOTIFY_URL` | `http://gws-mcp:3849/notify` | gws-mcp's notify listener |
+| `DREAM_NOTIFY_TOKEN_HOST_FILE` | none | Compose only: host path of the notify token file, shared with gws-mcp. Sets `DREAM_NOTIFY_TOKEN_FILE` |
+| `DREAM_NOTIFY_TOKEN_FILE` | none | Path to the notify token file as the runner sees it. Required outside compose |
+| `DREAM_NOTIFY_URL` | compose: `http://gws-mcp:3849/notify`; none in the runner | gws-mcp's notify listener. Required outside compose. Email is off unless this and `DREAM_NOTIFY_TOKEN_FILE` are both set |
 
 ### Running it
 
 Pick one of these, and turn off the Claude Desktop scheduled task (`graph-dream-nightly`) once you have, so the two don't both run. If they overlap, the lock makes the second one exit, but each still uses its own budget.
 
 1. **Always-on container.** Add `COMPOSE_PROFILES=dream` and `ANTHROPIC_API_KEY_HOST_FILE=...` to `.env`, then `docker compose up -d`. The `graph-dream` service waits for `DREAM_SCHEDULE` each day. `docker logs graph-memory-dream` shows when the next run is.
-2. **Windows Task Scheduler.** Leave the profile off and run `.\scripts\register-dream-task.ps1 -At 22:47` from the graph-memory folder. The task runs `docker compose run --rm graph-dream node dist/dream-runner/index.js` daily and catches up after sleep.
+2. **Windows Task Scheduler.** Leave the profile off and run `.\scripts\register-dream-task.ps1 -At 22:47` from the graph-memory folder. The task runs `docker compose run --rm graph-dream node dist/dream-runner/index.js --job nightly` daily and catches up after sleep. Docker Desktop must be running at the scheduled time. Options:
+   - `-Job weekly -DayOfWeek Sunday -At 06:00` registers the weekly job (`--job weekly`). `-DayOfWeek` defaults to `Sunday`.
+   - `-ComposeDir <folder>` sets the folder that holds `docker-compose.yml` and `.env`. It defaults to the current folder.
+   - `-TaskName <name>` sets the Task Scheduler name. The default is `graph-memory nightly dream (API key)` or `graph-memory weekly maintenance (API key)`.
+   - `-Unregister` removes the task. Add `-Job weekly` to remove the weekly one.
 
 To try one run by hand: `docker compose run --rm graph-dream node dist/dream-runner/index.js` (add `--force` to run even when the quick check finds nothing).
 
@@ -445,23 +381,23 @@ To try one run by hand: `docker compose run --rm graph-dream node dist/dream-run
 The same runner can run `prompts/weekly-maintenance.md` with `--job weekly`, or on a schedule in the daemon with `DREAM_WEEKLY_SCHEDULE` (e.g. `Sun 06:00`; off by default). It differs from the nightly job in these ways:
 
 - It always runs; there's no pending check.
-- It gets `graph_export`, `graph_cypher` and `graph_prune`, which the prompt's backup, analysis and prune steps need. `graph_merge` stays hidden, since merging is the reviewer's call (rule 6). Override with `DREAM_WEEKLY_EXCLUDE_TOOLS`.
+- It gets `graph_export`, `graph_cypher` and `graph_prune`, which the prompt's backup, analysis and prune steps need. Hidden by default: `graph_merge` (merging is the reviewer's call, rule 6), `graph_reembed`, `graph_ingest`, `graph_unmerge` and `graph_read_transcript`. Override with `DREAM_WEEKLY_EXCLUDE_TOOLS`.
 - Its own budget, `DREAM_WEEKLY_MAX_COST_USD` (default $1.50). Past the wrap-up point the model is told not to run the prune execute step.
 - **Email comes from the runner, not the model.** Step 12 needs a shell, Python and `gws`, so the model skips it; once the run finishes, the runner emails the report it wrote (see Email below). The model never gets a mail tool.
 - The lock source is `api-runner-weekly`. In the daemon, when both jobs fall due together, the weekly runs first and the nightly right after.
 
 ### Email
 
-With `DREAM_NOTIFY_TOKEN_HOST_FILE` set, the runner sends mail after a run (`notify.ts`):
+The runner sends mail after every run when email is set up (`notify.ts`). In compose, that means `DREAM_NOTIFY_TOKEN_HOST_FILE` is set. Outside compose, set both `DREAM_NOTIFY_URL` and `DREAM_NOTIFY_TOKEN_FILE`. Email is off unless both are set.
 
 - **Nightly, completed:** a summary, subject `Graph dream — <date>: <N> sessions, <E> entities, <D> edges (~$cost)`, with the counts `update_manifest` recorded, what discovery found, and the model's closing summary.
-- **Nightly, nothing pending:** a one-line `Graph dream — <date>: nothing new (~$0.00)`, so a quiet night still confirms the runner is alive.
+- **Nightly, nothing pending:** subject `Graph dream — <date>: nothing new (~$0.00)`. The body says no API call was made, so a quiet night still confirms the runner is alive.
 - **Weekly, completed:** the report from `logs/weekly-reports/`, subject `Weekly Graph Maintenance — <date> (<N> action items, ~$cost)`.
 - **Any run that doesn't finish cleanly** (error, budget stop, turn limit, refusal, lock held): a short alert with the outcome and the last 40 log lines.
 
 Every mail starts with the run's estimated cost (turns, model) and the API spend so far this calendar month, summed from `logs/dream-runner/runs.jsonl`. These are the runner's estimates from its price table; the Console's usage page is the authority.
 
-Mail goes through gws-mcp's send-only notify listener (`POST /notify` with a bearer token). gws-mcp sends from its `NOTIFY_ACCOUNT` to its fixed `NOTIFY_TO`, so the runner holds no Gmail credential and the token can't mail anyone else. The listener's port isn't published: `graph-dream` reaches it as `gws-mcp:3849` over the shared `mcp-notify` docker network, which both compose files declare. To set it up, write one random value (32+ characters) to a file, point gws-mcp's `NOTIFY_TOKEN_HOST_FILE` and this project's `DREAM_NOTIFY_TOKEN_HOST_FILE` at it, set `NOTIFY_ACCOUNT` and `NOTIFY_TO` for gws-mcp, and restart both. A failed send is logged and never fails the run. The report is plain text (it's Markdown, which reads fine as is).
+Mail goes through gws-mcp's send-only notify listener (`POST /notify` with a bearer token). gws-mcp sends from its `NOTIFY_ACCOUNT` to its fixed `NOTIFY_TO`, so the runner holds no Gmail credential and the token can't mail anyone else. By default the listener's port isn't published: `graph-dream` reaches it as `gws-mcp:3849` over the shared `mcp-notify` docker network, which both compose files declare. Host tasks (`task.js`) can't use that name. Publish the listener on a loopback port (127.0.0.1) so they can reach it. To set it up, write one random value (32+ characters) to a file, point gws-mcp's `NOTIFY_TOKEN_HOST_FILE` and this project's `DREAM_NOTIFY_TOKEN_HOST_FILE` at it, set `NOTIFY_ACCOUNT` and `NOTIFY_TO` for gws-mcp, and restart both. A failed send is logged and never fails the run. The report is plain text (it's Markdown, which reads fine as is).
 
 ### Other scheduled tasks
 
@@ -500,12 +436,19 @@ Mail goes through gws-mcp's send-only notify listener (`POST /notify` with a bea
 What the model gets:
 
 - `list_dir`, `read_file`: anywhere under `workdir`. `write_file`, `edit_file`: only under `write_paths`. Symlinks out are refused.
-- One tool per command. The executable and its leading args are fixed. The model supplies one argument, which must match `pattern`, plus flags from `flags`. It's spawned without a shell, in `workdir`, with a 120 s timeout.
+- One tool per command. The executable and its leading args are fixed. The model supplies one argument, which must match `pattern`, plus flags from `flags`. It's spawned without a shell, in `workdir`, with a 120 s timeout unless the command sets `timeout_s`.
 - `http_request` to the listed prefixes and methods. The runner adds the bearer token and fills `{{VAR}}` from files, so the model never sees either.
 - The allowlisted tools of each stdio MCP server.
 - `send_email`, through a gws-mcp notify profile: the sender and recipient are fixed there, and there's an optional `html` flag. At most `max_per_run` sends per run.
 
-Runs log to `~/graph-memory/logs/dream-runner/<run_id>-<name>.log` and append to the same `runs.jsonl` as the dream, so the dream's "API spend this month" line counts them. If a run doesn't complete, the runner emails an alert through the same profile. These tasks run on the host, not in the container, so they can use local tools. Schedule one with `scripts/register-api-task.ps1 -TaskFile <file> -At HH:MM`.
+Runs log to `~/graph-memory/logs/dream-runner/<run_id>-<name>.log` and append to the same `runs.jsonl` as the dream, so the dream's "API spend this month" line counts them. If a run doesn't complete, the runner emails an alert through the same profile. These tasks run on the host, not in the container, so they can use local tools. Schedule one with `scripts/register-api-task.ps1 -TaskFile <file> -At HH:MM`. The script:
+
+- Registers the Task Scheduler job `API task - <name>`. `-At` defaults to `08:00`. `-Weekly -DayOfWeek <day>` makes it weekly (the day defaults to Monday). `-RepoDir` defaults to the current folder, which must have a built `dist/`.
+- Sets `ANTHROPIC_API_KEY_FILE` to `-ApiKeyFile` for that process only. The default is a file named `claude-api-key` in your user profile folder. The script never reads the key.
+- Appends the runner's stderr to `~/graph-memory/logs/dream-runner/<name>.scheduler.log`. Per-run logs stay in the same folder.
+- `-Unregister` removes the job. Pass the same `-TaskFile`.
+
+Defaults when a task file leaves them out (`task.ts`): `model` `claude-sonnet-5-5`, `effort` `medium`, `max_cost_usd` `1`, `max_turns` `60`, `log_dir` `~/graph-memory/logs/dream-runner`, `email.max_per_run` `2`. At 80% of `max_cost_usd` the model is told to wrap up, with 10 more turns allowed. The run stops at 1.5x.
 
 ### What stays on the subscription
 

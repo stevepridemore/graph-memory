@@ -8,7 +8,7 @@ https://github.com/user-attachments/assets/826e5f5a-5759-4b31-83dd-6bd7e0e044b8
 
 *Asked from my phone. Pulls a decision made days ago on my laptop, citing the commit hash.*
 
-> **No external API keys, no LLM provider integration, no per-token costs.** Entity extraction runs inside your Claude sessions (Max plan). Embedding runs locally via [bge-small-en](https://huggingface.co/BAAI/bge-small-en-v1.5). Everything stays on your hardware unless you choose to expose it.
+> **No external API keys or per-token costs by default.** Entity extraction runs inside your Claude sessions on your Claude plan. Embedding runs locally via [bge-small-en](https://huggingface.co/BAAI/bge-small-en-v1.5). Everything stays on your hardware unless you choose to expose it. If you'd rather pay per token, an optional runner moves the nightly dream and weekly maintenance to an Anthropic API key (see [API-key runner](docs/DREAM_PROCESS.md#api-key-runner)).
 
 ## Why a graph
 
@@ -45,17 +45,17 @@ This project replaces flat keyword matching with weighted, relationship-aware re
                             └─── bolt-internal ───────┘
 ```
 
-Two Docker services, talking over the compose network. The MCP server is the only thing that touches Neo4j directly — it implements OAuth 2.1 itself (RS256 JWTs, public clients with PKCE-S256, RFC 7591 dynamic client registration, RFC 7009 revocation), validates bearer tokens for `/mcp` calls, and exposes Cloudflare Access only on `/oauth/authorize` for the actual user login. The Neo4j instance has no external listeners.
+Two Docker services, talking over the compose network (plus an optional third, `graph-dream`, covered below). The MCP server is the only thing that touches Neo4j directly — it implements OAuth 2.1 itself (RS256 JWTs, public clients with PKCE-S256, RFC 7591 dynamic client registration, RFC 7009 revocation), validates bearer tokens for `/mcp` calls, and exposes Cloudflare Access only on `/oauth/authorize` for the actual user login. The Neo4j instance has no external listeners.
 
 The dream process is just another Claude session that runs on a schedule, reads transcripts, and calls the same MCP tools any client would call — there's no separate extraction pipeline.
 
-By default that session is a Claude Code scheduled task on your Claude plan. If you'd rather bill it to an Anthropic API key, the optional dream runner (`src/dream-runner/`, the `graph-dream` compose service) runs the same prompt through the Messages API. See [API-key runner](docs/DREAM_PROCESS.md#api-key-runner).
+By default that session is a Claude Code scheduled task on your Claude plan. If you'd rather bill it to an Anthropic API key, the optional dream runner (`src/dream-runner/`, the `graph-dream` compose service under the `dream` profile) runs the same nightly and weekly prompts through the Messages API, with a per-run cost cap and an email summary of each run's cost. The same runner can run your other scheduled prompts on the host with only the commands, URLs and MCP tools you allow (`dist/dream-runner/task.js`). See [API-key runner](docs/DREAM_PROCESS.md#api-key-runner).
 
 ## Schema
 
-**Entity types (canonical):** `Person`, `Project`, `Preference`, `Concept`, `Decision`, `Fact`, `Event`, `Object`, `Reasoning` — plus a few ad-hoc types (Organization, Technology, Artifact, Infrastructure, Feature, Resource) that have emerged organically through use. The schema is permissive on labels.
+**Node types (19):** `Person`, `Organization`, `Project`, `Feature`, `Concept`, `Technology`, `Decision`, `Reasoning`, `Preference`, `Event`, `Fact`, `Artifact`, `Object`, `Resource`, `Infrastructure`, `Alias`, `Location`, `Issue`, `Task`.
 
-**Relationship types (canonical, 22):** `WORKS_ON`, `WORKS_AT`, `REPORTS_TO`, `STAKEHOLDER_IN`, `PREFERS`, `KNOWS_ABOUT`, `DEPENDS_ON`, `USES_TECH`, `USES`, `DECIDED_FOR`, `SUPERSEDES`, `CONTRADICTS`, `RELATED_TO`, `ALIAS_OF`, `PARTICIPATED_IN`, `OCCURRED_DURING`, `PRODUCED`, `TRIGGERED_BY`, `HOSTED_ON`, `PRODUCED_BY`, `LED_TO`, `INVOLVED_IN`. The catch-all `RELATED_TO` carries a `relationship_type` subtype property (`similar_to`, `part_of`, `enables`, `impacts`, etc.) for cases where the typed relationships don't fit.
+**Edge verbs (50):** grouped into people and roles (`WORKS_ON`, `REPORTS_TO`, `KNOWS`, …), knowledge and decisions (`PREFERS`, `DECIDED_FOR`, `LED_TO`, …), tech and dependencies (`USES_TECH`, `DEPENDS_ON`, `IMPLEMENTS`, …), composition (`PART_OF`, `CONTAINS`, `INSTANCE_OF`, …), reference (`ABOUT`, `DESCRIBES`, `DOCUMENTS`), authorship, lifecycle (`SUPERSEDES`, `REPLACES`, `BLOCKS`, …), place, events, and identity (`ALIAS_OF`, `CONTRADICTS`). `RELATED_TO` is the fallback when no specific verb fits, with a `relationship_type` subtype property. Writes are checked against this vocabulary; `SCHEMA_ENFORCEMENT` controls whether unknown verbs are coerced (default) or rejected.
 
 Every node and edge carries:
 - `weight` (0.0–1.0) — decays over time on per-type half-lives
@@ -68,31 +68,32 @@ Concise vocabulary in [`GRAPH_SCHEMA.md`](GRAPH_SCHEMA.md). Full reference (weig
 
 ## Tools
 
-The MCP server exposes 23 tools across these categories:
+The MCP server exposes 24 tools across these categories:
 
 | Category | Tools |
 |---|---|
 | Query | `graph_query`, `graph_search` (semantic), `graph_entities`, `graph_contradictions`, `graph_communities`, `graph_build_context` |
-| Write | `graph_relate` (single + batch), `graph_boost`, `graph_weaken`, `graph_delete`, `graph_merge`, `graph_unmerge` |
+| Write | `graph_relate` (single + batch), `graph_boost`, `graph_weaken`, `graph_delete`, `graph_merge`, `graph_unmerge`, `graph_alias` |
 | Maintenance | `graph_decay`, `graph_prune`, `graph_validate`, `graph_reembed`, `graph_merge_suggestions` |
 | Operational | `graph_stats`, `graph_export`, `graph_audit`, `graph_ingest`, `graph_read_transcript`, `graph_cypher` (admin only) |
 
-Slash-command wrappers (`/graph`, `/graph-ask`, `/graph-search`, `/graph-stats`, `/graph-dream`, `/graph-briefing`, `/graph-find`, `/graph-backup`, `/graph-capture`, `/ingest`, etc.) install into `~/.claude/skills/`. Full reference: [`docs/SKILLS.md`](docs/SKILLS.md).
+Slash-command wrappers (`/graph`, `/graph-ask`, `/graph-find`, `/graph-stats`, `/graph-boost`, `/graph-briefing`, `/graph-dream`, `/graph-backup`, `/graph-bootstrap`, `/graph-capture`, `/ingest`, `/ingest-audio`) install into `~/.claude/skills/`. Full reference: [`docs/SKILLS.md`](docs/SKILLS.md).
 
-`/graph-capture` is the manual companion to the nightly dream: the dream extracts knowledge from Claude Code transcripts in `~/.claude/projects/`, but cannot see claude.ai web conversations or Claude Desktop chats (those live server-side or in Electron app data). Run `/graph-capture` at the end of a substantive claude.ai or Desktop conversation to commit any new entities, decisions, or facts to the graph.
+`/graph-capture` is the manual companion to the nightly dream: the dream extracts knowledge from Claude Code transcripts in `~/.claude/projects/`, but cannot see claude.ai web conversations or Claude Desktop chats (those live server-side or in Electron app data). Run `/graph-capture` at the end of a substantive claude.ai or Desktop conversation to commit any new entities, decisions, or facts to the graph. Claude Code cloud sessions are different: a collector prompt (`prompts/collect-cloud-sessions.md`) queues their text into the ingest backlog through `graph_ingest`, and the nightly dream extracts it (see [Cloud sessions](docs/DREAM_PROCESS.md#cloud-sessions-and-claude-code-projects)).
 
 ## Prerequisites
 
 **Required:**
 - **Node.js 22+** and npm
 - **Docker** (Desktop on Windows/macOS, or Docker Engine on Linux) with Docker Compose v2
-- **Claude Code** and/or **Claude Desktop** with a Claude plan that covers Claude Code access — Pro, Max, Team, Enterprise, or Console all work (the free Claude.ai plan does not include Claude Code). Pro is fine for light/exploratory use; **Max is recommended for daily-use deployments** because the nightly dream process can be transcript-heavy on a busy day, and an unattended run that exhausts Pro's 5-hour window will abort mid-extraction and skip that night.
+- **Claude Code** and/or **Claude Desktop** with a Claude plan that covers Claude Code access — Pro, Max, Team, Enterprise, or Console all work (the free Claude.ai plan does not include Claude Code). Pro is fine for light/exploratory use; **Max is recommended for daily-use deployments** because the nightly dream process can be transcript-heavy on a busy day, and an unattended run that exhausts Pro's 5-hour window will abort mid-extraction and skip that night. Running the dream on an Anthropic API key instead avoids the plan limits.
 - A few hundred MB of disk for Neo4j + embeddings model
 
 **Optional:**
 - **[MarkItDown](https://github.com/microsoft/markitdown)** (`pip install "markitdown[pdf,docx,xlsx,pptx]"`) — enables ingesting binary documents (`.pdf`, `.docx`, `.xlsx`, `.pptx`, `.epub`, `.msg`, `.csv`, `.xml`, `.png`, `.jpg`). Without it, ingest is limited to `.md`, `.txt`, `.json`, `.html`, `.srt`, `.vtt`.
 - **[yt-dlp](https://github.com/yt-dlp/yt-dlp)** — convenient way to grab YouTube/web video subtitle files for ingestion. `yt-dlp --write-auto-sub --sub-lang en --skip-download <url>` writes a `.vtt` you can drop into `ingest/pending/`. Not a runtime dependency; just a tool that produces files graph-memory can already eat.
 - **[cloudflared](https://github.com/cloudflare/cloudflared)** + a Cloudflare account — only needed for the multi-device / claude.ai web setup described in [`docs/REMOTE.md`](docs/REMOTE.md). Local-only deployments don't need it.
+- **Anthropic API key** — only for the optional [API-key runner](docs/DREAM_PROCESS.md#api-key-runner).
 - **Python 3.10+** — required only by MarkItDown and by `scripts/sync-dream-skill.py`.
 
 ## Install
@@ -106,8 +107,8 @@ Use this on the machine that will host Neo4j + the MCP server. This is also wher
 **Linux / macOS / Windows with Git Bash or WSL:**
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/stevepridemore/graph-memory/v0.4.0/scripts/install-primary.sh \
-  | bash -s v0.4.0
+curl -fsSL https://raw.githubusercontent.com/stevepridemore/graph-memory/v0.5.0/scripts/install-primary.sh \
+  | bash -s v0.5.0
 # edit ~/graph-memory/.env (NEO4J_PASSWORD, GRAPH_MEMORY_HOME, CLAUDE_PROJECTS_DIR)
 cd ~/graph-memory && docker compose up -d
 ```
@@ -115,7 +116,7 @@ cd ~/graph-memory && docker compose up -d
 **Windows PowerShell (no bash needed):**
 
 ```powershell
-$v = 'v0.4.0'
+$v = 'v0.5.0'
 iwr "https://raw.githubusercontent.com/stevepridemore/graph-memory/$v/scripts/install-primary.ps1" -UseBasicParsing -OutFile $env:TEMP\gm-install.ps1
 & $env:TEMP\gm-install.ps1 -Version $v
 # edit $HOME\graph-memory\.env
@@ -133,14 +134,14 @@ Use this on every additional laptop, work computer, or phone. No Docker, no Neo4
 **Linux / macOS / Windows with Git Bash or WSL:**
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/stevepridemore/graph-memory/v0.4.0/scripts/install-secondary.sh \
-  | bash -s v0.4.0 your-tunnel-host.example.com
+curl -fsSL https://raw.githubusercontent.com/stevepridemore/graph-memory/v0.5.0/scripts/install-secondary.sh \
+  | bash -s v0.5.0 your-tunnel-host.example.com
 ```
 
 **Windows PowerShell (no bash needed):**
 
 ```powershell
-$v = 'v0.4.0'
+$v = 'v0.5.0'
 iwr "https://raw.githubusercontent.com/stevepridemore/graph-memory/$v/scripts/install-secondary.ps1" -UseBasicParsing -OutFile $env:TEMP\gm-install.ps1
 & $env:TEMP\gm-install.ps1 -Version $v -TunnelHost your-tunnel-host.example.com
 ```
@@ -193,7 +194,7 @@ If you use Claude Code on more than one PC and want a single dream process to in
 
 ## Document ingestion
 
-Drop files into `~/graph-memory/ingest/pending/` (or call `graph_ingest` directly). The next dream run extracts entities and relationships into the graph. Native support for `.md`, `.txt`, `.json`, `.html`, `.srt`, `.vtt`. With [MarkItDown](https://github.com/microsoft/markitdown) installed (`pip install "markitdown[pdf,docx,xlsx,pptx]"`), also handles `.pdf`, `.docx`, `.xlsx`, `.pptx`, `.epub`, `.msg`, `.csv`, `.xml`, `.png`, `.jpg`, etc. — converted to Markdown first, then extracted. Original files archive to `ingest/originals/<date>/`.
+Drop files into `~/graph-memory/ingest/pending/`, or call `graph_ingest` with a file path or, from a remote caller that can't reach the server's disk, with inline text (`content` + `file_name`, up to 2 MB). The next dream run extracts entities and relationships into the graph. Native support for `.md`, `.txt`, `.json`, `.html`, `.srt`, `.vtt`. With [MarkItDown](https://github.com/microsoft/markitdown) installed (`pip install "markitdown[pdf,docx,xlsx,pptx]"`), also handles `.pdf`, `.docx`, `.xlsx`, `.pptx`, `.epub`, `.msg`, `.csv`, `.xml`, `.png`, `.jpg`, etc. — converted to Markdown first, then extracted. Original files archive to `ingest/originals/<date>/`.
 
 ## Privacy
 
@@ -204,7 +205,7 @@ The graph stores personal information — names of colleagues, decisions, prefer
 - All data lives under a directory you control (default `~/graph-memory/`)
 - A `graph_export` tool produces portable JSONL backups; `~/graph-memory/backups/` is auto-rotated
 - Embedding model runs locally — no text leaves the machine for vector search
-- Entity extraction runs in your Claude sessions; same trust boundary as Claude itself
+- Entity extraction runs in your Claude sessions; same trust boundary as Claude itself. With the optional API-key runner, transcripts go to the Anthropic API under your API account instead
 - API keys, passwords, and secrets are explicitly excluded from extraction (see `prompts/dream-nightly.md`)
 
 ## Tech stack
@@ -217,6 +218,7 @@ The graph stores personal information — names of colleagues, decisions, prefer
 | Driver | `neo4j-driver` |
 | MCP framework | `@modelcontextprotocol/sdk` |
 | Auth | `jose` for JWT signing/verification (RS256) |
+| API-key runner (optional) | `@anthropic-ai/sdk` |
 | Tunnel (optional) | Cloudflare Tunnel (`cloudflared`) + Cloudflare Access |
 | Testing | Vitest |
 
@@ -235,7 +237,7 @@ All planned phases shipped:
 - ✅ npm audit clean (0 vulnerabilities)
 - ✅ Pre-built GHCR images + curl-pipeable installers (no clone or local build required for end users)
 
-Current release: [`v0.4.0`](https://github.com/stevepridemore/graph-memory/releases/tag/v0.4.0).
+Current release: [`v0.5.0`](https://github.com/stevepridemore/graph-memory/releases/tag/v0.5.0).
 
 Currently steady-state. Active development is opportunistic; the system runs unattended via the nightly dream process.
 
@@ -245,6 +247,7 @@ Newest first. Each tag publishes `ghcr.io/stevepridemore/graph-memory-mcp:<tag>`
 
 | Version | Date | Summary |
 |---|---|---|
+| [`v0.5.0`](https://github.com/stevepridemore/graph-memory/releases/tag/v0.5.0) | 2026-10-27 | Optional API-key runner: the nightly dream and weekly maintenance can run on an Anthropic API key (`graph-dream` compose service, `dream` profile) with per-run cost caps and an email summary of each run's cost. A general task runner (`dist/dream-runner/task.js`) runs other scheduled prompts on the same key with only the commands, URLs and MCP tools a task file allows. `graph_ingest` accepts inline content so Claude Code cloud sessions can feed the nightly dream. Adds the `plain-tech-docs` skill for checking docs. |
 | [`v0.4.0`](https://github.com/stevepridemore/graph-memory/releases/tag/v0.4.0) | 2026-10-11 | Security and data-integrity release. Fixes Cypher injection through relation and type names, and a `tenant_id` overwrite through caller-supplied properties. Fixes compounding decay, makes batch writes atomic, routes every write through one entity resolver, and adds the `graph_alias` tool. Types and relations are now checked against the documented vocabulary (see `SCHEMA_ENFORCEMENT`). Transcript format detection no longer misreads transcripts that open with metadata records. |
 | [`v0.3.1`](https://github.com/stevepridemore/graph-memory/releases/tag/v0.3.1) | 2026-05-17 | Rule subtype for permanent preferences, exempt from decay and pruning. `.gitattributes` forces LF on shell scripts and the Dockerfile so a Windows clone builds a working image. |
 | [`v0.3.0`](https://github.com/stevepridemore/graph-memory/releases/tag/v0.3.0) | 2026-05-10 | Curl-pipeable primary/secondary device installers + pre-built GHCR image. Multi-stage Dockerfile, auto-cert generation on first run, vendored slash commands. End users no longer need to clone or build from source. |
@@ -259,7 +262,8 @@ Newest first. Each tag publishes `ghcr.io/stevepridemore/graph-memory-mcp:<tag>`
 - [`GRAPH_SCHEMA.md`](GRAPH_SCHEMA.md) — concise vocabulary (node types + edge verbs) for both agent and humans
 - [`docs/GRAPH_SCHEMA_REFERENCE.md`](docs/GRAPH_SCHEMA_REFERENCE.md) — full reference (decay functions, weight semantics, validity windows, example queries)
 - [`docs/MCP_SERVER.md`](docs/MCP_SERVER.md) — every MCP tool with input/output schemas
-- [`docs/DREAM_PROCESS.md`](docs/DREAM_PROCESS.md) — extraction pipeline, manifest format, changelog structure
+- [`docs/DREAM_PROCESS.md`](docs/DREAM_PROCESS.md) — extraction pipeline, manifest format, changelog structure, API-key runner
+- [`docs/BACKUP.md`](docs/BACKUP.md) — backups and restore
 - [`docs/SKILLS.md`](docs/SKILLS.md) — slash command definitions
 - [`docs/REMOTE.md`](docs/REMOTE.md) — exposing graph-memory via Cloudflare Tunnel + Access
 - [`docs/MULTI_TENANT.md`](docs/MULTI_TENANT.md) — tenant isolation model

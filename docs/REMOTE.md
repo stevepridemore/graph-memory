@@ -192,8 +192,8 @@ Everything else uses bearer tokens that we sign.
 | `/mcp` | gated by CF Access (cookie or Cf-Access-Jwt-Assertion) | gated by Authorization: Bearer (our JWT) |
 | 401 response | `Cf-Access-Jwt-Assertion` scheme (non-standard) | `Bearer realm="..." resource_metadata="..."` (RFC 9728) |
 
-The `TENANT_ID_SOURCE` env var gains a new mode `oauth` (now default for the
-HTTPS transport). Stdio transport (Claude Code, Claude Desktop on this
+The `TENANT_ID_SOURCE` env var gains a new mode `oauth`. Set `TENANT_ID_SOURCE=oauth` for HTTPS and tunnel
+deployments; the default is `static`, which serves every request as the admin tenant with no auth. Stdio transport (Claude Code, Claude Desktop on this
 machine via `docker exec`) still uses `LOCAL_TENANT_ID` — unaffected.
 
 ### Cloudflare Access policy: required path-level bypass list

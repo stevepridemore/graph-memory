@@ -8,18 +8,11 @@ Each skill is a thin wrapper that calls the `graph-memory` MCP server tools.
 
 ## Installation
 
-```bash
-mkdir -p ~/.claude/skills/ingest
-mkdir -p ~/.claude/skills/graph
-mkdir -p ~/.claude/skills/graph-ask
-mkdir -p ~/.claude/skills/graph-stats
-mkdir -p ~/.claude/skills/graph-dream
-mkdir -p ~/.claude/skills/graph-find
-mkdir -p ~/.claude/skills/graph-boost
-mkdir -p ~/.claude/skills/graph-briefing
-```
+The installers copy every skill in the repo's `skills/` folder into `~/.claude/skills/`: `scripts/install-primary.sh`, `install-primary.ps1`, `install-secondary.sh` and `install-secondary.ps1`. Each skill is a folder with a `SKILL.md`. The sections below describe each one; the files themselves are the source.
 
-Then create each `SKILL.md` as described below.
+To install by hand from a clone, copy the folder's contents, for example `cp -r skills/* ~/.claude/skills/`.
+
+`plain-tech-docs` is a developer skill for this repo's docs. It's in `skills/`, so the installers copy it too. Ignore it if you don't edit docs.
 
 ---
 
@@ -77,6 +70,28 @@ Steps:
 
 If no file path is provided, ask the user for one.
 ```
+
+---
+
+## /ingest-audio
+
+**Purpose:** Transcribe a local audio or video file with Whisper, then queue it for the dream or ingest it now.
+
+**Location:** `~/.claude/skills/ingest-audio/SKILL.md`
+
+**Usage:**
+```
+/ingest-audio path/to/talk.mp3
+/ingest-audio path/to/call.m4a --model small --topic "hiring, budget" --author "Speaker name"
+/ingest-audio path/to/call.m4a --now
+```
+
+**Behavior:**
+- Runs the `whisper` CLI locally. It needs `ffmpeg` too. Supported types: `.mp3`, `.wav`, `.m4a`, `.mp4`, `.ogg`, `.flac`, `.webm`, `.mkv`, `.avi`, `.mov`.
+- `--model` is `tiny`, `base` (default), `small`, `medium` or `large`. Bigger models are more accurate and slower on CPU. The first run for a model downloads its weights.
+- Writes a transcript `.md` and a `.meta.json` sidecar straight into `~/graph-memory/ingest/pending/`. It doesn't call `graph_ingest`, because that tool runs in Docker and can't see host paths. The dream picks the file up on its next run.
+- `--now` extracts entities inline instead (`graph_entities`, `graph_relate`, `graph_boost`), like `/ingest --now`.
+- For YouTube or other online URLs, use `/ingest <url>`.
 
 ---
 
@@ -191,6 +206,25 @@ If there are stale nodes, mention they may need review or will be pruned.
 
 ---
 
+## /graph-backup
+
+**Purpose:** Export the memory graph to a timestamped JSONL backup file. Use before risky operations, or on demand.
+
+**Location:** `~/.claude/skills/graph-backup/SKILL.md`
+
+**Usage:**
+```
+/graph-backup
+/graph-backup with label "pre-prune"
+```
+
+**Behavior:**
+- Calls `graph_export`, with a `label` if you give one. The file lands in `~/graph-memory/backups/`. See [BACKUP.md](BACKUP.md).
+- Reports the file path, node and edge counts, size, how many old files were pruned, and how many are kept.
+- If the export fails, it suggests checking that the container is running (`docker ps`).
+
+---
+
 ## /graph-bootstrap
 
 **Purpose:** One-time bulk import of existing knowledge into the graph.
@@ -251,11 +285,11 @@ Parse the arguments:
 - `--ingest-only` optional: only process the ingest drop folder, skip conversation transcripts
 
 Steps:
-1. Check for lock file at ~/.claude/graph-memory/processed/dream.lock
+1. Check for lock file at ~/graph-memory/processed/dream.lock
    - If it exists and was created less than 2 hours ago, report "Dream process already running" and exit
    - Otherwise, create the lock file with: {"pid": 0, "timestamp": "<now>", "source": "manual-graph-dream"}
-2. Read ~/.claude/graph-memory/processed/manifest.json to find unprocessed transcripts
-3. Check ~/.claude/graph-memory/ingest/pending/ for new documents
+2. Read ~/graph-memory/processed/manifest.json to find unprocessed transcripts
+3. Check ~/graph-memory/ingest/pending/ for new documents
 4. If nothing pending, report "No pending work", delete the lock file, and exit
 
 5. For each unprocessed transcript (JSONL files):
@@ -275,11 +309,11 @@ Steps:
 
 7. Call graph_decay to apply time-based maintenance
 
-8. Write changelog to ~/.claude/graph-memory/logs/YYYY-MM-DD.md
+8. Write changelog to ~/graph-memory/logs/YYYY-MM-DD.md
 
 9. Move ingest files to completed/
 
-10. Delete the lock file at ~/.claude/graph-memory/processed/dream.lock
+10. Delete the lock file at ~/graph-memory/processed/dream.lock
 
 11. Report summary: transcripts processed, entities created/updated, edges, contradictions
 
@@ -316,7 +350,7 @@ IMPORTANT: NEVER extract API keys, passwords, tokens, secrets, or credentials in
 - `--topic` focuses capture on entities/relationships related to a specific topic mentioned in the conversation
 - `--since-message <uuid>` only considers messages from that point onward — useful for partial captures during long conversations
 
-The canonical skill prompt is committed to the repo at [`prompts/graph-capture.md`](../prompts/graph-capture.md). When deploying, copy it to `~/.claude/skills/graph-capture/SKILL.md`. It goes through: candidate inventory → search-first existing-entity check → 3-way classification → relationship planning → weight assignment → batch write → validation → user-facing summary.
+The skill source is [`skills/graph-capture/SKILL.md`](../skills/graph-capture/SKILL.md), which the installers copy to `~/.claude/skills/graph-capture/SKILL.md`. Edit that file. [`prompts/graph-capture.md`](../prompts/graph-capture.md) is a separate copy that the installers don't use. The skill goes through: candidate inventory → search-first existing-entity check → 3-way classification → relationship planning → weight assignment → batch write → validation → user-facing summary.
 
 **Why the 3-way branch matters:** an early version of this skill ran on a conversation that contained outdated context about an old infrastructure choice. The user corrected the conversation; the skill then created new entities representing the correction *but also* re-confirmed the now-wrong edges by calling `graph_relate` on them (which bumps `last_confirmed`). Net effect: the graph held both the old wrong fact (freshly strengthened) and the new correct one, with no `invalid_at` resolution. The 3-way branch with explicit invalidation prevents this anti-pattern.
 
@@ -586,15 +620,19 @@ The script is stdlib Python. It reports `file:line:col: [category] "match" -> su
 | Command | Purpose | MCP Tool(s) Used |
 |---------|---------|-----------------|
 | `/ingest <file>` | Add document to knowledge graph | `graph_ingest`, `graph_relate` |
+| `/ingest-audio <file>` | Transcribe audio/video with Whisper, then queue or ingest | `graph_entities`, `graph_relate`, `graph_boost` (with `--now` only) |
 | `/graph <entity>` | Query and explore the graph | `graph_query` |
 | `/graph-ask <question>` | Natural language → Cypher queries | `graph_cypher` (Claude writes Cypher) |
 | `/graph-stats` | Health dashboard | `graph_stats`, `graph_ingest` |
+| `/graph-backup` | Export the graph to a timestamped JSONL file | `graph_export` |
 | `/graph-dream` | Manual dream run (inline) | All graph tools (runs as session) |
+| `/graph-bootstrap` | One-time import of memory files and transcripts | `graph_entities`, `graph_relate`, `graph_decay` |
+| `/graph-capture` | Capture the current conversation | `graph_search`, `graph_entities`, `graph_relate`, `graph_validate` (plus boost, weaken, delete) |
 | `/graph-briefing` | Session briefing with context | `graph_stats`, `graph_query`, `graph_contradictions` |
 | `/graph-find <pattern>` | Audit/review graph | `graph_contradictions`, `graph_entities` |
 | `/graph-boost` | Adjust edge weights | `graph_boost`, `graph_weaken` |
 | `/plain-tech-docs [paths]` | Flag and fix AI-sounding prose in docs | none (local script) |
 
-All skills run in Claude Code sessions (Max plan). No external API calls needed.
+Most skills run in Claude Code sessions (Max plan) and call only the local graph-memory MCP server. Two skills reach outside: `/ingest <url>` fetches the page or YouTube transcript, and `/ingest-audio` runs Whisper locally (no network use after the model is downloaded).
 
 All skills are installed globally at `~/.claude/skills/` and available in every session.

@@ -49,7 +49,7 @@ init Cypher, example queries) see
 | `Resource` ✅ 🤔 | A consumable or referenceable thing | Overlaps with `Object`. Currently rare in graph (1 node). Candidate for merge into `Object` unless it earns its keep. |
 | `Infrastructure` ✅ 🤔 | A server, host, network device, deployment target | Overlaps with `Object`. Currently rare (1 node). Candidate for merge into `Object` with `subtype: infrastructure`. |
 | `Alias` ✅ | An alternate name pointing at a canonical entity | Legacy: no code ever resolved through `Alias` nodes. Alternate names now live in an `aliases` list on the entity itself, managed with `graph_alias`, and every write path resolves through it (exact name, then case-insensitive name, then alias, then slug). `aliases` cannot be set through ordinary properties. |
-| `Location` ✅ 🆕 | A place: city, county, region, or address | Target of `LOCATED_IN`. The verb table already referenced this as "Place"; named `Location` here to match the nodes in the live graph. |
+| `Location` ✅ 🆕 | A place: city, county, region, or address | Target of `LOCATED_IN` and `DEPLOYED_TO`. |
 | `Issue` ✅ 🆕 | A bug, defect, or open problem | Endpoint for `BLOCKS` / `BLOCKED_BY` / `RESOLVED_BY`, which referenced it before it was defined here. |
 | `Task` ✅ 🆕 | A discrete unit of work to be done | Endpoint for `BLOCKS` / `BLOCKED_BY`, which referenced it before it was defined here. |
 
@@ -139,6 +139,7 @@ edge points from A to B.
 | Verb | Direction | Use when |
 |---|---|---|
 | `PRODUCED` ✅ | Person/Project → Artifact/Event | Authorship of an output |
+| `PRODUCED_BY` 🆕 | Artifact/Object → Person/Project/Event | Inverse of `PRODUCED`; where this artifact came from |
 | `AUTHORED` 🆕 | Person → Artifact | Wrote/created a doc, post, or code |
 | `CREATED` 🆕 | Person → Project/Object | Brought something into existence (broader than `AUTHORED`) |
 | `AFFECTS` 🆕 | Decision → Object/Project | A decision applies to or constrains a target |
@@ -155,12 +156,13 @@ edge points from A to B.
 | `BLOCKED_BY` 🆕 | Issue/Task → Issue/Task | Inverse of `BLOCKS` |
 | `RESOLVED_BY` 🆕 | Issue/Fact → Decision/Event | Closes a contradiction or open question |
 
-### Place & runtime
+### Location & runtime
 
 | Verb | Direction | Use when |
 |---|---|---|
-| `LOCATED_IN` 🆕 | Person/Object → Place | Geographic placement |
-| `DEPLOYED_TO` 🆕 | Project → Infrastructure/Place | Runtime deployment target |
+| `LOCATED_IN` 🆕 | Person/Object → Location | Geographic placement |
+| `DEPLOYED_TO` 🆕 | Project → Infrastructure/Location | Runtime deployment target |
+| `HOSTED_ON` 🆕 | Object → Object | Runs on or inside another object (an app on a server, a container on a host) |
 
 ### Events & temporal
 
@@ -188,7 +190,7 @@ without one. Three patterns:
    without an arrow (`MATCH (a)-[r:KNOWS]-(b)`). Direction in storage
    is meaningless.
 2. **Inverse-pair verbs** (`CONTAINS`/`PART_OF`, `BLOCKS`/`BLOCKED_BY`,
-   `REPLACES`/`DEPRECATED_BY`): only store one direction per fact —
+   `REPLACES`/`DEPRECATED_BY`, `PRODUCED`/`PRODUCED_BY`): only store one direction per fact —
    pick the canonical (typically active voice → forward arrow) and let
    queries follow either.
 3. **Asymmetric verbs** (`AUTHORED`, `EXTENDS`, `INSPIRED_BY`,

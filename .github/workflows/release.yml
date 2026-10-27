@@ -1,7 +1,7 @@
 name: Release
 
 # Publishes the graph-memory-mcp container image to GHCR on every v* tag push,
-# tagged with both the version and `latest`. The image is what the
+# tagged with the version, and with `latest` when it is the newest tag. The image is what the
 # install-primary.sh script pulls — no clone or local build required for users.
 
 on:
@@ -13,29 +13,46 @@ permissions:
   contents: read
   packages: write
 
+# One release at a time, so re-running several tags can't race on :latest.
+concurrency:
+  group: release-image
+  cancel-in-progress: false
+
 jobs:
   publish-image:
     name: Publish container image
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
 
-      - uses: docker/setup-buildx-action@v3
+      # Only the highest v* tag moves :latest. Re-running an older tag's
+      # release republishes that version without pulling :latest back.
+      - name: Pick image tags
+        id: tags
+        run: |
+          newest=$(git tag --list 'v*' --sort=-v:refname | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | head -n1)
+          tags="ghcr.io/stevepridemore/graph-memory-mcp:${GITHUB_REF_NAME}"
+          if [ "$GITHUB_REF_NAME" = "$newest" ]; then
+            tags="$tags,ghcr.io/stevepridemore/graph-memory-mcp:latest"
+          fi
+          echo "list=$tags" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/setup-buildx-action@v4
 
       - name: Log in to GHCR
-        uses: docker/login-action@v3
+        uses: docker/login-action@v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Build and push
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: .
           push: true
-          tags: |
-            ghcr.io/stevepridemore/graph-memory-mcp:${{ github.ref_name }}
-            ghcr.io/stevepridemore/graph-memory-mcp:latest
+          tags: ${{ steps.tags.outputs.list }}
           cache-from: type=gha
           cache-to: type=gha,mode=max

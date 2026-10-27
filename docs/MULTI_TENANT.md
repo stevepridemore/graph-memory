@@ -70,9 +70,11 @@ For stdio transport (Claude Code / Claude Desktop running locally), there's no i
 | `static` | local stdio (Claude Code / Desktop), tests | `LOCAL_TENANT_ID` env var |
 | `cf-access` | Cloudflare Access JWT on every path (legacy mode) | Cf-Access JWT `email` claim |
 | `header` | self-hosted reverse-proxy setups | `X-Graph-Memory-Tenant` request header (only safe behind a trusted proxy) |
-| `oauth` | **production remote mode** — claude.ai web, multi-device | `email` claim from our own RS256 bearer JWT (issued by `/oauth/token`) |
+| `oauth` | **recommended remote mode** — claude.ai web, multi-device | `email` claim from our own RS256 bearer JWT (issued by `/oauth/token`) |
 
-**`oauth` mode (production default for HTTPS transport):** The server validates the `Authorization: Bearer` token against its own RSA keypair (see `~/graph-memory/oauth/`). The JWKS for these keys is served at `/oauth/jwks` — separate from the Cloudflare Access JWKS at `https://<team>.cloudflareaccess.com/cdn-cgi/access/certs`. In this mode, Cloudflare Access only gates `/oauth/authorize` (the one path a browser must reach during the OAuth connect flow); all other paths (`/mcp`, `/oauth/token`, `/.well-known/*`, `/health`) bypass CF Access and accept bearer tokens directly.
+**`oauth` mode (recommended for HTTPS transport):** The server validates the `Authorization: Bearer` token against its own RSA keypair (see `~/graph-memory/oauth/`). The JWKS for these keys is served at `/oauth/jwks` — separate from the Cloudflare Access JWKS at `https://<team>.cloudflareaccess.com/cdn-cgi/access/certs`. In this mode, Cloudflare Access only gates `/oauth/authorize` (the one path a browser must reach during the OAuth connect flow); all other paths (`/mcp`, `/oauth/token`, `/.well-known/*`, `/health`) bypass CF Access and accept bearer tokens directly.
+
+`TENANT_ID_SOURCE` defaults to `static` (see `src/shared/auth.ts` and `docker-compose.yml`). The server logs a warning at startup when an HTTP transport runs with `static`. Set `oauth` or `cf-access` for any HTTP transport that other hosts can reach.
 
 `cf-access` mode is now used only internally (gating the `/oauth/authorize` path). `static` and `header` remain valid for local-only and custom proxy deployments.
 
@@ -100,6 +102,7 @@ The tenant whose id matches `BOOTSTRAP_TENANT_ID` (typically the system owner's 
 
 - **`graph_cypher`** — only this tenant can run raw Cypher (otherwise users could bypass tenant filtering by writing their own queries).
 - **`graph_reembed` with no scope** — re-embeds entities across all tenants. Non-admin tenants can only reembed their own.
+- **`graph_ingest` with inline `content`:** queued text is dreamed into the admin graph, so only the admin tenant may send it. Other tenants get an error.
 - **Schema and migration changes** run as the admin during `initializeSchema()`.
 
 There's no role hierarchy beyond this — `isAdminTenant()` in [`src/shared/auth.ts`](../src/shared/auth.ts) is a single-line check. If finer-grained roles become necessary, that's the seam.
@@ -107,7 +110,7 @@ There's no role hierarchy beyond this — `isAdminTenant()` in [`src/shared/auth
 ## Caveats and known limitations
 
 - **Fulltext index is global at the index layer.** Neo4j 5.x doesn't expose tenant-aware fulltext indexes; we filter results post-query in the WHERE clause. Correctness is intact (no leak), but a fulltext search in tenant A can match-then-filter entities in tenant B at the index layer. Tiny perf overhead at small scale.
-- **Vector index is also global.** Same pattern — over-request `top_k * 4` candidates from the index, then filter to the calling tenant. Negligible at hundreds of nodes; revisit at 100k+.
+- **Vector index is also global.** Same pattern — over-request `max(top_k * 4, 40)` candidates from the index, then filter to the calling tenant. Negligible at hundreds of nodes; revisit at 100k+.
 - **Embeddings are tenant-agnostic.** The text we embed is just the entity name + type + select properties — no cross-tenant signal. Re-embedding across all tenants is safe.
 - **No per-tenant rate limiting in the MCP layer.** Cloudflare Access provides per-policy rate rules; configure those if abuse becomes a concern.
 

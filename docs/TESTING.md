@@ -8,6 +8,10 @@ Test suites live in `src/`:
 | `src/shared/oauth-events.test.ts` | Structured-event log shape, IP-extraction precedence chain, throw-resilience | No |
 | `src/mcp-server/read-body.test.ts` | Body-size cap (64 KB OAuth / 4 MB MCP), fast reject via `Content-Length`, streaming reject | No |
 | `src/shared/neo4j-client.test.ts` | Integration tests for the Neo4j client — schema init, multi-tenant data ops, decay/bi-temporal/contradiction queries, `graph_merge`/`graph_unmerge` | **Yes** |
+| `src/shared/transcript-parser.test.ts` | Transcript JSONL parsing: leading metadata, long lead-ins, files with no messages, bad first line | No |
+| `src/mcp-server/ingest-content.test.ts` | Ingest file-name validation and the session cursors used by cloud-session ingest | No |
+| `src/dream-runner/dream-runner.test.ts` | Dream runner: pending discovery, file-tool confinement, tool filtering, cost and email summaries (fake Messages client and MCP server) | No |
+| `src/dream-runner/task.test.ts` | API task runner: file-tool confinement (including symlinks) and run logging to `runs.jsonl` | No |
 
 The full suite runs in ~10 seconds end-to-end against a fresh Neo4j. Test counts grow as new functionality lands; check the run output for the current totals.
 
@@ -19,7 +23,7 @@ No setup required:
 npx vitest run src/shared/oauth.test.ts
 ```
 
-These are pure unit tests, but a few exercise disk I/O against `~/graph-memory/oauth/clients.json` (because `src/shared/config.ts` hardcodes `GRAPH_MEMORY_HOME = homedir()/graph-memory`). Each disk-touching test cleans up via `beforeEach`/`afterEach`. If you've never run the production server on this machine, the directory will be created fresh.
+These are pure unit tests, but a few exercise disk I/O against `~/graph-memory/oauth/clients.json` (`src/shared/config.ts` sets `GRAPH_MEMORY_HOME` from the env var of that name, falling back to `homedir()/graph-memory`). Each disk-touching test cleans up via `beforeEach`/`afterEach`. If you've never run the production server on this machine, the directory will be created fresh.
 
 ## Running the full suite (with Neo4j)
 
@@ -98,10 +102,10 @@ The throwaway container is still booting. Neo4j's bolt port comes up before auth
 
 ## CI
 
-`.github/workflows/ci.yml` defines a `Test` job that:
+`.github/workflows/ci.yml` runs on pushes to `main` and on pull requests. It has two jobs:
 
-- Spins up a `neo4j:5.20-community` service container with `NEO4J_AUTH=neo4j/test1234` on `localhost:7687` (CI port can be the standard one because there's nothing else competing for it).
-- Runs `npm ci && npm run build && npx vitest run` with `NEO4J_URI=bolt://localhost:7687`, `NEO4J_USER=neo4j`, `NEO4J_PASSWORD=test1234`.
+- **Typecheck:** `npm ci`, then `npm run build` (`tsc`).
+- **Test:** starts a `neo4j:5.20-community` service container with `NEO4J_AUTH=neo4j/test1234` on `localhost:7687` (CI port can be the standard one because there's nothing else competing for it). Then it runs `npm ci` and `npm run test:coverage` with `NEO4J_URI=bolt://localhost:7687`, `NEO4J_USER=neo4j`, `NEO4J_PASSWORD=test1234`.
 - Required as a status check on `main` (branch ruleset 16067964).
 
 If a PR fails CI but passes locally, the most common cause is a test that depends on undeclared env or filesystem state — re-run locally with **only** `NEO4J_*` env set (no `.env` sourced, no other graph-memory env) to mirror CI.
@@ -135,4 +139,4 @@ Coverage is measured with Vitest's [v8 provider](https://vitest.dev/guide/covera
 
 ### CI
 
-CI runs `npm run test:coverage` on every push and PR. The `NEO4J_*` env vars are already set on the `Test` job via the service container. Coverage numbers appear in the `Test` job log — no artifact upload, no threshold gate (measure first, decide later).
+The Test job runs `npm run test:coverage` on pushes to `main` and on pull requests. The `NEO4J_*` env vars are already set on the `Test` job via the service container. Coverage numbers appear in the `Test` job log — no artifact upload, no threshold gate (measure first, decide later).

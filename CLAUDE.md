@@ -13,6 +13,8 @@ You have access to a graph-based memory system via the `graph-memory` MCP server
 
 - `graph_query` for structured lookups (entities, relationships, weights)
 - `graph_cypher` when you need a custom query (you know the schema — see /graph-ask skill)
+- `graph_search` when the user's wording may not match an entity name (semantic lookup)
+- `graph_alias` when the user says two names refer to the same entity
 - `graph_boost` when the user confirms something you recalled from the graph
 - `graph_weaken` when the user corrects something the graph got wrong
 

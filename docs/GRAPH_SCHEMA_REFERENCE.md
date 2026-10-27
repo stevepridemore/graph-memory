@@ -13,20 +13,23 @@ This document defines the Neo4j schema for the graph memory system. Neo4j is sch
 
 ## Schema Initialization
 
-Run once when setting up the database (stored in `~/.claude/graph-memory/schema/v1.cypher`):
+Applied on every server start. All statements are idempotent. The file is `$GRAPH_MEMORY_HOME/schema/v1.cypher`, falling back to the bundled `schema/v1.cypher`:
 
 ```cypher
-// ─── Uniqueness Constraints (on :Entity label for cross-type uniqueness) ───
-CREATE CONSTRAINT entity_id IF NOT EXISTS FOR (n:Entity) REQUIRE n.id IS UNIQUE;
+// ─── Uniqueness Constraints ───
+// Composite key: an id is unique per tenant, not globally.
+CREATE CONSTRAINT entity_tenant_id IF NOT EXISTS FOR (n:Entity) REQUIRE (n.tenant_id, n.id) IS UNIQUE;
 CREATE CONSTRAINT alias_id IF NOT EXISTS FOR (n:Alias) REQUIRE n.id IS UNIQUE;
 
 // ─── Type-Specific Indexes for Common Lookups ───
+CREATE INDEX entity_tenant_name IF NOT EXISTS FOR (n:Entity) ON (n.tenant_id, n.name);
 CREATE INDEX person_name IF NOT EXISTS FOR (n:Person) ON (n.name);
 CREATE INDEX project_name IF NOT EXISTS FOR (n:Project) ON (n.name);
 CREATE INDEX concept_name IF NOT EXISTS FOR (n:Concept) ON (n.name);
 CREATE INDEX event_name IF NOT EXISTS FOR (n:Event) ON (n.name);
 CREATE INDEX object_name IF NOT EXISTS FOR (n:Object) ON (n.name);
 CREATE INDEX preference_key IF NOT EXISTS FOR (n:Preference) ON (n.domain, n.key);
+CREATE INDEX reasoning_name IF NOT EXISTS FOR (n:Reasoning) ON (n.name);
 CREATE INDEX alias_text IF NOT EXISTS FOR (n:Alias) ON (n.alias_text);
 CREATE INDEX entity_subtype IF NOT EXISTS FOR (n:Entity) ON (n.subtype);
 
@@ -131,7 +134,7 @@ Choices made, with reasoning and context.
     reversible: BOOLEAN,            // default true
     status: STRING,                 // "active", "superseded", "reversed"
     decided_date: DATETIME,
-    confidence: FLOAT               // default 0.7 (decisions start higher — they were explicit)
+    confidence: FLOAT               // new entities start at 0.5 (see Schema Summary)
 })
 ```
 
@@ -210,16 +213,7 @@ Captures *how* a problem was solved — the process and approach, not just the o
 **Key relationships:** `LED_TO` (Reasoning → Decision/Event/Fact) and `INVOLVED_IN` (Reasoning → Person/Project/Concept/Object).
 
 ### Alias
-Tracks alternate names for entities (for entity resolution). Does NOT carry the `:Entity` label.
-
-```
-(:Alias {
-    id: STRING,
-    alias_text: STRING,             // the alternate name (normalized)
-    target_type: STRING,            // which node label the target has
-    target_id: STRING               // the id of the canonical entity
-})
-```
+Legacy label. No code writes `:Alias` nodes. Alternate names live in the `aliases` list property on the entity, managed with `graph_alias`. Every write and lookup resolves through it: exact name, then case-insensitive name, then alias. `aliases` is a reserved property, so it cannot be set through ordinary properties.
 
 ---
 
@@ -405,7 +399,7 @@ Example — NOT a contradiction: "Project X uses Vue" then later "Project X uses
 #### RELATED_TO
 Any → Any (generic catch-all)
 
-**Allowed `relationship_type` values** (to prevent unbounded variation):
+**Suggested `relationship_type` values** (the write path does not check these; see `RELATED_TO_SUBTYPES` in `src/shared/types.ts`):
 `similar_to`, `part_of`, `enables`, `impacts`, `depends_on`, `alternative_to`, `derived_from`, `implements`, `extends`, `configured_by`
 
 ```cypher
@@ -416,10 +410,10 @@ Any → Any (generic catch-all)
 ```
 
 #### ALIAS_OF
-Alias → any Entity
+Entity ↔ Entity (symmetric). Records that two entities are the same thing without merging them. Name resolution does not read these edges. `graph_alias` is what makes a name resolve.
 
 ```cypher
-(a:Alias)-[:ALIAS_OF { weight: 1.0 }]->(target:Entity)
+(a:Entity)-[:ALIAS_OF { weight: 1.0 }]-(b:Entity)
 ```
 
 ### Event Relationships *(NEW)*
@@ -602,11 +596,11 @@ where:
 
 ### Example: Affinity in Action
 ```
-Working directory: ~/Documents/Projects/graph-memory
+Working directory: ~/projects/graph-memory
 Query entities: ["database"]
 
 Raw results (no affinity):
-  1. PostgreSQL  — weight 0.65 (used in domino-auth-project)
+  1. PostgreSQL  — weight 0.65 (used in billing-api)
   2. Neo4j       — weight 0.55 (used in graph-memory)
   3. SQLite      — weight 0.50 (used in graph-memory)
 
@@ -634,12 +628,14 @@ new_weight = weight * (decay_rate ^ days_since_last_confirmed)
 | Event | 0.993 | ~99 days (events age fastest — they're temporal by nature) |
 | Object | 0.996 | ~173 days |
 
-**Implementation note:** Decay is calculated from absolute `last_seen` / `last_confirmed` timestamps, not incrementally. This means it's correct regardless of how often the dream process runs. The `graph_decay` MCP tool applies this in batch.
+**Implementation note:** Decay is measured from the later of `last_seen` (for edges, `last_confirmed`) and `last_decayed`. Each run stamps `last_decayed`, so repeated runs do not compound. The `graph_decay` MCP tool applies this in batch. Only the eight types with a rate in `config.decay.rates` decay.
 
 ### Pruning Threshold
 Nodes are flagged for pruning (and eligible for `graph_prune`) when:
-- `confidence < 0.1` AND no relationships with `weight > 0.2`, **OR**
-- Zero edges (orphaned) AND `last_seen` older than `prune_orphan_days` (default: 30 days)
+- `confidence < prune_node_threshold` (0.1) AND no relationship has a weight at or above `prune_edge_threshold` (0.05), **OR**
+- Zero edges (orphaned) AND `last_seen` older than `prune_orphan_days` (default: 30 days) AND `confidence` at or above the node threshold
+
+Nodes with `subtype: 'rule'` are never flagged.
 
 Flagged nodes appear in dream changelogs. Actual deletion requires `graph_prune` with explicit user confirmation — never auto-deleted.
 
@@ -737,12 +733,12 @@ Claude handles entity resolution using its reasoning ability — no algorithmic 
 
 1. Check existing entities via `graph_entities` MCP tool before creating new ones
 2. Use the full-text search index for fuzzy name matching
-3. Check the Alias table for known alternate names
+3. Check the `aliases` list on candidate entities for known alternate names
 4. When uncertain, create as new and flag for review in the changelog
 5. **Never merge without high confidence** — false merges are worse than duplicates
 
 ### Alias Management
-- When a new alias is discovered, create Alias node linked to canonical entity
+- When a new alias is discovered, call `graph_alias` on the canonical entity
 - Common patterns: abbreviations, nicknames, project code names
 - Dream process reviews potential aliases in each run
 
@@ -753,23 +749,29 @@ Claude handles entity resolution using its reasoning ability — no algorithmic 
 
 ## Schema Summary
 
-### Node Types (9 canonical types)
-| Type | Subtypes | Decay Half-life | Default Confidence |
-|------|----------|-----------------|-------------------|
-| Person | individual, contact, group | 346 days | 0.5 |
-| Project | active, paused, completed, abandoned | 138 days | 0.5 |
-| Preference | coding_style, tools, workflow, communication, environment | 693 days | 0.5 |
-| Concept | technology, methodology, domain, pattern, language, framework | 693 days | 0.5 |
-| Decision | architectural, process, tooling, design, policy | 231 days | 0.7 |
-| Fact | infrastructure, process, policy, configuration, credential_note | 173 days | 0.5 |
-| Event | meeting, deployment, incident, review, milestone, conversation, discovery | 99 days | 0.5 |
-| Object | repository, server, database, document, config, tool, container, service, file | 173 days | 0.5 |
-| Reasoning | debugging, design, analysis, research | 173 days | 0.5 |
-| Alias | *(none)* | *(no decay)* | *(n/a)* |
+### Node Types (19 documented types)
+The 19 labels in `ENTITY_TYPES` (`src/shared/types.ts`). New entities start at confidence 0.5. `graph_relate` passes its `weight` as the starting confidence when one is given.
 
-**Ad-hoc types:** claude.ai and other clients sometimes create entities with types not in the canonical list above (e.g., `Organization`, `Technology`, `Artifact`). Neo4j accepts these labels without error. We periodically review ad-hoc types that appear frequently and promote useful ones to the canonical list. The canonical list drives decay rates, schema documentation, and skill instructions.
+| Type | Subtypes | Decay Half-life |
+|------|----------|-----------------|
+| Person | individual, contact, group | 346 days |
+| Project | active, paused, completed, abandoned | 138 days |
+| Preference | coding_style, tools, workflow, communication, environment | 693 days |
+| Concept | technology, methodology, domain, pattern, language, framework | 693 days |
+| Decision | architectural, process, tooling, design, policy | 231 days |
+| Fact | infrastructure, process, policy, configuration, credential_note | 173 days |
+| Event | meeting, deployment, incident, review, milestone, conversation, discovery | 99 days |
+| Object | repository, server, database, document, config, tool, container, service, file | 173 days |
+| Reasoning | debugging, design, analysis, research | none (no rate in config, never decays) |
+| Alias | *(none)* | *(no decay)* |
+| Organization, Feature, Technology, Artifact, Resource, Infrastructure, Location, Issue, Task | *(none listed)* | none (no rate in config) |
 
-### Relationship Types (22 total)
+Only the eight types with a rate in `config.decay.rates` decay: Person, Project, Preference, Concept, Decision, Fact, Event and Object.
+
+**Out-of-vocabulary writes:** `SCHEMA_ENFORCEMENT` defaults to `coerce`. An unknown type is written as `Object` with the original in `proposed_type`. An unknown verb is written as `RELATED_TO` with the original in `proposed_relations`. `lenient` writes the input as given, and `strict` rejects it. The most frequent proposals are the candidates to add to the vocabulary.
+
+### Relationship Types (50 in `RELATIONSHIP_TYPES`)
+The table lists common verbs. [GRAPH_SCHEMA.md](../GRAPH_SCHEMA.md) has the full vocabulary with directions.
 | Relationship | From → To | Key Properties |
 |-------------|-----------|---------------|
 | WORKS_ON | Person → Project | role, since |
@@ -784,7 +786,7 @@ Claude handles entity resolution using its reasoning ability — no algorithmic 
 | DECIDED_FOR | Decision → any | — |
 | SUPERSEDES | Decision → Decision | reason, superseded_date |
 | CONTRADICTS | any → any | description, detected_date, resolved, resolution |
-| RELATED_TO | any → any | relationship_type (constrained set) |
+| RELATED_TO | any → any | relationship_type (suggested values, not enforced) |
 | ALIAS_OF | Alias → any Entity | — |
 | PARTICIPATED_IN | Person → Event | role |
 | OCCURRED_DURING | Event → Project | — |
@@ -813,29 +815,14 @@ Powers `graph_search` hybrid retrieval. Embeddings are generated by the local `b
 
 ## Schema Migration Strategy
 
-Schema versions are stored in `~/.claude/graph-memory/schema/`:
+There is no migration runner. On startup the MCP server runs `initializeSchema()` (src/shared/neo4j-client.ts):
 
-```
-schema/
-├── v1.cypher              # Initial schema (constraints + indexes)
-├── migrations/
-│   ├── v1_to_v2.cypher    # Add new node type, property, etc.
-│   └── ...
-└── current_version.txt    # Tracks applied version
-```
+1. Reads `$GRAPH_MEMORY_HOME/schema/v1.cypher`, falling back to the copy bundled in the image (`schema/v1.cypher`).
+2. Runs each statement. Every constraint and index uses `IF NOT EXISTS`, so this is safe on every start.
+3. Backfills `tenant_id` on any entity that lacks one, using `BOOTSTRAP_TENANT_ID` (default `bootstrap`).
 
-### Execution Path
-
-**Migrations are applied by the MCP server on startup**, NOT by the dream process or `graph_cypher` (which is read-only). The MCP server's initialization routine:
-
-1. Reads `current_version.txt` (defaults to "0" if missing)
-2. Scans `migrations/` for files matching `v{N}_to_v{N+1}.cypher`
-3. Applies each pending migration in order using `session.executeWrite()`
-4. Updates `current_version.txt` after each successful migration
-5. Logs applied migrations to stdout
-
-**This means schema changes take effect on MCP server restart.** Since the server starts fresh with each Claude Code session (stdio transport = new process per session), migrations apply automatically on the next session start.
+To change the schema, edit `schema/v1.cypher` with idempotent statements and restart the server. One-off data changes (renames, backfills) are run by hand with Cypher. `graph_stats` reports `schema/current_version.txt` as the schema version if the file exists, otherwise `1`; nothing writes that file.
 
 ### Rollback
 
-Neo4j constraint and index creation is idempotent (`IF NOT EXISTS`). For destructive migrations, the migration file should include a comment block with the rollback Cypher. Rollback is manual via Neo4j Browser (`http://localhost:7474`).
+Rollback is manual. Drop a constraint or index with Cypher (Neo4j Browser at `http://localhost:7474`, or `cypher-shell` in the container) and remove it from `v1.cypher` so it is not recreated on the next start.

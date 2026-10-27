@@ -1,8 +1,8 @@
 # Graph Memory System — Architecture
 
-## Design Principle: No API Key Required
+## Design Principle: No API Key Required (by default)
 
-All LLM intelligence runs inside Claude Code sessions (covered by Max subscription). The MCP server is a dumb pipe to Neo4j — it executes Cypher, returns results, nothing more. Entity extraction, Cypher generation, and reasoning all happen in Claude Code where your Max plan covers it.
+By default, all LLM intelligence runs inside Claude Code sessions (covered by a Max subscription). The MCP server is a thin pipe to Neo4j — it executes Cypher, returns results, nothing more. Entity extraction, Cypher generation, and reasoning all happen in Claude Code where your Max plan covers it. An optional API-key runner can run the nightly dream instead; see [DREAM_PROCESS.md](DREAM_PROCESS.md#api-key-runner).
 
 ```
 LLM work (Max plan)              Graph operations (local, free)
@@ -11,7 +11,7 @@ Claude Code sessions             MCP Server → Neo4j
   - Entity extraction              - Execute Cypher queries
   - Cypher generation              - Return results
   - Reasoning/synthesis            - No LLM calls
-  - Dream process (scheduled)      - No API key needed
+  - Dream process (scheduled)      - No API key (default)
 ```
 
 ## System Overview
@@ -23,7 +23,7 @@ claude.ai web / Claude Desktop (remote)         Claude Code / Claude Desktop (lo
    ▼                                                  ▼
 ┌─────────────────────────────────────────────────────────────────┐
 │              graph-memory-mcp (Docker, port 3847)               │
-│              Node 22 + Express raw HTTP                         │
+│              Node 22, node:http and node:https (no Express)     │
 │                                                                 │
 │  User message → Claude reasons → Graph MCP query                │
 │                                   │                             │
@@ -53,7 +53,7 @@ claude.ai web / Claude Desktop (remote)         Claude Code / Claude Desktop (lo
               ┌───────────────────────────────────────┐
               │    Dream Process (Scheduled Task)      │
               │    Runs AS a Claude Code session        │
-              │    (Max plan — no API key needed)       │
+              │    (Max plan; no API key by default)    │
               │                                        │
               │  1. Read new transcripts + ingest docs │
               │  2. Claude extracts entities/edges     │
@@ -82,7 +82,7 @@ claude.ai web / Claude Desktop (remote)         Claude Code / Claude Desktop (lo
 - Readers don't block writers — MCP server and dream process connect simultaneously with zero issues
 - Full Cypher query language support
 - Official TypeScript driver (`neo4j-driver`) — actively maintained, pure JS, no native bindings
-- Docker deployment — sits alongside existing Domino container in WSL2
+- Docker deployment on the primary device
 - Mature ecosystem — GraphAcademy courses, Neogma OGM, active community
 - Free for personal use (GPLv3)
 
@@ -91,30 +91,28 @@ claude.ai web / Claude Desktop (remote)         Claude Code / Claude Desktop (lo
 **Deployment:**
 
 ```yaml
-# docker-compose.yml (in ~/Documents/Projects/graph-memory/ — source repo)
-# Run with: docker compose -f ~/Documents/Projects/graph-memory/docker-compose.yml up -d
+# docker-compose.yml (repo root; abbreviated)
 services:
-  graph-memory-mcp:
-    # Node 22 + Express HTTP on port 3847
-    # Connected to by Cloudflare Tunnel (remote) or docker exec (local stdio)
-
-  graph-memory-neo4j:
-    image: neo4j:5.20-community
-    # + APOC plugin
+  neo4j:
+    image: neo4j:5.20-community   # + APOC plugin
     ports:
-      - "127.0.0.1:7474:7474"   # Browser UI (optional, for debugging)
-      - "127.0.0.1:7687:7687"   # Bolt protocol (host-side access; not used by MCP in prod)
-    # MCP service connects as bolt://neo4j:7687 over compose internal network
-    volumes:
-      - neo4j-data:/data
-      - neo4j-logs:/logs
-    environment:
-      - NEO4J_AUTH=neo4j/<password>
-    restart: unless-stopped
+      - "127.0.0.1:7474:7474"     # Browser UI (optional, for debugging)
+      - "127.0.0.1:7687:7687"     # Bolt (host-side access; MCP uses bolt://neo4j:7687 internally)
+    volumes:                      # bind mounts under GRAPH_MEMORY_HOME, not named volumes
+      - ${GRAPH_MEMORY_HOME}/neo4j/data:/data
+      - ${GRAPH_MEMORY_HOME}/neo4j/logs:/logs
+      - ${GRAPH_MEMORY_HOME}/neo4j/import:/import
 
-volumes:
-  neo4j-data:
-  neo4j-logs:
+  graph-memory-mcp:
+    # Node 22; node:http/https server on port 3847 (no Express)
+    # Reached by Cloudflare Tunnel (remote) or docker exec (local stdio)
+    volumes:
+      - ${GRAPH_MEMORY_HOME}:/root/graph-memory
+
+  graph-dream:
+    # Optional API-key dream runner, started only with the "dream" profile
+    profiles: ["dream"]
+    command: ["node", "dist/dream-runner/index.js", "--daemon"]
 ```
 
 **Resource footprint:** ~512MB RAM (tunable). Graph data is single-digit MB for personal use. The JVM is the real cost.
@@ -158,6 +156,9 @@ Each tool is annotated with hints so Claude can reason about safety.
 | `graph_build_context` | Bundle graph health + context into one call | No | readOnly |
 | `graph_search` | Hybrid semantic + graph traversal retrieval | No | readOnly |
 | `graph_reembed` | Regenerate entity embeddings | No | idempotent |
+| `graph_alias` | List, add or remove an entity's aliases | No | idempotent |
+| `graph_merge` | Merge a duplicate entity into another (supports dry run) | No | destructive |
+| `graph_merge_suggestions` | List likely duplicate entities | No | readOnly |
 
 **Key change from previous design:** `graph_cypher` no longer translates natural language to Cypher. It only executes pre-formed Cypher queries (enforced read-only via Neo4j's `executeRead()` transaction mode). **Claude in the session generates the Cypher itself** — it knows the schema (injected via skill instructions) and can write Cypher directly. No Haiku call needed.
 
@@ -176,13 +177,14 @@ Each tool is annotated with hints so Claude can reason about safety.
 
 ### 3. Dream Process (Scheduled Task — IS a Claude Code Session)
 
-**This is the key architectural decision.** The dream process is NOT a standalone script that calls the Claude API. It IS a Claude Code scheduled task — meaning it runs as a full Claude Code session with access to your Max plan.
+**This is the key architectural decision for the default setup.** The dream process is NOT a standalone script that calls the Claude API. It IS a Claude Code scheduled task — meaning it runs as a full Claude Code session with access to your Max plan.
 
 **What this means:**
 - Claude itself reads the transcripts and extracts entities (no API key needed)
 - Claude calls the MCP tools to write to the graph (same tools available as in any session)
 - Claude writes the changelog
 - All covered by your Max subscription
+- Optional alternative: `dist/dream-runner/index.js` runs the same prompt through the Messages API on an API key. See [DREAM_PROCESS.md](DREAM_PROCESS.md#api-key-runner).
 
 **Trigger conditions (lazy evaluation):**
 - Nightly scheduled task checks for new transcripts/ingest docs
@@ -197,7 +199,7 @@ Scheduled task fires (Claude Code session)
   → Claude extracts entities and relationships (its own reasoning, Max plan)
   → Claude calls graph_relate, graph_boost, etc. via MCP tools
   → Claude calls graph_decay via MCP tool
-  → Claude writes changelog to ~/.claude/graph-memory/logs/
+  → Claude writes changelog to ~/graph-memory/logs/
   → Claude updates manifest.json
 ```
 
@@ -241,6 +243,7 @@ Scheduled tasks are stored at `~/.claude/scheduled-tasks/<task-name>/SKILL.md` a
 Example tasks:
 - **graph-dream-nightly** — processes new transcripts and ingest docs, runs decay, writes changelog. Runs nightly.
 - **graph-dream-weekly** — deep health analysis: stats, contradictions, stale nodes, weekly summary.
+- **API-key runner (optional)** — the same nightly prompt through `node dist/dream-runner/index.js`. Add `--job weekly` for the weekly maintenance prompt, or `--daemon` to run both on a schedule. See [DREAM_PROCESS.md](DREAM_PROCESS.md#api-key-runner).
 
 ## Retrieval Trigger: How Claude Knows to Use the Graph
 
@@ -311,7 +314,7 @@ Nightly task fires (Claude Code session)
      - 2 new edges created via graph_relate
      - 1 contradiction flagged
   → Calls graph_decay for maintenance
-  → Writes changelog to ~/.claude/graph-memory/logs/2026-04-06.md
+  → Writes changelog to ~/graph-memory/logs/2026-04-06.md
   → Updates manifest.json
 ```
 
@@ -370,13 +373,16 @@ Dream process extracts 8 entities and 15 relationships from a transcript
 ## Directory Structure
 
 ```
-~/.claude/graph-memory/
+~/graph-memory/
+├── backups/               # graph_export JSONL backups
 ├── ingest/                # Drop folder for documents to ingest
 │   ├── pending/           # Drop files here — dream process picks them up
 │   └── completed/         # Processed files moved here with metadata
-├── logs/                  # Dream process changelogs
+├── logs/                  # Dream process changelogs and run logs
 │   ├── 2026-04-06.md
-│   ├── weekly/
+│   ├── weekly/            # Claude Code weekly analysis reports
+│   ├── weekly-reports/    # API-key weekly reports (prompts/weekly-maintenance.md)
+│   ├── dream-runner/      # API-key runner logs and runs.jsonl
 │   └── ...
 ├── processed/             # Tracking file for processed transcripts
 │   └── manifest.json
@@ -413,20 +419,20 @@ Dream process extracts 8 entities and 15 relationships from a transcript
 
 | Component | Technology | Rationale |
 |-----------|-----------|-----------|
-| Language | TypeScript/Node.js | User's comfort zone, Claude Code ecosystem |
+| Language | TypeScript/Node.js | Matches the Claude Code ecosystem |
 | Graph DB | Neo4j Community (Docker) | Full ACID, concurrent access, mature Cypher, free |
 | Neo4j Driver | `neo4j-driver` (npm) | Official, pure JS, TypeScript types, actively maintained |
 | MCP Framework | `@modelcontextprotocol/sdk` | Standard MCP server toolkit |
-| LLM for everything | Claude Code sessions (Max plan) | No API key needed — extraction, Cypher gen, reasoning |
+| LLM for everything | Claude Code sessions (Max plan) | No API key needed by default — extraction, Cypher gen, reasoning. API-key runner is optional |
 | Hook scripts | Node.js CLI scripts | Fast startup, filesystem checks only |
 | Testing | Vitest | Lightweight, TypeScript-native |
-| Container | Docker Desktop (WSL2) | Already installed, runs alongside Domino container |
+| Container | Docker (Desktop on Windows/macOS, Engine on Linux) | Runs Neo4j and the MCP server as containers |
 
 ## Scope: Global, Not Project-Based
 
 This system operates at the **user level**, not per-project:
 
-- **Neo4j container, config, logs, ingest folder** all live under `~/.claude/graph-memory/`
+- **Neo4j container, config, logs, ingest folder** all live under `~/graph-memory/`
 - **MCP server** registered in `~/.claude/settings.json` (user-level)
 - **Hooks** registered in user-level settings
 - **Scheduled tasks** are session-agnostic
@@ -439,7 +445,7 @@ This system operates at the **user level**, not per-project:
 
 ## Path Conventions
 
-**In documentation:** `~/.claude/` is used as shorthand for readability.
+**In documentation:** `~/` means your home folder. Graph data lives under `~/graph-memory/`, and Claude Code transcripts under `~/.claude/projects/`.
 
 **In code, hooks, scheduled task prompts, and MCP registration:** Always use fully qualified absolute paths (e.g. `C:\Users\<you>\.claude\...` on Windows or `/home/<you>/.claude/...` on Linux/macOS). Tilde expansion is not guaranteed across all execution contexts on Windows (hooks run as shell commands, scheduled tasks run as Claude sessions, MCP server runs as a Node.js child process — each may handle `~` differently). The MCP server itself uses `os.homedir()` to resolve at startup; downstream code references the resolved `GRAPH_MEMORY_HOME` constant.
 
@@ -456,8 +462,8 @@ The MCP server resolves paths at startup using `os.homedir()` and exposes a `GRA
 
 ## Backup & Recovery
 
-- **Neo4j data** lives in a Docker volume (`neo4j-data`). Back up with `docker cp` or volume export.
-- **Schema** stored in `~/.claude/graph-memory/schema/` as `.cypher` files for rebuild
-- **Markdown files** remain the source of truth. If the graph is corrupted, bootstrap script can rebuild from memory files + transcripts.
+- **Neo4j data** lives in `${GRAPH_MEMORY_HOME}/neo4j/data` (a bind mount, not a named volume). See [BACKUP.md](BACKUP.md) for cold copies, dumps and JSONL exports.
+- **Schema** is `schema/v1.cypher` in the repo. The image copies it to `/app/schema/`.
+- **Markdown files** remain the source of truth. If the graph is corrupted, the bootstrap prompt (`/graph-bootstrap`) can rebuild from memory files + transcripts.
 - **Config and manifest** are small JSON files — include in any backup
-- **Recovery procedure:** Stop container → restore volume → restart. Or: drop database → re-run schema → re-run bootstrap.
+- **Recovery procedure:** Stop container → restore data directory → restart. Or: restore a `graph_export` JSONL with the import script (see BACKUP.md), then re-run bootstrap for anything newer.
