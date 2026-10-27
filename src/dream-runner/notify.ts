@@ -1,34 +1,24 @@
 import { readFileSync, readdirSync, statSync } from "node:fs";
 import { join } from "node:path";
-import nodemailer from "nodemailer";
 import { readSecretFile } from "./api-key.js";
 
 // Email from the runner itself, after a run: the weekly report, and an alert
-// when a run doesn't finish cleanly. The model never gets a mail tool. Uses
-// plain SMTP (Gmail with an app password by default), so it doesn't depend on
-// any OAuth sign-in staying fresh.
+// when a run doesn't finish cleanly. The model never gets a mail tool. Mail
+// goes through gws-mcp's send-only notify listener (POST /notify with a shared
+// token), which sends from a fixed account to a fixed recipient. The runner
+// picks neither, so it holds no Gmail credential.
 
 export interface MailSettings {
-  to: string;
-  user: string;
-  passwordFile: string;
-  host: string;
-  port: number;
+  url: string;
+  tokenFile: string;
 }
 
-/** Null when email isn't set up (no recipient, sender or password file). */
+/** Null when email isn't set up (no notify URL or token file). */
 export function loadMailSettings(env: NodeJS.ProcessEnv = process.env): MailSettings | null {
-  const to = env.DREAM_ALERT_TO?.trim();
-  const user = env.DREAM_SMTP_USER?.trim();
-  const passwordFile = env.DREAM_SMTP_PASSWORD_FILE?.trim();
-  if (!to || !user || !passwordFile) return null;
-  return {
-    to,
-    user,
-    passwordFile,
-    host: env.DREAM_SMTP_HOST?.trim() || "smtp.gmail.com",
-    port: Number(env.DREAM_SMTP_PORT?.trim() || 465),
-  };
+  const url = env.DREAM_NOTIFY_URL?.trim();
+  const tokenFile = env.DREAM_NOTIFY_TOKEN_FILE?.trim();
+  if (!url || !tokenFile) return null;
+  return { url, tokenFile };
 }
 
 export interface Mail {
@@ -38,16 +28,24 @@ export interface Mail {
 
 export type SendFn = (mail: Mail) => Promise<void>;
 
-export function smtpSender(settings: MailSettings): SendFn {
+/** gws-mcp caps the body at 200 KB; trim from the top so the end survives. */
+const MAX_TEXT = 190 * 1024;
+
+export function notifySender(settings: MailSettings, fetchFn: typeof fetch = fetch): SendFn {
   return async (mail) => {
-    const pass = readSecretFile(settings.passwordFile, "DREAM_SMTP_PASSWORD_FILE", /^(?:export\s+)?\w*PASSWORD\s*=\s*(.+)$/);
-    const transport = nodemailer.createTransport({
-      host: settings.host,
-      port: settings.port,
-      secure: settings.port === 465,
-      auth: { user: settings.user, pass },
+    const token = readSecretFile(settings.tokenFile, "DREAM_NOTIFY_TOKEN_FILE", /^(?:export\s+)?\w*TOKEN\s*=\s*(.+)$/);
+    const text = mail.text.length > MAX_TEXT ? "[…trimmed]\n" + mail.text.slice(-MAX_TEXT) : mail.text;
+    const res = await fetchFn(settings.url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
+      body: JSON.stringify({ subject: mail.subject.slice(0, 200), text }),
+      signal: AbortSignal.timeout(60_000),
     });
-    await transport.sendMail({ from: settings.user, to: settings.to, subject: mail.subject, text: mail.text });
+    if (!res.ok) {
+      let detail = "";
+      try { detail = ((await res.json()) as { error?: string }).error ?? ""; } catch { /* not JSON */ }
+      throw new Error(`notify returned ${res.status}${detail ? `: ${detail}` : ""}`);
+    }
   };
 }
 

@@ -17,7 +17,7 @@ const { findPendingWork, totalPending } = await import("./pending.js");
 const { resolvePath, runFileTool, FileToolError } = await import("./file-tools.js");
 const { estimateCostUsd, nextRunAt, loadSettings, runDream, kickoffMessage } = await import("./index.js");
 const { TranscriptTools } = await import("./transcript-tools.js");
-const { mailForRun, loadMailSettings } = await import("./notify.js");
+const { mailForRun, loadMailSettings, notifySender } = await import("./notify.js");
 
 const roots = { graphHome, projectsDir };
 
@@ -177,13 +177,31 @@ describe("transcript tools", () => {
 });
 
 describe("email", () => {
-  it("is off unless recipient, sender and password file are all set", () => {
+  it("is off unless the notify URL and token file are both set", () => {
     expect(loadMailSettings({})).toBeNull();
-    expect(loadMailSettings({ DREAM_ALERT_TO: "a@x", DREAM_SMTP_USER: "b@x" })).toBeNull();
-    expect(loadMailSettings({ DREAM_ALERT_TO: "a@x", DREAM_SMTP_USER: "b@x", DREAM_SMTP_PASSWORD_FILE: "/p" })).toMatchObject({
-      host: "smtp.gmail.com",
-      port: 465,
+    expect(loadMailSettings({ DREAM_NOTIFY_URL: "http://gws-mcp:3849/notify" })).toBeNull();
+    expect(loadMailSettings({ DREAM_NOTIFY_URL: "http://gws-mcp:3849/notify", DREAM_NOTIFY_TOKEN_FILE: "/t" })).toEqual({
+      url: "http://gws-mcp:3849/notify",
+      tokenFile: "/t",
     });
+  });
+
+  it("posts to the notify listener with the token and reports failures", async () => {
+    const tokenFile = join(graphHome, "notify-token");
+    writeFileSync(tokenFile, "tok-0123456789abcdef0123456789abcdef\n");
+    const calls: { url: string; init: RequestInit }[] = [];
+    let status = 200;
+    const fakeFetch = (async (url: string, init: RequestInit) => {
+      calls.push({ url, init });
+      return new Response(JSON.stringify(status === 200 ? { ok: true } : { error: "send failed" }), { status });
+    }) as unknown as typeof fetch;
+    const send = notifySender({ url: "http://gws-mcp:3849/notify", tokenFile }, fakeFetch);
+    await send({ subject: "S", text: "T" });
+    expect(calls[0].url).toBe("http://gws-mcp:3849/notify");
+    expect((calls[0].init.headers as Record<string, string>).Authorization).toBe("Bearer tok-0123456789abcdef0123456789abcdef");
+    expect(JSON.parse(calls[0].init.body as string)).toEqual({ subject: "S", text: "T" });
+    status = 502;
+    await expect(send({ subject: "S", text: "T" })).rejects.toThrow("notify returned 502: send failed");
   });
 
   it("sends the weekly report, alerts on trouble, stays quiet otherwise", () => {

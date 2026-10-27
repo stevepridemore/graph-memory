@@ -428,9 +428,8 @@ The runner reads the key at run time from `ANTHROPIC_API_KEY`, or from the file 
 | `DREAM_WEEKLY_SCHEDULE` | `off` | Weekly maintenance in the daemon, e.g. `Sun 06:00` |
 | `DREAM_WEEKLY_MAX_COST_USD` | `1.5` | Weekly job's budget |
 | `DREAM_WEEKLY_EXCLUDE_TOOLS` | see Weekly maintenance | Graph tools hidden from the weekly job |
-| `DREAM_ALERT_TO` | none | Where reports and alerts go; email is off without it |
-| `DREAM_SMTP_USER` | none | SMTP login and From address |
-| `DREAM_SMTP_PASSWORD_HOST_FILE` | none | Host path of the app-password file (compose mounts it) |
+| `DREAM_NOTIFY_TOKEN_HOST_FILE` | none | Host path of the notify token file, shared with gws-mcp; email is off without it |
+| `DREAM_NOTIFY_URL` | `http://gws-mcp:3849/notify` | gws-mcp's notify listener |
 
 ### Running it
 
@@ -453,13 +452,13 @@ The same runner can run `prompts/weekly-maintenance.md` with `--job weekly`, or 
 
 ### Email
 
-With `DREAM_ALERT_TO`, `DREAM_SMTP_USER` and an SMTP password file set, the runner sends mail after a run (`notify.ts`):
+With `DREAM_NOTIFY_TOKEN_HOST_FILE` set, the runner sends mail after a run (`notify.ts`):
 
 - **Weekly, completed:** the report from `logs/weekly-reports/`, subject `Weekly Graph Maintenance — <date> (<N> action items)`.
 - **Any run that doesn't finish cleanly** (error, budget stop, turn limit, refusal, lock held): a short alert with the outcome, cost and the last 40 log lines.
 - **Nothing** for a normal nightly or a quiet night.
 
-It uses plain SMTP (Gmail with an app password by default; `DREAM_SMTP_HOST` / `DREAM_SMTP_PORT` to change), read from a file like the API key, so it doesn't depend on any OAuth sign-in staying fresh. A failed send is logged and never fails the run. The report is plain text (it's Markdown, which reads fine as is).
+Mail goes through gws-mcp's send-only notify listener (`POST /notify` with a bearer token). gws-mcp sends from its `NOTIFY_ACCOUNT` to its fixed `NOTIFY_TO`, so the runner holds no Gmail credential and the token can't mail anyone else. The listener's port isn't published: `graph-dream` reaches it as `gws-mcp:3849` over the shared `mcp-notify` docker network, which both compose files declare. To set it up, write one random value (32+ characters) to a file, point gws-mcp's `NOTIFY_TOKEN_HOST_FILE` and this project's `DREAM_NOTIFY_TOKEN_HOST_FILE` at it, set `NOTIFY_ACCOUNT` and `NOTIFY_TO` for gws-mcp, and restart both. A failed send is logged and never fails the run. The report is plain text (it's Markdown, which reads fine as is).
 
 ### What stays on the subscription
 

@@ -147,18 +147,28 @@ services:
       - DREAM_EFFORT=${DREAM_EFFORT:-medium}
       - DREAM_MAX_COST_USD=${DREAM_MAX_COST_USD:-3}
       # Email (optional): the weekly report and alerts for runs that don't
-      # finish cleanly. Off unless DREAM_ALERT_TO and DREAM_SMTP_USER are set
-      # and the app-password file is mounted below.
-      - DREAM_ALERT_TO=${DREAM_ALERT_TO:-}
-      - DREAM_SMTP_USER=${DREAM_SMTP_USER:-}
-      - DREAM_SMTP_PASSWORD_FILE=/run/secrets/smtp_password
+      # finish cleanly, sent through gws-mcp's send-only notify listener over
+      # the shared mcp-notify network. Off unless DREAM_NOTIFY_TOKEN_HOST_FILE
+      # is set (the same token file gws-mcp's NOTIFY_TOKEN_HOST_FILE uses).
+      - DREAM_NOTIFY_URL=${DREAM_NOTIFY_URL:-http://gws-mcp:3849/notify}
+      - DREAM_NOTIFY_TOKEN_FILE=${DREAM_NOTIFY_TOKEN_HOST_FILE:+/run/secrets/notify_token}
     volumes:
       - ${GRAPH_MEMORY_HOME}:/root/graph-memory
       - ${CLAUDE_PROJECTS_DIR}:/root/.claude/projects:ro
       - ${ANTHROPIC_API_KEY_HOST_FILE:-./.anthropic-api-key}:/run/secrets/anthropic_api_key:ro
-      - ${DREAM_SMTP_PASSWORD_HOST_FILE:-./.smtp-password}:/run/secrets/smtp_password:ro
+      - ${DREAM_NOTIFY_TOKEN_HOST_FILE:-./.notify-token}:/run/secrets/notify_token:ro
+    networks:
+      - default
+      - mcp-notify
     logging:
       driver: json-file
       options:
         max-size: "10m"
         max-file: "5"
+
+networks:
+  # Shared with the gws-mcp project, whose notify listener lives on it.
+  # Whichever project starts first creates it; not `external`, so graph-dream
+  # still starts when gws-mcp isn't deployed.
+  mcp-notify:
+    name: mcp-notify

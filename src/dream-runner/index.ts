@@ -26,7 +26,7 @@ import { resolveApiKey } from "./api-key.js";
 import { FILE_TOOLS, FILE_TOOL_NAMES, runFileTool, type FileRoots } from "./file-tools.js";
 import { findPendingWork, totalPending, type PendingWork } from "./pending.js";
 import { TRANSCRIPT_TOOLS, TRANSCRIPT_TOOL_NAMES, TranscriptTools } from "./transcript-tools.js";
-import { loadMailSettings, mailForRun, smtpSender, type SendFn } from "./notify.js";
+import { loadMailSettings, mailForRun, notifySender, type SendFn } from "./notify.js";
 
 const here = dirname(fileURLToPath(import.meta.url));
 
@@ -280,7 +280,7 @@ export type RunOutcome = "nothing_pending" | "locked" | "completed" | "budget_st
 export interface RunnerDeps {
   anthropic?: Pick<Anthropic, "beta">;
   connect?: () => Promise<Client>;
-  /** null turns email off; undefined uses DREAM_ALERT_TO / DREAM_SMTP_* if set. */
+  /** null turns email off; undefined uses DREAM_NOTIFY_URL / DREAM_NOTIFY_TOKEN_FILE if set. */
   send?: SendFn | null;
 }
 
@@ -301,7 +301,7 @@ export async function runDream(
   let send = deps.send;
   if (send === undefined) {
     const mail = loadMailSettings();
-    send = mail ? smtpSender(mail) : null;
+    send = mail ? notifySender(mail) : null;
   }
   const mail = send && mailForRun({ job, ...result, graphHome: settings.roots.graphHome });
   if (send && mail) {

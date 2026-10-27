@@ -23,7 +23,7 @@ export function resolveApiKey(env: NodeJS.ProcessEnv = process.env): string {
 }
 
 /**
- * Read a one-value secret file (the API key, the SMTP app password). Same
+ * Read a one-value secret file (the API key, the notify token). Same
  * shapes as above: bare value, or a NAME=value line matching `line`.
  */
 export function readSecretFile(keyPath: string, label: string, line?: RegExp): string {
