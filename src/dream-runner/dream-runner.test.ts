@@ -209,7 +209,7 @@ describe("email", () => {
     const started = new Date(Date.now() - 5000);
     const reports = join(graphHome, "logs", "weekly-reports");
     mkdirSync(reports, { recursive: true });
-    writeFileSync(join(reports, "2026-11-01.md"), "# Weekly\n\n## Action Required\n- [ ] merge Milo\n- [ ] check X\n");
+    writeFileSync(join(reports, "2026-11-01.md"), "# Weekly\n\n## Action Required\n- [ ] merge Alpha and Beta\n- [ ] check X\n");
     const logPath = join(graphHome, "logs", "dream-runner", "t.log");
     mkdirSync(dirname(logPath), { recursive: true });
     writeFileSync(logPath, "turn 1\nerror: boom\n");
@@ -217,7 +217,7 @@ describe("email", () => {
 
     const weekly = mailForRun({ ...base, job: "weekly", outcome: "completed" })!;
     expect(weekly.subject).toMatch(/Weekly Graph Maintenance — .* \(2 action items, ~\$0\.40\)/);
-    expect(weekly.text).toContain("merge Milo");
+    expect(weekly.text).toContain("merge Alpha and Beta");
 
     const failed = mailForRun({ ...base, job: "nightly", outcome: "error" })!;
     expect(failed.subject).toMatch(/nightly run error/);

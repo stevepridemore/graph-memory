@@ -73,7 +73,7 @@ describe("task runner", () => {
       [{ type: "tool_use", id: "t1", name: "echo_query", input: { gaql: "SELECT x FROM y" } }],
       [
         { type: "tool_use", id: "t2", name: "write_file", input: { path: "ads/audits/today.md", content: "# report" } },
-        { type: "tool_use", id: "t3", name: "send_email", input: { subject: "[CFL Ads] test", body: "<p>hi</p>", html: true } },
+        { type: "tool_use", id: "t3", name: "send_email", input: { subject: "[Site] test", body: "<p>hi</p>", html: true } },
         { type: "tool_use", id: "t4", name: "write_file", input: { path: "ads/README.md", content: "nope" } },
       ],
       [{ type: "text", text: "All clear. Report written, one email sent." }],
@@ -101,7 +101,7 @@ describe("task runner", () => {
     expect(result.outcome).toBe("completed");
     expect(readFileSync(join(work, "ads", "audits", "today.md"), "utf-8")).toBe("# report");
     expect(readFileSync(join(work, "ads", "README.md"), "utf-8")).toBe("status: ok\n");
-    expect(sent).toEqual([{ subject: "[CFL Ads] test", text: "<p>hi</p>", html: true }]);
+    expect(sent).toEqual([{ subject: "[Site] test", text: "<p>hi</p>", html: true }]);
     const turn2 = JSON.stringify(seen[1]);
     expect(turn2).toContain("got SELECT x FROM y");
     const turn3 = JSON.stringify(seen[2]);
