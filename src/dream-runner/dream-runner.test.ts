@@ -1,0 +1,360 @@
+import { describe, it, expect, beforeAll, afterAll } from "vitest";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { tmpdir } from "node:os";
+
+// dream-lock.ts and config.ts read HOME / GRAPH_MEMORY_HOME at import time,
+// so point both at a scratch folder before importing anything under test.
+const root = mkdtempSync(join(tmpdir(), "dream-runner-"));
+const graphHome = join(root, "graph-memory");
+const projectsDir = join(root, ".claude", "projects");
+process.env.HOME = root;
+process.env.USERPROFILE = root;
+process.env.GRAPH_MEMORY_HOME = graphHome;
+
+const { parseKeyFile, resolveApiKey } = await import("./api-key.js");
+const { findPendingWork, totalPending } = await import("./pending.js");
+const { resolvePath, runFileTool, FileToolError } = await import("./file-tools.js");
+const { estimateCostUsd, nextRunAt, loadSettings, runDream, kickoffMessage } = await import("./index.js");
+const { TranscriptTools } = await import("./transcript-tools.js");
+const { mailForRun, loadMailSettings, notifySender } = await import("./notify.js");
+
+const roots = { graphHome, projectsDir };
+
+beforeAll(() => {
+  mkdirSync(join(graphHome, "processed"), { recursive: true });
+  mkdirSync(join(graphHome, "ingest", "pending"), { recursive: true });
+  mkdirSync(join(projectsDir, "proj-a"), { recursive: true });
+});
+
+afterAll(() => rmSync(root, { recursive: true, force: true }));
+
+describe("api key", () => {
+  it("parses a bare key and an env-style line", () => {
+    expect(parseKeyFile("sk-test-123\n")).toBe("sk-test-123");
+    expect(parseKeyFile("﻿# comment\nANTHROPIC_API_KEY=\"sk-test-456\"\r\n")).toBe("sk-test-456");
+    expect(parseKeyFile("OTHER=1\nFOO=2\n")).toBeNull();
+  });
+
+  it("prefers the env var, then the file, and accepts a folder with one file", () => {
+    expect(resolveApiKey({ ANTHROPIC_API_KEY: "sk-env" })).toBe("sk-env");
+    const keyDir = join(root, "claude-api-key");
+    mkdirSync(keyDir);
+    writeFileSync(join(keyDir, "key.txt"), "sk-from-folder\n");
+    expect(resolveApiKey({ ANTHROPIC_API_KEY_FILE: keyDir })).toBe("sk-from-folder");
+    expect(resolveApiKey({ ANTHROPIC_API_KEY_FILE: join(keyDir, "key.txt") })).toBe("sk-from-folder");
+  });
+
+  it("errors without leaking contents", () => {
+    expect(() => resolveApiKey({})).toThrow(/ANTHROPIC_API_KEY_FILE/);
+    const bad = join(root, "bad-key");
+    writeFileSync(bad, "A=sk-secret\nB=2\n");
+    expect(() => resolveApiKey({ ANTHROPIC_API_KEY_FILE: bad })).toThrow(/No value found/);
+    try { resolveApiKey({ ANTHROPIC_API_KEY_FILE: bad }); } catch (e) {
+      expect(String(e)).not.toContain("sk-secret");
+    }
+  });
+});
+
+describe("pending work", () => {
+  it("counts new and grown transcripts and text ingest files only", () => {
+    writeFileSync(join(projectsDir, "proj-a", "s-new.jsonl"), "{}\n");
+    writeFileSync(join(projectsDir, "proj-a", "s-old.jsonl"), "{}\n{}\n");
+    writeFileSync(join(projectsDir, "proj-a", "s-same.jsonl"), "{}\n");
+    writeFileSync(join(projectsDir, "proj-a", "agent-x.jsonl"), "{}\n");
+    writeFileSync(
+      join(graphHome, "processed", "manifest.json"),
+      JSON.stringify({ processed: { "s-old": { file_size_bytes: 3 }, "s-same": { file_size_bytes: 3 } } }),
+    );
+    writeFileSync(join(graphHome, "ingest", "pending", "notes.md"), "hi");
+    writeFileSync(join(graphHome, "ingest", "pending", "notes.md.meta.json"), "{}");
+    writeFileSync(join(graphHome, "ingest", "pending", "scan.pdf"), "%PDF");
+
+    const p = findPendingWork(graphHome, projectsDir);
+    expect(p).toMatchObject({ newTranscripts: 1, grownTranscripts: 1, ingestFiles: 1, ingest: ["notes.md"] });
+    expect(totalPending(p)).toBe(3);
+    expect(p.transcripts.map((t) => [t.session_id, t.mode, t.path]).sort()).toEqual([
+      ["s-new", "new", "~/.claude/projects/proj-a/s-new.jsonl"],
+      ["s-old", "delta", "~/.claude/projects/proj-a/s-old.jsonl"],
+    ]);
+  });
+
+  it("leaves sessions that changed in the last few minutes for next time", () => {
+    const p = findPendingWork(graphHome, projectsDir, { activeMinutes: 30 });
+    expect(p.transcripts).toEqual([]);
+    expect(p.skippedActive.sort()).toEqual(["s-new", "s-old"]);
+  });
+
+  it("puts the list in the kickoff message", () => {
+    const msg = kickoffMessage(new Date("2026-10-27T00:00:00Z"), findPendingWork(graphHome, projectsDir));
+    expect(msg).toContain('"session_id": "s-old"');
+    expect(msg).toContain("- notes.md");
+    expect(msg).not.toContain("diskPath");
+  });
+});
+
+describe("file tools", () => {
+  it("maps the prompt's ~ paths onto the roots", () => {
+    expect(resolvePath("~/graph-memory/processed/manifest.json", roots, "read")).toBe(
+      join(graphHome, "processed", "manifest.json"),
+    );
+    expect(resolvePath("~/.claude/projects/proj-a", roots, "read")).toBe(join(projectsDir, "proj-a"));
+  });
+
+  it("refuses paths outside the roots, writes to transcripts, and the lock", () => {
+    expect(() => resolvePath("/etc/passwd", roots, "read")).toThrow(FileToolError);
+    expect(() => resolvePath("~/graph-memory/../.ssh/id_rsa", roots, "read")).toThrow(FileToolError);
+    expect(() => resolvePath("~/.claude/projects/proj-a/s-new.jsonl", roots, "write")).toThrow(/read-only/);
+    expect(() => resolvePath("~/graph-memory/processed/dream.lock", roots, "write")).toThrow(/lock/);
+  });
+
+  it("refuses a symlink that escapes the root", () => {
+    const outside = join(root, "outside");
+    mkdirSync(outside);
+    symlinkSync(outside, join(graphHome, "escape"));
+    expect(() => resolvePath("~/graph-memory/escape/x.txt", roots, "write")).toThrow(FileToolError);
+  });
+
+  it("writes, reads in pages, stats, moves and deletes", () => {
+    const out = runFileTool("write_file", { path: "~/graph-memory/logs/test.md", content: "abcdef\nghi" }, roots);
+    expect(out).toContain("wrote");
+    expect(runFileTool("read_file", { path: "~/graph-memory/logs/test.md" }, roots)).toBe("abcdef\nghi");
+    expect(runFileTool("read_file", { path: "~/graph-memory/logs/test.md", offset: 2, limit: 3 }, roots)).toBe(
+      "[characters 2-5 of 10; read on with offset 5]\ncde",
+    );
+    expect(JSON.parse(runFileTool("stat_file", { path: "~/graph-memory/logs/test.md" }, roots))).toMatchObject({
+      size_bytes: 10,
+      line_count: 2,
+    });
+    runFileTool("move_file", { from: "~/graph-memory/logs/test.md", to: "~/graph-memory/ingest/completed/test.md" }, roots);
+    expect(existsSync(join(graphHome, "ingest", "completed", "test.md"))).toBe(true);
+    runFileTool("delete_file", { path: "~/graph-memory/ingest/completed/test.md" }, roots);
+    expect(existsSync(join(graphHome, "ingest", "completed", "test.md"))).toBe(false);
+  });
+});
+
+describe("transcript tools", () => {
+  const msg = (role: string, text: string, ts: string) =>
+    JSON.stringify({ type: role, sessionId: "s-t", cwd: "/w", uuid: `${role}-${text}`, timestamp: ts, message: { role, content: [{ type: "text", text }] } });
+
+  it("pages messages, filters deltas, and records the watermark in the manifest", () => {
+    const file = join(projectsDir, "proj-a", "s-t.jsonl");
+    writeFileSync(file, [
+      msg("user", "a".repeat(30), "2026-10-01T00:00:00Z"),
+      msg("assistant", "b".repeat(30), "2026-10-02T00:00:00Z"),
+      msg("user", "c".repeat(30), "2026-10-03T00:00:00Z"),
+    ].join("\n") + "\n");
+    const item = { session_id: "s-t", path: "~/.claude/projects/proj-a/s-t.jsonl", diskPath: file, size_bytes: 1, modified: "", mode: "new" as const };
+    const tools = new TranscriptTools([item], graphHome, 50);
+
+    const p1 = JSON.parse(tools.run("read_transcript", { session_id: "s-t" }));
+    expect(p1.messages.map((m: { text: string }) => m.text[0])).toEqual(["a"]);
+    expect(p1.next_offset).toBe(1);
+    const p2 = JSON.parse(tools.run("read_transcript", { session_id: "s-t", offset: 1 }));
+    expect(p2.messages).toHaveLength(1);
+
+    const delta = JSON.parse(tools.run("read_transcript", { session_id: "s-t", since: "2026-10-02T12:00:00Z" }));
+    expect(delta.matching_messages).toBe(1);
+    expect(delta.messages[0].text[0]).toBe("c");
+    expect(delta.next_offset).toBeNull();
+
+    expect(() => tools.run("read_transcript", { session_id: "not-pending" })).toThrow(/pending list/);
+
+    writeFileSync(join(graphHome, "processed", "manifest.json"), JSON.stringify({ processed: { other: { line_count: 9 } }, extra: 1 }));
+    tools.run("update_manifest", { session_id: "s-t", entities_extracted: 2, edges_created: 3 });
+    const manifest = JSON.parse(readFileSync(join(graphHome, "processed", "manifest.json"), "utf-8"));
+    expect(manifest.extra).toBe(1);
+    expect(manifest.processed.other).toEqual({ line_count: 9 });
+    expect(manifest.processed["s-t"]).toMatchObject({
+      path: item.path,
+      line_count: 3,
+      entities_extracted: 2,
+      edges_created: 3,
+    });
+    expect(manifest.processed["s-t"].file_size_bytes).toBeGreaterThan(90);
+    expect(typeof manifest.last_dream_run).toBe("string");
+  });
+});
+
+describe("email", () => {
+  it("is off unless the notify URL and token file are both set", () => {
+    expect(loadMailSettings({})).toBeNull();
+    expect(loadMailSettings({ DREAM_NOTIFY_URL: "http://gws-mcp:3849/notify" })).toBeNull();
+    expect(loadMailSettings({ DREAM_NOTIFY_URL: "http://gws-mcp:3849/notify", DREAM_NOTIFY_TOKEN_FILE: "/t" })).toEqual({
+      url: "http://gws-mcp:3849/notify",
+      tokenFile: "/t",
+    });
+  });
+
+  it("posts to the notify listener with the token and reports failures", async () => {
+    const tokenFile = join(graphHome, "notify-token");
+    writeFileSync(tokenFile, "tok-0123456789abcdef0123456789abcdef\n");
+    const calls: { url: string; init: RequestInit }[] = [];
+    let status = 200;
+    const fakeFetch = (async (url: string, init: RequestInit) => {
+      calls.push({ url, init });
+      return new Response(JSON.stringify(status === 200 ? { ok: true } : { error: "send failed" }), { status });
+    }) as unknown as typeof fetch;
+    const send = notifySender({ url: "http://gws-mcp:3849/notify", tokenFile }, fakeFetch);
+    await send({ subject: "S", text: "T" });
+    expect(calls[0].url).toBe("http://gws-mcp:3849/notify");
+    expect((calls[0].init.headers as Record<string, string>).Authorization).toBe("Bearer tok-0123456789abcdef0123456789abcdef");
+    expect(JSON.parse(calls[0].init.body as string)).toEqual({ subject: "S", text: "T" });
+    status = 502;
+    await expect(send({ subject: "S", text: "T" })).rejects.toThrow("notify returned 502: send failed");
+  });
+
+  it("sends the weekly report, alerts on trouble, stays quiet otherwise", () => {
+    const started = new Date(Date.now() - 5000);
+    const reports = join(graphHome, "logs", "weekly-reports");
+    mkdirSync(reports, { recursive: true });
+    writeFileSync(join(reports, "2026-11-01.md"), "# Weekly\n\n## Action Required\n- [ ] merge Milo\n- [ ] check X\n");
+    const logPath = join(graphHome, "logs", "dream-runner", "t.log");
+    mkdirSync(dirname(logPath), { recursive: true });
+    writeFileSync(logPath, "turn 1\nerror: boom\n");
+    const base = { started, turns: 3, costUsd: 0.4, logPath, graphHome };
+
+    const weekly = mailForRun({ ...base, job: "weekly", outcome: "completed" })!;
+    expect(weekly.subject).toMatch(/Weekly Graph Maintenance — .* \(2 action items\)/);
+    expect(weekly.text).toContain("merge Milo");
+
+    const failed = mailForRun({ ...base, job: "nightly", outcome: "error" })!;
+    expect(failed.subject).toMatch(/nightly run error/);
+    expect(failed.text).toContain("error: boom");
+
+    expect(mailForRun({ ...base, job: "nightly", outcome: "completed" })).toBeNull();
+    expect(mailForRun({ ...base, job: "nightly", outcome: "nothing_pending" })).toBeNull();
+  });
+
+  it("emails an alert when a run fails", async () => {
+    writeFileSync(join(graphHome, "ingest", "pending", "x.md"), "hi");
+    const sent: Array<{ subject: string }> = [];
+    const anthropic = { beta: { messages: { create: async () => { throw new Error("api down"); } } } };
+    const fakeMcp = { listTools: async () => ({ tools: [] }), callTool: async () => ({ content: [] }), close: async () => {} };
+    const outcome = await runDream({ ...loadSettings({}, []), roots }, {
+      anthropic: anthropic as never,
+      connect: async () => fakeMcp as never,
+      send: async (m) => { sent.push(m); },
+    });
+    expect(outcome).toBe("error");
+    expect(sent[0].subject).toMatch(/nightly run error/);
+  });
+});
+
+describe("schedule and cost", () => {
+  it("picks today's slot if it's ahead, else tomorrow's", () => {
+    const now = new Date(2026, 9, 27, 1, 0, 0);
+    expect(nextRunAt("02:30", now)).toEqual(new Date(2026, 9, 27, 2, 30, 0));
+    expect(nextRunAt("00:15", now)).toEqual(new Date(2026, 9, 28, 0, 15, 0));
+    expect(() => nextRunAt("25:00", now)).toThrow();
+    // 2026-10-27 is a Tuesday.
+    expect(nextRunAt("Sun 06:00", now)).toEqual(new Date(2026, 10, 1, 6, 0, 0));
+    expect(nextRunAt("Tue 00:30", now)).toEqual(new Date(2026, 10, 3, 0, 30, 0));
+    expect(nextRunAt("Tue 01:30", now)).toEqual(new Date(2026, 9, 27, 1, 30, 0));
+    expect(() => nextRunAt("Xyz 01:00", now)).toThrow();
+  });
+
+  it("estimates cost from usage", () => {
+    const usage = { input: 1_000_000, output: 100_000, cacheRead: 1_000_000, cacheWrite: 0 };
+    expect(estimateCostUsd("claude-opus-5-5", usage)).toBeCloseTo(4 + 2 + 0.2);
+  });
+});
+
+describe("runDream loop", () => {
+  it("runs tools until the model finishes, then releases the lock", async () => {
+    // Fake model: one turn calls a graph tool and a file tool, the next ends.
+    const calls: Array<Record<string, unknown>> = [];
+    const replies = [
+      {
+        stop_reason: "tool_use",
+        content: [
+          { type: "tool_use", id: "t1", name: "graph_stats", input: {} },
+          { type: "tool_use", id: "t2", name: "write_file", input: { path: "~/graph-memory/logs/run.md", content: "ok" } },
+        ],
+      },
+      { stop_reason: "end_turn", content: [{ type: "text", text: "Done." }] },
+    ];
+    const anthropic = {
+      beta: {
+        messages: {
+          create: async (params: Record<string, unknown>) => {
+            calls.push(structuredClone(params));
+            const r = replies.shift()!;
+            return { ...r, usage: { input_tokens: 1000, output_tokens: 100, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 } };
+          },
+        },
+      },
+    };
+    const mcpCalls: string[] = [];
+    const fakeMcp = {
+      listTools: async () => ({ tools: [{ name: "graph_stats", description: "stats", inputSchema: { type: "object" } }] }),
+      callTool: async ({ name }: { name: string }) => {
+        mcpCalls.push(name);
+        return { content: [{ type: "text", text: "x".repeat(50) }] };
+      },
+      close: async () => {},
+    };
+
+    const settings = { ...loadSettings({}, []), maxToolResultChars: 20, roots };
+    const outcome = await runDream(settings, {
+      anthropic: anthropic as never,
+      connect: async () => fakeMcp as never,
+    });
+
+    expect(outcome).toBe("completed");
+    expect(mcpCalls).toEqual(["graph_stats"]);
+    expect(readFileSync(join(graphHome, "logs", "run.md"), "utf-8")).toBe("ok");
+    expect(existsSync(join(root, "graph-memory", "processed", "dream.lock"))).toBe(false);
+
+    // Second request carried both tool results in one user message, and the
+    // oversized one was spilled to a file with a pointer.
+    const second = calls[1].messages as Array<{ role: string; content: Array<Record<string, unknown>> }>;
+    const results = second[second.length - 1].content;
+    expect(results.map((r) => r.tool_use_id)).toEqual(["t1", "t2"]);
+    expect(String(results[0].content)).toMatch(/over the 20 limit/);
+    expect(calls[0].fallbacks).toBe("default");
+    expect(calls[0].model).toBe("claude-opus-5-5");
+  });
+
+  it("runs the weekly job with its own tools and prompt, even with nothing pending", async () => {
+    let params: Record<string, unknown> | undefined;
+    const anthropic = {
+      beta: {
+        messages: {
+          create: async (p: Record<string, unknown>) => {
+            params = p;
+            return { stop_reason: "end_turn", content: [{ type: "text", text: "Done." }], usage: { input_tokens: 1, output_tokens: 1 } };
+          },
+        },
+      },
+    };
+    const fakeMcp = {
+      listTools: async () => ({
+        tools: ["graph_export", "graph_prune", "graph_cypher", "graph_merge", "graph_read_transcript"].map((name) => ({
+          name, description: name, inputSchema: { type: "object" },
+        })),
+      }),
+      callTool: async () => ({ content: [] }),
+      close: async () => {},
+    };
+    const settings = { ...loadSettings({}, []), roots: { graphHome, projectsDir: join(root, "no-projects") } };
+    const outcome = await runDream(settings, { anthropic: anthropic as never, connect: async () => fakeMcp as never }, "weekly");
+    expect(outcome).toBe("completed");
+    const names = (params!.tools as Array<{ name: string }>).map((t) => t.name);
+    expect(names).toEqual(expect.arrayContaining(["graph_export", "graph_prune", "graph_cypher"]));
+    expect(names).not.toContain("graph_merge");
+    expect(names).not.toContain("read_transcript");
+    expect(String(params!.system)).toContain("Step 12 (email): skip it.");
+    expect(String((params!.messages as Array<{ content: string }>)[0].content)).toContain("weekly graph maintenance");
+  });
+
+  it("makes no API call when nothing is pending", async () => {
+    rmSync(projectsDir, { recursive: true, force: true });
+    rmSync(join(graphHome, "ingest", "pending"), { recursive: true, force: true });
+    let called = false;
+    const anthropic = { beta: { messages: { create: async () => { called = true; return {}; } } } };
+    const outcome = await runDream({ ...loadSettings({}, []), roots }, { anthropic: anthropic as never });
+    expect(outcome).toBe("nothing_pending");
+    expect(called).toBe(false);
+  });
+});

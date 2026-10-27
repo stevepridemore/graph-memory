@@ -107,3 +107,72 @@ services:
       options:
         max-size: "10m"
         max-file: "5"
+
+  # ─── Nightly dream on an Anthropic API key (opt-in) ───
+  # Runs prompts/dream-nightly.md through the Messages API instead of a
+  # Claude Code scheduled task, so it bills the API key rather than a claude.ai
+  # plan. Same image as the MCP server; it starts its own stdio copy of the
+  # server to reach the graph. Off unless the "dream" profile is enabled:
+  #   docker compose --profile dream up -d       (or COMPOSE_PROFILES=dream in .env)
+  # One-off runs (e.g. from Windows Task Scheduler instead of the daemon):
+  #   docker compose run --rm graph-dream node dist/dream-runner/index.js
+  #   docker compose run --rm graph-dream node dist/dream-runner/index.js --job weekly
+  # See docs/DREAM_PROCESS.md, "API-key runner".
+  graph-dream:
+    image: ghcr.io/stevepridemore/graph-memory-mcp:${MCP_IMAGE_TAG:-latest}
+    container_name: graph-memory-dream
+    profiles: ["dream"]
+    restart: unless-stopped
+    depends_on:
+      neo4j:
+        condition: service_healthy
+    entrypoint: []
+    command: ["node", "dist/dream-runner/index.js", "--daemon"]
+    env_file:
+      - .env
+    environment:
+      - GRAPH_MEMORY_HOME=/root/graph-memory
+      - DREAM_PROJECTS_DIR=/root/.claude/projects
+      - BOOTSTRAP_TENANT_ID=${BOOTSTRAP_TENANT_ID:-bootstrap}
+      - LOCAL_TENANT_ID=${LOCAL_TENANT_ID:-${BOOTSTRAP_TENANT_ID:-bootstrap}}
+      # The key is read from this mounted file at run time. Never put the key
+      # itself in .env or this file.
+      - ANTHROPIC_API_KEY_FILE=/run/secrets/anthropic_api_key
+      - TZ=${DREAM_TZ:-UTC}
+      - DREAM_SCHEDULE=${DREAM_SCHEDULE:-22:47}
+      # Weekly maintenance (backup, analysis, prune, report), e.g. "Sun 06:00".
+      # Off by default so it doesn't double up with the Claude Code weekly task.
+      - DREAM_WEEKLY_SCHEDULE=${DREAM_WEEKLY_SCHEDULE:-off}
+      - DREAM_MODEL=${DREAM_MODEL:-claude-opus-5-5}
+      - DREAM_EFFORT=${DREAM_EFFORT:-medium}
+      - DREAM_MAX_COST_USD=${DREAM_MAX_COST_USD:-3}
+      # Email (optional): the weekly report and alerts for runs that don't
+      # finish cleanly, sent through gws-mcp's send-only notify listener over
+      # the shared mcp-notify network. Off unless DREAM_NOTIFY_TOKEN_HOST_FILE
+      # is set (the same token file gws-mcp's NOTIFY_TOKEN_HOST_FILE uses).
+      - DREAM_NOTIFY_URL=${DREAM_NOTIFY_URL:-http://gws-mcp:3849/notify}
+      - DREAM_NOTIFY_TOKEN_FILE=${DREAM_NOTIFY_TOKEN_HOST_FILE:+/run/secrets/notify_token}
+    volumes:
+      - ${GRAPH_MEMORY_HOME}:/root/graph-memory
+      - ${CLAUDE_PROJECTS_DIR}:/root/.claude/projects:ro
+      - ${ANTHROPIC_API_KEY_HOST_FILE:-./.anthropic-api-key}:/run/secrets/anthropic_api_key:ro
+      - ${DREAM_NOTIFY_TOKEN_HOST_FILE:-./.notify-token}:/run/secrets/notify_token:ro
+    networks:
+      - default
+      - mcp-notify
+    # The image's healthcheck probes the MCP server's :3847/health, which the
+    # runner doesn't serve.
+    healthcheck:
+      disable: true
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+
+networks:
+  # Shared with the gws-mcp project, whose notify listener lives on it.
+  # Whichever project starts first creates it; not `external`, so graph-dream
+  # still starts when gws-mcp isn't deployed.
+  mcp-notify:
+    name: mcp-notify

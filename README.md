@@ -49,6 +49,8 @@ Two Docker services, talking over the compose network. The MCP server is the onl
 
 The dream process is just another Claude session that runs on a schedule, reads transcripts, and calls the same MCP tools any client would call — there's no separate extraction pipeline.
 
+By default that session is a Claude Code scheduled task on your Claude plan. If you'd rather bill it to an Anthropic API key, the optional dream runner (`src/dream-runner/`, the `graph-dream` compose service) runs the same prompt through the Messages API. See [API-key runner](docs/DREAM_PROCESS.md#api-key-runner).
+
 ## Schema
 
 **Entity types (canonical):** `Person`, `Project`, `Preference`, `Concept`, `Decision`, `Fact`, `Event`, `Object`, `Reasoning` — plus a few ad-hoc types (Organization, Technology, Artifact, Infrastructure, Feature, Resource) that have emerged organically through use. The schema is permissive on labels.
