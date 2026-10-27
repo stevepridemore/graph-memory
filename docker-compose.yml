@@ -160,6 +160,10 @@ services:
     networks:
       - default
       - mcp-notify
+    # The image's healthcheck probes the MCP server's :3847/health, which the
+    # runner doesn't serve.
+    healthcheck:
+      disable: true
     logging:
       driver: json-file
       options:
