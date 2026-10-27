@@ -2,11 +2,11 @@
 
 ## Overview
 
-The `graph-memory-mcp` server is a thin wrapper around Neo4j. It executes Cypher queries and returns results. **No LLM calls — all intelligence stays in Claude Code sessions (Max plan).** 20 tools total.
+The `graph-memory-mcp` server is a thin wrapper around Neo4j. It executes Cypher queries and returns results. **No LLM calls — all intelligence stays in Claude Code sessions (Max plan).** 24 tools total.
 
 This means:
 - No API key needed
-- No `@anthropic-ai/sdk` dependency
+- The server makes no LLM calls. `@anthropic-ai/sdk` is used only by the optional API-key dream runner (`src/dream-runner`)
 - Fast and predictable — every tool call is just a database operation
 - Claude in the session handles entity extraction, Cypher generation, and reasoning
 
@@ -14,7 +14,7 @@ This means:
 
 - **Tool annotations:** Each tool is annotated with `readOnlyHint`, `destructiveHint`, and `idempotentHint` so Claude can reason about which tools are safe to call speculatively.
 - **Multi-label nodes:** All entity nodes carry `:Entity` plus their type label. Tools that search across types use the `:Entity` label; tools that filter use specific labels.
-- **Confidence-max MERGE pattern:** Write tools use `MERGE` with a hybrid update strategy — take max for explicit evidence, additive boost for mentions.
+- **Confidence-max MERGE pattern:** Write tools use `MERGE`. When the new weight is higher, it replaces the stored weight. Otherwise the stored weight gets +0.05, capped at 1.0.
 
 ## Registration
 
@@ -72,6 +72,8 @@ The driver handles connection pooling, retries, and session management automatic
   "current_only": true
 }
 ```
+
+`max_hops` is capped at 4, even if a larger value is passed.
 
 **`context_level`** controls response size (default: `full`):
 - `minimal` — just id, name, type, confidence per node. No properties, no source files. Fast for scanning/listing.
@@ -186,9 +188,11 @@ The `localId` field allows referencing entities within the same batch call befor
 {
   "action": "created" | "strengthened",
   "edge": { "from": "...", "to": "...", "type": "...", "weight": 0.65 },
-  "created_entities": ["entity-name"]
+  "coercions": [ { "kind": "relation", "from": "RUNS_ON", "to": "DEPLOYED_TO" } ]
 }
 ```
+
+`coercions` appears only when a type or verb was changed (see Vocabulary below).
 
 **Output (batch):**
 ```json
@@ -197,18 +201,18 @@ The `localId` field allows referencing entities within the same batch call befor
   "entities_merged": 1,
   "edges_created": 2,
   "edges_strengthened": 0,
-  "details": [
-    { "entity": "graph-memory", "action": "created" },
-    { "entity": "neo4j", "action": "merged" },
-    { "edge": "alice→WORKS_ON→graph-memory", "action": "created", "weight": 0.7 }
-  ]
+  "edges_failed": 0,
+  "failed_refs": [],
+  "skipped_entities": [],
+  "coercions": []
 }
 ```
 
 **Behavior:**
-- **Single mode:** Uses `MERGE` to find-or-create both nodes and the relationship in a single transaction. If the relationship exists, applies confidence-max update (take max of current and new weight for explicit evidence, additive boost for mentions). Sets `valid_at` if provided. Atomic.
-- **Batch mode:** Resolves all `localId` references, creates all entities, then creates all relationships in a single Neo4j transaction. If any step fails, the entire batch rolls back. Provenance fields (`source_session`, `source_transcript`, `source_type`) are applied to all edges in the batch.
-- **Supersession handling:** If a new edge contradicts an existing one (same endpoints, same type, different target), the old edge's `invalid_at` is set to the new edge's `valid_at` rather than creating a CONTRADICTS relationship. This is the default for factual updates. True contradictions (ambiguous, unresolved) still use the CONTRADICTS edge type.
+- **Single mode:** Finds or creates both endpoints, then `MERGE`s the edge. These are separate statements, not one transaction. If the edge exists, the weight becomes the new weight when that is higher, otherwise the current weight plus 0.05 (capped at 1.0). Sets `valid_at` if provided.
+- **Batch mode:** Resolves `localId` references and writes all entities and relations in one write transaction. An entity or relation that fails validation (an empty name, a `valid_at` that is not a date, or a type or verb rejected under `SCHEMA_ENFORCEMENT=strict`) is skipped and listed in `skipped_entities` or `failed_refs`. Relations whose endpoints do not resolve also go to `failed_refs`. The rest is written. Only a database error rolls back the whole batch. Provenance fields (`source_session`, `source_transcript`, `source_type`) are applied to all edges in the batch. Batch mode does not supersede: `valid_at` is stored, but no other edge is invalidated.
+- **Vocabulary (`SCHEMA_ENFORCEMENT`):** Known aliases map to the documented value with no proposal recorded (for example `RUNS_ON` to `DEPLOYED_TO`, or `tool` to `Technology`). An unknown type is stored as `Object`, and the original is kept in `proposed_type`. An unknown verb is stored as `RELATED_TO`, and the original is kept in `proposed_relations`. `coerce` (default) does this. `lenient` writes the input as given. `strict` rejects it.
+- **Supersession (single mode):** If `valid_at` is given and the relation is not `FAMILY_OF`, `KNOWS`, `COLLABORATES_WITH`, `MENTOR_OF`, `ALIAS_OF`, `CONTRADICTS` or `RELATED_TO`, current edges of the same type from the same source to a different target get `invalid_at` set to `valid_at`. Without `valid_at`, nothing is superseded. Genuine contradictions still need an explicit `CONTRADICTS` edge.
 
 ---
 
@@ -248,7 +252,7 @@ The `localId` field allows referencing entities within the same batch call befor
   "from_name": "string",
   "to_name": "string",
   "relation": "string",
-  "amount": 0.2,
+  "amount": 0.3,
   "reason": "string"
 }
 ```
@@ -262,6 +266,8 @@ The `localId` field allows referencing entities within the same batch call befor
   "pruned": false
 }
 ```
+
+`pruned` is `true` when the new weight is 0.05 or lower. Nothing is deleted. The tool returns an error if the edge does not exist.
 
 ---
 
@@ -316,8 +322,8 @@ The `localId` field allows referencing entities within the same batch call befor
 {
   "contradictions": [
     {
-      "node_a": { "id": "...", "type": "Fact", "content": "Project X uses Vue" },
-      "node_b": { "id": "...", "type": "Fact", "content": "Project X uses React" },
+      "node_a": { "id": "...", "type": "Fact", "name": "..." },
+      "node_b": { "id": "...", "type": "Fact", "name": "..." },
       "description": "Conflicting tech stack for Project X",
       "detected_date": "2026-04-05T...",
       "resolved": false
@@ -390,7 +396,7 @@ For `queue`, give either `file_path` (a file on the server, copied into `pending
 
 ### graph_cypher
 
-**Purpose:** Execute a pre-formed Cypher query against Neo4j. **Read-only.** Claude generates the Cypher in the session — this tool just runs it.
+**Purpose:** Execute a pre-formed Cypher query against Neo4j. **Read-only.** Admin tenant only. Claude generates the Cypher in the session — this tool just runs it.
 
 **Input:**
 ```json
@@ -414,7 +420,7 @@ For `queue`, give either `file_path` (a file on the server, copied into `pending
 
 **Safety:**
 - **Primary defense — `executeRead` transaction mode:** The query is executed via Neo4j's read-only transaction (`session.executeRead()`). Neo4j itself rejects ANY write operation at the database level, regardless of what the Cypher contains. This is the definitive guard — it cannot be bypassed by clever Cypher construction, Unicode tricks, or comment injection. No application-level clause whitelist is needed.
-- **5-second query timeout** to prevent runaway traversals.
+- **30-second transaction timeout** (the `runReadOnly` default) to prevent runaway traversals. The `query.cypher_timeout_ms` config value is not read by this path.
 - Writes go through dedicated tools (`graph_relate`, `graph_boost`, `graph_prune`, etc.) with proper validation.
 
 ---
@@ -435,23 +441,30 @@ For `queue`, give either `file_path` (a file on the server, copied into `pending
 {
   "nodes_decayed": 45,
   "edges_decayed": 120,
-  "nodes_flagged_for_pruning": 3,
-  "edges_below_threshold": 7,
-  "details": [
-    { "type": "Project", "name": "old-project", "old_confidence": 0.15, "new_confidence": 0.12 }
-  ]
+  "nodes_flagged_for_pruning": 3
 }
 ```
 
 **Behavior:**
-Runs a single Cypher query per node type that calculates decay based on `last_seen` / `last_confirmed` timestamps and the configured decay rates. Uses Neo4j transactions so it's all-or-nothing — no partial decay on failure (fixes reviewer's concern about crash mid-maintenance).
+Runs one Cypher statement per node type in `config.decay.rates`, then one for edges. Only these types decay: Person, Project, Preference, Concept, Decision, Fact, Event, Object. `Reasoning` and the other types have no rate and never decay. Nodes and edges with `subtype: 'rule'` on either end are exempt.
+
+Decay is measured from the later of `last_seen` (for edges, `last_confirmed`) and `last_decayed`. Each run stamps `last_decayed`, so repeated runs do not compound. The exponent is whole elapsed days. Confidence and weight are floored at 0.01.
+
+Each statement is its own auto-commit write, so the run is not all-or-nothing. A failure part-way leaves earlier updates in place. With `dry_run: true`, `nodes_decayed` counts the nodes that would decay, and `edges_decayed` is always 0.
 
 ```cypher
-// Example: decay all Project nodes
-MATCH (n:Project)
-WHERE n.last_seen < datetime() - duration('P1D')
-WITH n, n.confidence * (0.995 ^ duration.between(n.last_seen, datetime()).days) AS new_conf
-SET n.confidence = CASE WHEN new_conf < 0.01 THEN 0.01 ELSE new_conf END
+// Node pass for Project (rate 0.995 from config.decay.rates)
+MATCH (n:Project {tenant_id: $tenantId})
+WHERE (n.subtype IS NULL OR n.subtype <> 'rule')
+WITH n, CASE
+    WHEN n.last_decayed IS NULL THEN n.last_seen
+    WHEN n.last_seen IS NULL THEN n.last_decayed
+    WHEN n.last_decayed > n.last_seen THEN n.last_decayed
+    ELSE n.last_seen END AS base_ts
+WHERE base_ts IS NOT NULL AND base_ts < datetime() - duration('P1D')
+WITH n, n.confidence * ($rate ^ duration.inDays(base_ts, datetime()).days) AS new_conf
+SET n.confidence = CASE WHEN new_conf < 0.01 THEN 0.01 ELSE new_conf END,
+    n.last_decayed = datetime()
 RETURN count(n) AS decayed
 ```
 
@@ -459,7 +472,7 @@ RETURN count(n) AS decayed
 
 ### graph_prune
 
-**Purpose:** Remove entities and edges that have decayed below threshold. Provides a preview before destructive action. Called after reviewing `graph_decay` results or `graph_find stale` output.
+**Purpose:** Remove entities and edges that have decayed below threshold. Provides a preview before destructive action. Called after reviewing `graph_decay` results or `graph_entities` output.
 
 **Annotation:** `destructiveHint: true`
 
@@ -476,23 +489,21 @@ RETURN count(n) AS decayed
 
 - `mode: "preview"` (default) — returns what would be pruned without deleting anything.
 - `mode: "execute"` — actually deletes. Requires explicit confirmation from the user (Claude should ask before calling with execute).
-- `node_threshold` — prune nodes with confidence below this AND no edges with weight above `edge_threshold`. Defaults to config value (`decay.prune_node_threshold`).
+- `node_threshold` — prune nodes with confidence below this AND no edges with weight at or above `edge_threshold`. Defaults to config value (`decay.prune_node_threshold`).
 - `edge_threshold` — prune edges with weight below this. Defaults to config value (`decay.prune_edge_threshold`).
-- `include_orphans` — also prune nodes with zero edges, regardless of confidence, if `last_seen` is older than `max_age_days`.
+- `include_orphans` (default `true`) also prunes nodes with zero edges, `confidence` at or above `node_threshold`, and `last_seen` older than `max_age_days`.
 - `max_age_days` — age threshold for orphan pruning (default: 30, from config `decay.prune_orphan_days`).
 
 **Output (preview):**
 ```json
 {
   "mode": "preview",
-  "nodes_to_prune": [
-    { "id": "old-project", "type": "Project", "name": "Old Project", "confidence": 0.08, "last_seen": "2025-11-15T...", "edge_count": 0 }
-  ],
-  "edges_to_prune": [
-    { "from": "alice", "to": "old-project", "type": "WORKS_ON", "weight": 0.03 }
-  ],
-  "node_count": 1,
-  "edge_count": 1
+  "nodes_pruned": 1,
+  "edges_pruned": 1,
+  "details": [
+    { "action": "would_delete_node", "id": "old-project", "type": "Project" },
+    { "action": "would_delete_edge", "from": "alice", "to": "old-project", "type": "WORKS_ON" }
+  ]
 }
 ```
 
@@ -502,20 +513,17 @@ RETURN count(n) AS decayed
   "mode": "executed",
   "nodes_pruned": 1,
   "edges_pruned": 1,
-  "details": [
-    { "action": "deleted_node", "id": "old-project", "type": "Project" },
-    { "action": "deleted_edge", "from": "alice", "to": "old-project", "type": "WORKS_ON" }
-  ]
+  "details": []
 }
 ```
 
 **Behavior:**
-1. Query for all nodes with `confidence < node_threshold` that have no edges with `weight > edge_threshold`
+1. Query for all nodes with `confidence < node_threshold` that have no edges with `weight >= edge_threshold`
 2. Query for all edges with `weight < edge_threshold`
 3. If `include_orphans`: also find nodes with zero edges and `last_seen` older than `max_age_days`
 4. In preview mode: return the lists without modifying anything
-5. In execute mode: delete edges first, then nodes, in a single transaction
-6. Alias nodes pointing to pruned entities are also removed
+5. In execute mode: delete every edge below `edge_threshold` in the tenant, then `DETACH DELETE` the node list. These are separate statements, not one transaction, so a failure part-way leaves earlier deletions in place. `details` is empty in execute mode.
+6. Execute does not re-apply the rule-subtype exemption to edges, which preview does. Alias nodes are not touched.
 
 ---
 
@@ -557,7 +565,7 @@ RETURN count(n) AS decayed
    - Match the edge using (entity_id)--[relation_type]--(other_entity_id) with direction
    - Delete the edge from the original node
    - Create an equivalent edge on the new node (preserving weight, all properties)
-3. Log the split in the merge audit log (`~/.claude/graph-memory/logs/merge-audit.jsonl`)
+3. Log the split in the merge audit log (`$GRAPH_MEMORY_HOME/logs/merge-audit.jsonl`)
 4. Return summary of what was moved
 
 **Edge identification:** Edges are identified by composite key (`other_entity_id` + `relation_type` + `direction`) rather than internal Neo4j IDs, which are not stable across restarts. If multiple edges exist between the same pair with the same type (rare), all are moved.
@@ -565,6 +573,77 @@ RETURN count(n) AS decayed
 **If `edges_to_move` is empty:** Claude can use `graph_query` on the merged entity first to inspect all edges, then decide which to move. The `/graph-ask` skill makes this easy.
 
 ---
+
+### graph_merge
+
+**Purpose:** Consolidate two entities into one. Moves the source's edges onto the target, copies source properties the target lacks, then deletes the source. Inverse of `graph_unmerge`.
+
+**Annotation:** `destructiveHint: true`
+
+**Input:**
+```json
+{
+  "source_id": "string",
+  "target_id": "string",
+  "reason": "string",
+  "dry_run": false
+}
+```
+
+**Output:**
+```json
+{
+  "source": { "id": "...", "name": "...", "deleted": true },
+  "target": { "id": "...", "name": "..." },
+  "edges_added": 3,
+  "edges_consolidated": 1,
+  "self_loops_dropped": 0,
+  "properties_adopted": ["..."],
+  "dry_run": false,
+  "audit_logged": true
+}
+```
+
+**Behavior:**
+1. Both IDs must exist in the caller's tenant. Merging an entity into itself is an error.
+2. Direct edges between source and target are dropped, since they would become self-loops (`self_loops_dropped`).
+3. Each other edge moves to the target. If the target already has an edge of the same type to the same node, the two are consolidated (`edges_consolidated`) and the higher weight is kept.
+4. Properties the target lacks are copied. Reserved keys (`id`, `tenant_id`, `name`, `embedding`, `first_seen`, `last_seen`, `times_mentioned`, `confidence`) are not copied.
+5. The target's embedding is cleared. Run `graph_reembed` to rebuild it.
+6. The source node is deleted.
+7. Each non-dry-run merge appends a line with `reason` to `$GRAPH_MEMORY_HOME/logs/merge-audit.jsonl`. Dry runs are not logged.
+
+With `dry_run: true`, nothing changes. `edges_added` is an upper bound, and `edges_consolidated` is 0. Run a dry run first, since the merge is destructive.
+
+### graph_alias
+
+**Purpose:** Add or remove alternate names for an entity. Later writes and lookups that use an alias resolve to the entity instead of creating a duplicate node.
+
+**Annotation:** `idempotentHint: true`
+
+**Input:**
+```json
+{
+  "entity": "string",
+  "add": ["string"],
+  "remove": ["string"]
+}
+```
+
+**Output:**
+```json
+{
+  "id": "robin",
+  "aliases": ["Robbie"]
+}
+```
+
+**Behavior:**
+- `entity` is resolved by exact name, case-insensitive name, or alias. The tool returns `No entity found for "..."` if nothing matches.
+- Aliases are stored in the entity's `aliases` property. No node is created.
+- Alias matching is case-insensitive. An exact entity name takes precedence over an alias.
+- If both `add` and `remove` are given, `add` runs first.
+- With neither, the current list is returned.
 
 ### graph_merge_suggestions
 
@@ -645,7 +724,7 @@ Same-type is a hard gate — never suggests cross-type merges. The weighted Jacc
 - Right after a heavy ingest — type-scoped scan on the entity types most likely affected
 - Reactively — when you suspect a specific entity has duplicates, scope to its `entity_id`
 
-**Pairs with:** `graph_unmerge` (inverse — splits false merges) and an as-yet-unimplemented `graph_merge` tool (executes an approved merge). Until that lands, surfaced pairs can be merged manually via `graph_relate` to add an `ALIAS_OF` edge plus targeted `graph_delete` on the duplicate.
+**Pairs with:** `graph_unmerge` (inverse — splits false merges) and `graph_merge` (executes an approved merge; run with `dry_run: true` first). To keep two entities separate but linked, use `graph_alias` to add the other name, or `graph_relate` with `ALIAS_OF`.
 
 ---
 
@@ -672,9 +751,7 @@ Same-type is a hard gate — never suggests cross-type merges. The weighted Jacc
     "orphaned_nodes": 3,
     "unresolved_contradictions": 1,
     "stale_nodes": 8,
-    "last_dream_run": "2026-04-06T23:00:00Z",
-    "pending_ingest_docs": 1,
-    "total_ingested_docs": 5
+    "pending_ingest_docs": 1
   }
 }
 ```
@@ -690,17 +767,15 @@ Same-type is a hard gate — never suggests cross-type merges. The weighted Jacc
 **Input:**
 ```json
 {
-  "entity_id": "string",
-  "reason": "string"
+  "id": "string"
 }
 ```
 
 **Output:**
 ```json
 {
-  "deleted": true,
-  "entity": { "id": "...", "name": "...", "type": "..." },
-  "edges_removed": 4
+  "action": "deleted",
+  "id": "..."
 }
 ```
 
@@ -721,19 +796,25 @@ Same-type is a hard gate — never suggests cross-type merges. The weighted Jacc
 }
 ```
 
-Provide either `session_id` (resolved to `~/.claude/projects/**/<session_id>.jsonl`) or an explicit `file_path`. `text_only` (default `true`) strips tool calls and returns only human/assistant text.
+Provide `session_id` (searched for as `~/.claude/projects/*/<session_id>.jsonl`) or `file_path`. If both are given, `file_path` wins. `text_only` (default `true`) returns only messages with non-empty text. Roles are `user`, `assistant` and `system`.
 
 **Output:**
 ```json
 {
-  "messages": [
-    { "role": "human", "text": "...", "timestamp": "...", "session_id": "...", "cwd": "..." }
-  ],
-  "message_count": 42,
   "session_id": "...",
-  "cwd": "..."
+  "cwd": "...",
+  "format_version": "v1",
+  "line_count": 120,
+  "message_count": 42,
+  "text_message_count": 30,
+  "warnings": [],
+  "messages": [
+    { "role": "user", "timestamp": "...", "uuid": "...", "parentUuid": "...", "text": "..." }
+  ]
 }
 ```
+
+`message_count` counts every parsed message. `messages` holds only the text messages when `text_only` is `true`.
 
 **When to use:** In the dream process before entity extraction. Prefer this over raw file reads.
 
@@ -746,14 +827,14 @@ Provide either `session_id` (resolved to `~/.claude/projects/**/<session_id>.jso
 **Input:**
 ```json
 {
-  "event": "run_start | run_end | transcript_start | transcript_end | transcript_skipped | entity_created | edge_created | edge_modified | merge_flagged | contradiction_found | ingest_start | ingest_end | decay_applied | format_warning | error",
+  "event": "run_start | run_end | transcript_start | transcript_end | transcript_skipped | entity_created | entity_resolved | edge_created | edge_modified | merge_flagged | contradiction_found | ingest_start | ingest_end | decay_applied | format_warning | error",
   "data": {}
 }
 ```
 
 **Output:**
 ```json
-{ "logged": true, "timestamp": "..." }
+{ "logged": true, "event": "...", "timestamp": "..." }
 ```
 
 **When to use:** Called by the dream process at the start/end of each run and at key milestones. Not needed during normal conversation.
@@ -762,7 +843,7 @@ Provide either `session_id` (resolved to `~/.claude/projects/**/<session_id>.jso
 
 ### graph_export
 
-**Purpose:** Write a timestamped JSONL backup of all nodes and edges to `~/graph-memory/backups/`. Prunes old backups beyond the retention count.
+**Purpose:** Write a timestamped JSONL backup of the caller's tenant's nodes and edges to `$GRAPH_MEMORY_HOME/backups/` (default `~/graph-memory/backups/`). Prunes old backups beyond the retention count.
 
 **Input:**
 ```json
@@ -772,12 +853,12 @@ Provide either `session_id` (resolved to `~/.claude/projects/**/<session_id>.jso
 }
 ```
 
-`keep` (default 14) is the number of backups to retain. `label` is an optional suffix for the filename (e.g. `"pre-migration"`).
+`keep` (1-30, default 14) is the number of backups to retain. `label` is an optional suffix for the filename (e.g. `"pre-migration"`). Characters other than letters, digits and hyphens in the label are replaced with hyphens. Files are named `backup-<YYYY-MM-DDTHH-MM-SS>[-<label>].jsonl`. The first line is a `meta` record, followed by `node` and `edge` records.
 
 **Output:**
 ```json
 {
-  "backup_file": "~/graph-memory/backups/2026-05-06T12-00-00.jsonl",
+  "backup_file": "~/graph-memory/backups/backup-2026-05-06T12-00-00.jsonl",
   "node_count": 297,
   "edge_count": 418,
   "size_bytes": 184320,
@@ -802,21 +883,23 @@ Provide either `session_id` (resolved to `~/.claude/projects/**/<session_id>.jso
 }
 ```
 
-`source_session` (optional) scopes the scan to entities created in one session. `max_issues` (default 50) caps the result size.
+`source_session` (optional) scopes the scan to entities created in one session. `max_issues` (1-200, default 50) caps the result size. Checks: names under 3 characters or on a generic-term list (high), names starting with reference language such as "the " (high), isolated entities with confidence at or below 0.4 and at most one mention (low), and entities that share a name ignoring case (medium).
 
 **Output:**
 ```json
 {
+  "total_issues": 7,
+  "by_severity": { "high": 3, "medium": 1, "low": 3 },
+  "scope": "full graph",
   "issues": [
     {
-      "severity": "high | medium | low",
-      "type": "generic_name | reference_language | orphan | near_duplicate",
       "entity_id": "...",
-      "entity_name": "...",
-      "description": "Name looks like a reference: 'the project'"
+      "name": "...",
+      "type": "Concept",
+      "issue": "...",
+      "severity": "high | medium | low"
     }
-  ],
-  "issue_count": 7
+  ]
 }
 ```
 
@@ -847,15 +930,17 @@ Provide either `session_id` (resolved to `~/.claude/projects/**/<session_id>.jso
     {
       "id": 1,
       "seed_name": "graph-memory",
+      "seed_id": "graph-memory",
       "member_count": 12,
       "dominant_type": "Project",
       "members": [ { "id": "...", "name": "...", "type": "..." } ]
     }
   ],
-  "total_members": 45,
-  "coverage_pct": 72.5
+  "coverage": { "total_entities": 120, "assigned": 45, "unassigned": 75 }
 }
 ```
+
+`members` holds at most 30 entries. `member_count` is the full count. Each entity joins at most one community. Communities are listed in the order their seeds were ranked (strong-edge degree), not by size.
 
 **When to use:** During the weekly deep dream to surface topic clusters, or when you want to understand the graph's major knowledge areas.
 
@@ -877,9 +962,17 @@ Provide either `session_id` (resolved to `~/.claude/projects/**/<session_id>.jso
 }
 ```
 
-All fields optional. `topic` triggers a neighbourhood expansion around the named entity.
+All fields optional. `recent_days` is 1-90 (default 7). `hub_count` is 1-20 (default 5). `max_recent` is 1-50 (default 15). `include_contradictions` defaults to `true`. `topic` adds a neighbourhood (2 hops, edge weight at least 0.3, up to 15 nodes and 25 edges returned). `project_cwd` applies affinity scoring to that neighbourhood.
 
-**Output:** Combined object containing `stats`, `recent_entities`, `top_hubs`, `contradictions` (if `include_contradictions`), and `topic_neighbourhood` (if `topic` provided).
+**Output:** One object with these keys:
+- `generated_at`
+- `graph_health`: `nodes`, `edges`, `by_node_type`, `avg_weight`, `orphaned`, `stale`, `unresolved_contradictions`
+- `pending_work`: `unprocessed_transcripts`, `pending_ingests`, `last_dream_run`, `hours_since_last_dream`
+- `last_dream`: the latest run start and end from `logs/dream-audit.jsonl`, or a summary from `processed/manifest.json` (`source: "manifest"`), or `null`
+- `recent_additions`: `days`, `entity_count`, `edge_count`, `entities`
+- `top_hubs`
+- `contradictions`: the unresolved list, or `null` when `include_contradictions` is false
+- `topic_neighbourhood`: `topic`, `node_count`, `edge_count`, `nodes`, `edges`, or `null` when no `topic` is given
 
 **When to use:** At session start via `/graph-briefing`, or whenever you want a full context snapshot in one tool call.
 
@@ -901,11 +994,12 @@ All fields optional. `topic` triggers a neighbourhood expansion around the named
 }
 ```
 
-`query` is required. `entity_types` filters results to specific node labels. `expand` (default `true`) returns connected nodes and edges around the seed matches.
+`query` is required. `top_k` is 1-50 (default 10). `min_similarity` is 0-1 (default 0.5). `entity_types` filters results to node labels from the entity vocabulary; other values are rejected. `expand` (default `true`) adds the neighbours of the seeds. `expand_min_weight` (default 0.3) is the edge weight floor for that expansion.
 
 **Output:**
 ```json
 {
+  "query": "...",
   "seeds": [
     { "id": "...", "name": "...", "type": "...", "similarity": 0.87 }
   ],
@@ -915,6 +1009,8 @@ All fields optional. `topic` triggers a neighbourhood expansion around the named
   }
 }
 ```
+
+`expansion` is `null` when `expand` is false or no seeds match. Only the top 5 seeds are expanded, and at most 30 edges are returned, highest weight first.
 
 **When to use:** When `graph_query` (keyword-based) doesn't surface the right entities — e.g. for conceptually related queries or when the exact entity name is unknown.
 
@@ -936,7 +1032,9 @@ All fields optional. `topic` triggers a neighbourhood expansion around the named
 {
   "embedded": 42,
   "skipped": 255,
-  "errors": 0
+  "errors": 0,
+  "force": false,
+  "scope": "all-tenants"
 }
 ```
 
@@ -963,11 +1061,11 @@ All fields optional. `topic` triggers a neighbourhood expansion around the named
 | Error | Response |
 |-------|----------|
 | Entity not found | Return empty result with `"found": false` |
-| Duplicate entity on create | Merge with existing via `MERGE`, return `"action": "merged"` |
-| Edge not found (for boost/weaken) | Return error suggesting `graph_relate` instead |
-| Invalid weight (out of range) | Clamp to [0.0, 1.0], return warning |
-| Neo4j connection failure | Return error: "graph unavailable — is the Docker container running?" |
-| Cypher query timeout (>5s) | Kill query, return error suggesting narrower question |
+| Duplicate entity on create | `MERGE` matches the existing node. Batch mode counts it in `entities_merged` |
+| Edge not found (for boost/weaken) | Tool returns an `Edge not found` error. Use `graph_relate` to create the edge |
+| Invalid weight (out of range) | Clamp to [0.0, 1.0]. No warning is returned |
+| Neo4j connection failure | Tool returns the driver error. Startup logs say "Is the Docker container running?" |
+| Cypher query timeout (30 s) | Neo4j aborts the transaction. Tool returns the driver error |
 | Neo4j transaction failure | Auto-retry (driver handles transient failures) |
 
 ## Performance Targets
@@ -979,7 +1077,7 @@ All fields optional. `topic` triggers a neighbourhood expansion around the named
 | graph_boost / graph_weaken | < 30ms |
 | graph_entities (search) | < 100ms |
 | graph_contradictions | < 200ms |
-| graph_cypher (read-only) | < 5s (timeout) |
+| graph_cypher (read-only) | < 5s (30 s timeout) |
 | graph_decay (full graph) | < 2s |
 | graph_ingest (queue) | < 100ms |
 | graph_ingest (status) | < 50ms |
@@ -994,7 +1092,7 @@ All easily achievable for a personal-scale graph on local Neo4j.
 
 ## Configuration Resilience
 
-All configuration values have **hardcoded defaults** compiled into the MCP server. The `config.json` file is an optional override — if it's missing, corrupted, or has missing keys, the server uses sensible defaults and logs a warning.
+All configuration values have **hardcoded defaults** compiled into the MCP server. The `config.json` file is an optional override — if it's missing, corrupted, or has missing keys, the server uses the built-in defaults without logging a warning.
 
 ```typescript
 // Hardcoded defaults (compiled into server)
@@ -1004,6 +1102,7 @@ const DEFAULTS = {
   neo4j: {
     uri: process.env.NEO4J_URI || "bolt://localhost:7687",
     user: process.env.NEO4J_USER || "neo4j",
+    database: process.env.NEO4J_DATABASE || "neo4j",
     password: process.env.NEO4J_PASSWORD  // REQUIRED — no fallback, fail if missing
   },
   weights: {
@@ -1019,13 +1118,14 @@ const DEFAULTS = {
     rates: { Person: 0.998, Project: 0.995, Preference: 0.999, Concept: 0.999, Decision: 0.997, Fact: 0.996, Event: 0.993, Object: 0.996 },
     edge_rate: 0.997,
     prune_node_threshold: 0.1,
-    prune_edge_threshold: 0.05
+    prune_edge_threshold: 0.05,
+    prune_orphan_days: 30
   },
   query: {
     default_max_hops: 2,
     default_min_weight: 0.3,
     default_limit: 20,
-    cypher_timeout_ms: 5000
+    cypher_timeout_ms: 5000   // not read by the query path; graph_cypher uses a 30 s timeout
   },
   affinity: {
     hop_1_multiplier: 1.3,
@@ -1034,7 +1134,7 @@ const DEFAULTS = {
 };
 ```
 
-Config loading: `config.json` values deep-merge over defaults. Missing keys use defaults. Invalid values (e.g., weight > 1.0) are clamped with a warning.
+Config loading: `config.json` values deep-merge over defaults. Missing keys use defaults. Weights and decay rates are clamped to [0, 1] without a warning.
 
 ## Concurrency
 

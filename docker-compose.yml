@@ -42,7 +42,7 @@ services:
 
   graph-memory-mcp:
     # Production default: pull the pre-built image from GHCR. Pin a specific
-    # tag via MCP_IMAGE_TAG in .env (e.g. MCP_IMAGE_TAG=v0.4.0); defaults to
+    # tag via MCP_IMAGE_TAG in .env (e.g. MCP_IMAGE_TAG=v0.5.0); defaults to
     # `latest`. To build locally from source instead, use the dev override:
     #   docker compose -f docker-compose.yml -f docker-compose.dev.yml up -d
     image: ghcr.io/stevepridemore/graph-memory-mcp:${MCP_IMAGE_TAG:-latest}
@@ -146,10 +146,12 @@ services:
       - DREAM_MODEL=${DREAM_MODEL:-claude-opus-5-5}
       - DREAM_EFFORT=${DREAM_EFFORT:-medium}
       - DREAM_MAX_COST_USD=${DREAM_MAX_COST_USD:-3}
-      # Email (optional): the weekly report and alerts for runs that don't
-      # finish cleanly, sent through gws-mcp's send-only notify listener over
-      # the shared mcp-notify network. Off unless DREAM_NOTIFY_TOKEN_HOST_FILE
-      # is set (the same token file gws-mcp's NOTIFY_TOKEN_HOST_FILE uses).
+      # Email (optional): every run sends a mail (the nightly summary or a
+      # "nothing new" note, the weekly report, or an alert for a run that
+      # doesn't finish cleanly), each with the run's cost. Sent through
+      # gws-mcp's send-only notify listener over the shared mcp-notify network.
+      # Off unless DREAM_NOTIFY_TOKEN_HOST_FILE is set (the same token file
+      # gws-mcp's NOTIFY_TOKEN_HOST_FILE uses).
       - DREAM_NOTIFY_URL=${DREAM_NOTIFY_URL:-http://gws-mcp:3849/notify}
       - DREAM_NOTIFY_TOKEN_FILE=${DREAM_NOTIFY_TOKEN_HOST_FILE:+/run/secrets/notify_token}
     volumes:

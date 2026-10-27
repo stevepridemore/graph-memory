@@ -82,7 +82,7 @@ If a genuinely new pattern emerges that doesn't fit anything in the canonical se
 | User confirmed something already in the graph | use `graph_boost` (+0.15) instead |
 | User corrected something the graph had wrong | use `graph_weaken` (-0.3) on the wrong edge, then `graph_relate` for the corrected fact |
 
-Capture aliases and identifying details inline in the edge `evidence` string when the source mentioned them. Examples: "Jordan Ellis (nickname Jay, initials JRE)", "Domino 14.5.1 (the version that introduced DominoIQ)". This makes future fuzzy matching much better.
+Capture aliases and identifying details inline in the edge `evidence` string when the source mentioned them. Examples: "Jordan Ellis (nickname Jay, initials JRE)", "Postgres 17 (the version that added incremental backup)". This makes future fuzzy matching much better.
 
 ### 5. Write to the graph (unless --dry-run)
 
@@ -97,12 +97,12 @@ For `--dry-run`, instead of calling write tools, print a human-readable summary 
 ```
 Would create:
   - Jordan Ellis (Person) — Senior Counsel at Acme Corp
-  - DominoIQ POC October Timeline (Decision) — confidence 0.7
+  - Billing Migration October Timeline (Decision) — confidence 0.7
 Would link:
-  - Jordan Ellis -[STAKEHOLDER_IN, weight 0.6]-> DominoIQ POC
+  - Jordan Ellis -[STAKEHOLDER_IN, weight 0.6]-> Billing Migration
   - ...
 Would boost (already in graph):
-  - Priya Shah: confirmed mentioned in DominoIQ context — +0.05
+  - Priya Shah: confirmed mentioned in billing migration context — +0.05
 ```
 
 ### 6. Validate after writing

@@ -1,6 +1,6 @@
 {
   "name": "graph-memory",
-  "version": "0.1.0",
+  "version": "0.5.0",
   "description": "Graph-based memory system for Claude Code using Neo4j",
   "type": "module",
   "main": "dist/mcp-server/index.js",

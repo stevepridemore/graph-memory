@@ -15,8 +15,8 @@
 #     | bash -s <version> <tunnel-host>
 #
 # Example:
-#   curl -fsSL https://raw.githubusercontent.com/stevepridemore/graph-memory/v0.4.0/scripts/install-secondary.sh \
-#     | bash -s v0.4.0 graph.example.com
+#   curl -fsSL https://raw.githubusercontent.com/stevepridemore/graph-memory/v0.5.0/scripts/install-secondary.sh \
+#     | bash -s v0.5.0 graph.example.com
 
 set -euo pipefail
 
@@ -24,7 +24,7 @@ VERSION="${1:-}"
 HOST="${2:-}"
 if [ -z "$VERSION" ] || [ -z "$HOST" ]; then
   echo "usage: install-secondary.sh <version> <tunnel-host>" >&2
-  echo "  e.g.: install-secondary.sh v0.4.0 graph.example.com" >&2
+  echo "  e.g.: install-secondary.sh v0.5.0 graph.example.com" >&2
   exit 2
 fi
 
