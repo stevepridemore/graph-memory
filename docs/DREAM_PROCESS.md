@@ -493,7 +493,7 @@ Mail goes through gws-mcp's send-only notify listener (`POST /notify` with a bea
   "mcp_servers": [{ "name": "analytics", "command": "C:/Users/you/.local/bin/analytics-mcp.exe",
                     "env": { "GOOGLE_APPLICATION_CREDENTIALS": "C:/Users/you/.creds/adc.json" },
                     "tools": ["run_report"] }],
-  "email": { "url": "http://127.0.0.1:3849/notify/site", "token_file": "~/.config/notify-site-token", "max_per_run": 2 }
+  "email": { "url": "http://127.0.0.1:3850/notify/site", "token_file": "~/.config/notify-site-token", "max_per_run": 2 }
 }
 ```
 
