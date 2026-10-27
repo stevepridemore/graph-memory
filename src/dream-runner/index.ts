@@ -22,7 +22,8 @@ import { GRAPH_MEMORY_HOME } from "../shared/config.js";
 import { acquireLock, releaseLock } from "../shared/dream-lock.js";
 import { resolveApiKey } from "./api-key.js";
 import { FILE_TOOLS, FILE_TOOL_NAMES, runFileTool, type FileRoots } from "./file-tools.js";
-import { findPendingWork, totalPending } from "./pending.js";
+import { findPendingWork, totalPending, type PendingWork } from "./pending.js";
+import { TRANSCRIPT_TOOLS, TRANSCRIPT_TOOL_NAMES, TranscriptTools } from "./transcript-tools.js";
 
 const here = dirname(fileURLToPath(import.meta.url));
 
@@ -38,13 +39,17 @@ export interface RunnerSettings {
   schedule: string;
   promptPath: string;
   excludeTools: Set<string>;
+  activeMinutes: number;
   roots: FileRoots;
   force: boolean;
 }
 
-// Graph tools the nightly prompt never calls. Left out so an unattended run
-// can't reach them; DREAM_EXCLUDE_TOOLS overrides the list ("" keeps all).
-const DEFAULT_EXCLUDED_TOOLS = "graph_cypher,graph_prune,graph_reembed,graph_export,graph_ingest,graph_unmerge";
+// Graph tools left out of an unattended run: ones the nightly prompt never
+// calls, plus graph_read_transcript, which read_transcript replaces (it
+// returns a whole session at once). DREAM_EXCLUDE_TOOLS overrides the list
+// ("" keeps all).
+const DEFAULT_EXCLUDED_TOOLS =
+  "graph_cypher,graph_prune,graph_reembed,graph_export,graph_ingest,graph_unmerge,graph_read_transcript";
 
 // Models whose server-side `fallbacks: "default"` mode is accepted.
 const FALLBACK_MODELS = new Set(["claude-fable-5-1", "claude-opus-5-5", "claude-opus-5", "claude-sonnet-5-5"]);
@@ -70,12 +75,13 @@ export function loadSettings(env: NodeJS.ProcessEnv = process.env, argv: string[
     effort,
     maxCostUsd: num("DREAM_MAX_COST_USD", 3),
     maxTurns: Math.floor(num("DREAM_MAX_TURNS", 200)),
-    maxToolResultChars: Math.floor(num("DREAM_MAX_TOOL_RESULT_CHARS", 80_000)),
+    maxToolResultChars: Math.floor(num("DREAM_MAX_TOOL_RESULT_CHARS", 40_000)),
     fallbacks: fallbackSetting === "off" ? false : FALLBACK_MODELS.has(model),
     schedule: env.DREAM_SCHEDULE?.trim() || "02:30",
     excludeTools: new Set(
       (env.DREAM_EXCLUDE_TOOLS ?? DEFAULT_EXCLUDED_TOOLS).split(",").map((t) => t.trim()).filter(Boolean),
     ),
+    activeMinutes: env.DREAM_SKIP_ACTIVE_MINUTES?.trim() === "0" ? 0 : num("DREAM_SKIP_ACTIVE_MINUTES", 30),
     promptPath: promptOverride || (existsSync(hostPrompt) ? hostPrompt : join(here, "..", "..", "prompts", "dream-nightly.md")),
     roots: {
       graphHome: GRAPH_MEMORY_HOME,
@@ -120,14 +126,40 @@ const RUNNER_NOTES = `
 
 You are running from the standalone dream runner, not from Claude Code. Nobody is watching this run, so don't ask questions: make the call the prompt describes and note anything doubtful in the changelog.
 
-- **Tools.** The graph tools are the graph-memory MCP tools. For files you have list_dir, stat_file, read_file, write_file, move_file and delete_file. They accept the prompt's paths as written (~/graph-memory/..., ~/.claude/projects/...). ~/.claude/projects is read-only. There is no shell.
+- **Discovery is done (Step 3).** The first message lists the exact pending transcripts (oldest first, each marked new or delta, with previous_processed_at for deltas) and the pending text ingest files. Work from that list. Don't list ~/.claude/projects and don't read manifest.json: both are large, and the runner has already compared them. Do read ~/graph-memory/config.json for max_transcripts_per_run and the other settings.
+- **Reading transcripts (Steps 4a-4b).** Use read_transcript instead of graph_read_transcript. It runs the same parser and returns pages of messages; for a delta item pass since = previous_processed_at and you get only the new messages. Page through with next_offset until it is null. You can extract and write to the graph page by page rather than holding the whole session.
+- **Manifest (Step 4h).** Use update_manifest instead of editing manifest.json. Call it once per transcript as soon as you finish it, including ones you skip (format, agent-internal, empty delta), so they aren't offered again.
+- **Other tools.** The graph tools are the graph-memory MCP tools. For files you have list_dir, stat_file, read_file, write_file, move_file and delete_file. They accept the prompt's paths as written (~/graph-memory/...). ~/.claude/projects is read-only. There is no shell.
 - **Lock.** The runner has already acquired ~/graph-memory/processed/dream.lock and releases it after you finish, so skip creating it in Step 2 and deleting it in Step 10. Still make the graph_audit run_start and run_end calls, with "source": "api-runner".
 - **MarkItDown is not available.** Take Step 5a's "not installed" branch: skip conversion, leave binary files in pending/, and say so in the changelog Notes.
-- **Watermarks.** Use stat_file for a transcript's file_size_bytes and line_count when you update the manifest.
 - **Large results.** A tool result over the size limit is saved to a file and you get the start of it plus the path. Read the rest with read_file and an offset before extracting from it.
 - **Budget.** If a message tells you the run's budget is spent, stop starting new transcripts or documents. Finish the item in hand, update the manifest for it, write the changelog (noting what's left for the next run), make the run_end audit call, and stop.
 - **Finish** with a short plain-text summary of what the run did. That ends the run.
 `;
+
+// The pending list goes in the first user message, not the system prompt, so
+// the system prompt stays byte-identical across runs for caching.
+export function kickoffMessage(started: Date, pending: PendingWork): string {
+  const transcripts = pending.transcripts.map((t) => ({
+    session_id: t.session_id,
+    path: t.path,
+    mode: t.mode,
+    size_bytes: t.size_bytes,
+    modified: t.modified,
+    ...(t.previous_processed_at ? { previous_processed_at: t.previous_processed_at } : {}),
+  }));
+  return [
+    `Run the nightly dream process now. Current time: ${started.toISOString()}.`,
+    "",
+    `Pending transcripts (${transcripts.length}, oldest first; process up to max_transcripts_per_run):`,
+    "```json",
+    JSON.stringify(transcripts, null, 1),
+    "```",
+    "",
+    `Pending text ingest files in ~/graph-memory/ingest/pending/ (${pending.ingest.length}):` +
+      (pending.ingest.length ? "\n" + pending.ingest.map((f) => `- ${f}`).join("\n") : " none"),
+  ].join("\n");
+}
 
 export function buildSystemPrompt(promptPath: string): string {
   return readFileSync(promptPath, "utf-8") + RUNNER_NOTES;
@@ -214,12 +246,17 @@ export async function runDream(settings: RunnerSettings, deps: RunnerDeps = {}):
   const logDir = join(settings.roots.graphHome, "logs", "dream-runner");
   const log = makeLogger(join(logDir, `${runId}.log`));
 
-  const pending = findPendingWork(settings.roots.graphHome, settings.roots.projectsDir);
+  const pending = findPendingWork(settings.roots.graphHome, settings.roots.projectsDir, {
+    activeMinutes: settings.activeMinutes,
+  });
   if (totalPending(pending) === 0 && !settings.force) {
     log("nothing pending; no API call made");
     return "nothing_pending";
   }
-  log(`pending: ${pending.newTranscripts} new, ${pending.grownTranscripts} grown transcripts, ${pending.ingestFiles} ingest files`);
+  log(
+    `pending: ${pending.newTranscripts} new, ${pending.grownTranscripts} grown transcripts, ${pending.ingestFiles} ingest files` +
+      (pending.skippedActive ? ` (${pending.skippedActive} still active, left for next run)` : ""),
+  );
 
   mkdirSync(join(homedir(), "graph-memory", "processed"), { recursive: true });
   if (!acquireLock("api-runner")) {
@@ -236,17 +273,15 @@ export async function runDream(settings: RunnerSettings, deps: RunnerDeps = {}):
   try {
     const client = deps.anthropic ?? new Anthropic({ apiKey: resolveApiKey(), maxRetries: 4 });
     mcp = await (deps.connect ?? connectGraphServer)();
-    const tools = [...(await graphTools(mcp, settings.excludeTools)), ...FILE_TOOLS];
+    const tools = [...(await graphTools(mcp, settings.excludeTools)), ...FILE_TOOLS, ...TRANSCRIPT_TOOLS];
+    const transcriptTools = new TranscriptTools(pending.transcripts, settings.roots.graphHome, Math.floor(settings.maxToolResultChars * 0.75));
     log(`model=${settings.model} effort=${settings.effort} tools=${tools.length} budget=$${settings.maxCostUsd}`);
 
     const system = buildSystemPrompt(settings.promptPath);
     const messages: Anthropic.Beta.BetaMessageParam[] = [
       {
         role: "user",
-        content: `Run the nightly dream process now. Current time: ${started.toISOString()}. ` +
-          `The runner's quick check found ${pending.newTranscripts} new transcript(s), ` +
-          `${pending.grownTranscripts} transcript(s) that have grown, and ${pending.ingestFiles} text ingest file(s); ` +
-          "confirm against the manifest as the prompt describes.",
+        content: kickoffMessage(started, pending),
       },
     ];
 
@@ -307,14 +342,22 @@ export async function runDream(settings: RunnerSettings, deps: RunnerDeps = {}):
         break;
       }
 
+      if (cost >= settings.maxCostUsd * 1.5) {
+        log(`estimated cost passed 1.5x the $${settings.maxCostUsd} budget during wrap-up; stopping`);
+        outcome = "budget_stopped";
+        break;
+      }
+
       const results: Anthropic.Beta.BetaContentBlockParam[] = [];
       for (const use of toolUses) {
-        results.push(await runTool(use, mcp, settings, spillDir));
+        results.push(await runTool(use, mcp, transcriptTools, settings, spillDir));
       }
-      if (!wrapUpSent && cost >= settings.maxCostUsd) {
+      // Wrap-up starts at 80% so the closing turns (changelog, audit) land
+      // near the budget rather than well past it.
+      if (!wrapUpSent && cost >= settings.maxCostUsd * 0.8) {
         wrapUpSent = true;
         turnLimit = turns + 20;
-        log(`budget of $${settings.maxCostUsd} reached; asking the model to wrap up`);
+        log(`80% of the $${settings.maxCostUsd} budget used; asking the model to wrap up`);
         results.push({
           type: "text",
           text: `Runner: this run's budget ($${settings.maxCostUsd}) is spent. Wrap up now as the Runner notes describe.`,
@@ -354,6 +397,7 @@ export async function runDream(settings: RunnerSettings, deps: RunnerDeps = {}):
 async function runTool(
   use: Anthropic.Beta.BetaToolUseBlock,
   mcp: Client,
+  transcriptTools: TranscriptTools,
   settings: RunnerSettings,
   spillDir: string,
 ): Promise<Anthropic.Beta.BetaToolResultBlockParam> {
@@ -363,6 +407,8 @@ async function runTool(
   try {
     if (FILE_TOOL_NAMES.has(use.name)) {
       text = runFileTool(use.name, input, settings.roots);
+    } else if (TRANSCRIPT_TOOL_NAMES.has(use.name)) {
+      text = transcriptTools.run(use.name, input);
     } else if (settings.excludeTools.has(use.name)) {
       throw new Error(`${use.name} is not available to the dream runner`);
     } else {

@@ -27,7 +27,7 @@ export interface FileRoots {
 
 export class FileToolError extends Error {}
 
-const DEFAULT_READ_LIMIT = 100_000;
+const DEFAULT_READ_LIMIT = 30_000;
 
 export const FILE_TOOLS: Anthropic.Beta.BetaTool[] = [
   {

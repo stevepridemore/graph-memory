@@ -15,7 +15,8 @@ process.env.GRAPH_MEMORY_HOME = graphHome;
 const { parseKeyFile, resolveApiKey } = await import("./api-key.js");
 const { findPendingWork, totalPending } = await import("./pending.js");
 const { resolvePath, runFileTool, FileToolError } = await import("./file-tools.js");
-const { estimateCostUsd, nextRunAt, loadSettings, runDream } = await import("./index.js");
+const { estimateCostUsd, nextRunAt, loadSettings, runDream, kickoffMessage } = await import("./index.js");
+const { TranscriptTools } = await import("./transcript-tools.js");
 
 const roots = { graphHome, projectsDir };
 
@@ -69,8 +70,25 @@ describe("pending work", () => {
     writeFileSync(join(graphHome, "ingest", "pending", "scan.pdf"), "%PDF");
 
     const p = findPendingWork(graphHome, projectsDir);
-    expect(p).toEqual({ newTranscripts: 1, grownTranscripts: 1, ingestFiles: 1 });
+    expect(p).toMatchObject({ newTranscripts: 1, grownTranscripts: 1, ingestFiles: 1, ingest: ["notes.md"] });
     expect(totalPending(p)).toBe(3);
+    expect(p.transcripts.map((t) => [t.session_id, t.mode, t.path]).sort()).toEqual([
+      ["s-new", "new", "~/.claude/projects/proj-a/s-new.jsonl"],
+      ["s-old", "delta", "~/.claude/projects/proj-a/s-old.jsonl"],
+    ]);
+  });
+
+  it("leaves sessions that changed in the last few minutes for next time", () => {
+    const p = findPendingWork(graphHome, projectsDir, { activeMinutes: 30 });
+    expect(p.transcripts).toEqual([]);
+    expect(p.skippedActive).toBe(2);
+  });
+
+  it("puts the list in the kickoff message", () => {
+    const msg = kickoffMessage(new Date("2026-10-27T00:00:00Z"), findPendingWork(graphHome, projectsDir));
+    expect(msg).toContain('"session_id": "s-old"');
+    expect(msg).toContain("- notes.md");
+    expect(msg).not.toContain("diskPath");
   });
 });
 
@@ -111,6 +129,49 @@ describe("file tools", () => {
     expect(existsSync(join(graphHome, "ingest", "completed", "test.md"))).toBe(true);
     runFileTool("delete_file", { path: "~/graph-memory/ingest/completed/test.md" }, roots);
     expect(existsSync(join(graphHome, "ingest", "completed", "test.md"))).toBe(false);
+  });
+});
+
+describe("transcript tools", () => {
+  const msg = (role: string, text: string, ts: string) =>
+    JSON.stringify({ type: role, sessionId: "s-t", cwd: "/w", uuid: `${role}-${text}`, timestamp: ts, message: { role, content: [{ type: "text", text }] } });
+
+  it("pages messages, filters deltas, and records the watermark in the manifest", () => {
+    const file = join(projectsDir, "proj-a", "s-t.jsonl");
+    writeFileSync(file, [
+      msg("user", "a".repeat(30), "2026-10-01T00:00:00Z"),
+      msg("assistant", "b".repeat(30), "2026-10-02T00:00:00Z"),
+      msg("user", "c".repeat(30), "2026-10-03T00:00:00Z"),
+    ].join("\n") + "\n");
+    const item = { session_id: "s-t", path: "~/.claude/projects/proj-a/s-t.jsonl", diskPath: file, size_bytes: 1, modified: "", mode: "new" as const };
+    const tools = new TranscriptTools([item], graphHome, 50);
+
+    const p1 = JSON.parse(tools.run("read_transcript", { session_id: "s-t" }));
+    expect(p1.messages.map((m: { text: string }) => m.text[0])).toEqual(["a"]);
+    expect(p1.next_offset).toBe(1);
+    const p2 = JSON.parse(tools.run("read_transcript", { session_id: "s-t", offset: 1 }));
+    expect(p2.messages).toHaveLength(1);
+
+    const delta = JSON.parse(tools.run("read_transcript", { session_id: "s-t", since: "2026-10-02T12:00:00Z" }));
+    expect(delta.matching_messages).toBe(1);
+    expect(delta.messages[0].text[0]).toBe("c");
+    expect(delta.next_offset).toBeNull();
+
+    expect(() => tools.run("read_transcript", { session_id: "not-pending" })).toThrow(/pending list/);
+
+    writeFileSync(join(graphHome, "processed", "manifest.json"), JSON.stringify({ processed: { other: { line_count: 9 } }, extra: 1 }));
+    tools.run("update_manifest", { session_id: "s-t", entities_extracted: 2, edges_created: 3 });
+    const manifest = JSON.parse(readFileSync(join(graphHome, "processed", "manifest.json"), "utf-8"));
+    expect(manifest.extra).toBe(1);
+    expect(manifest.processed.other).toEqual({ line_count: 9 });
+    expect(manifest.processed["s-t"]).toMatchObject({
+      path: item.path,
+      line_count: 3,
+      entities_extracted: 2,
+      edges_created: 3,
+    });
+    expect(manifest.processed["s-t"].file_size_bytes).toBeGreaterThan(90);
+    expect(typeof manifest.last_dream_run).toBe("string");
   });
 });
 

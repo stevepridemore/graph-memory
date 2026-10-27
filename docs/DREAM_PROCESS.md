@@ -391,7 +391,7 @@ An optional way to run the nightly dream on an Anthropic API key instead of a Cl
 ```
 graph-dream container (or a Task Scheduler job)
   └── node dist/dream-runner/index.js
-        ├── quick pending check (manifest, projects dir, ingest/pending)  → exits with no API call if nothing is new
+        ├── discovery (manifest, projects dir, ingest/pending)  → exits with no API call if nothing is new
         ├── acquires processed/dream.lock (source "api-runner")
         ├── spawns the MCP server over stdio  → graph_* tools, as LOCAL_TENANT_ID
         ├── file tools confined to ~/graph-memory (read-write) and ~/.claude/projects (read-only)
@@ -399,9 +399,11 @@ graph-dream container (or a Task Scheduler job)
 ```
 
 - **Prompt.** The system prompt is `~/graph-memory/prompts/dream-nightly.md` (the seeded copy, falling back to the one baked into the image) plus a short "Runner notes" section: the runner holds the lock, there's no shell, MarkItDown isn't available, and what to do when the budget runs out.
-- **Tools.** Every graph tool the MCP server lists, except the ones the nightly prompt never calls (`graph_cypher`, `graph_prune`, `graph_reembed`, `graph_export`, `graph_ingest`, `graph_unmerge`; override with `DREAM_EXCLUDE_TOOLS`). File access is `list_dir`, `stat_file`, `read_file`, `write_file`, `move_file` and `delete_file`. The lock file can't be written or deleted through them.
-- **Large results.** A tool result over `DREAM_MAX_TOOL_RESULT_CHARS` (default 80,000) is saved under `~/graph-memory/dream-runner/spill/` and the model gets the start plus the path to read on from. The spill folder is removed after the run.
-- **Cost controls.** No API call when nothing is pending. Prompt caching on the tools and system prompt. Old tool results are cleared server-side once the conversation gets long (context editing), since the manifest and changelog are on disk. A per-run estimate, `DREAM_MAX_COST_USD` (default $3): once it's passed, the model is told to finish the item in hand, write the changelog and stop, with 20 more turns allowed. `DREAM_MAX_TURNS` (default 200) is the hard stop.
+- **Discovery is the runner's job.** It compares the projects folder against the manifest itself and puts the exact pending list (session id, path, new or delta, previous `processed_at`) in the first message, so the model never lists the projects folder or reads the manifest. Sessions modified in the last `DREAM_SKIP_ACTIVE_MINUTES` (default 30) are left for the next run, which keeps a live session from being half-processed. The first test run without this spent its whole budget on discovery.
+- **Transcripts and manifest.** `read_transcript` pages through a pending session with the canonical parser and applies the delta filter (`since`) before anything reaches the model. `update_manifest` merges one entry into `manifest.json` on disk, with the size, line count and timestamp captured when the file was read. Both stand in for steps the prompt describes with `graph_read_transcript` and hand edits.
+- **Tools.** Every graph tool the MCP server lists, except the ones the nightly prompt never calls (`graph_cypher`, `graph_prune`, `graph_reembed`, `graph_export`, `graph_ingest`, `graph_unmerge`) and `graph_read_transcript`, which `read_transcript` replaces; override with `DREAM_EXCLUDE_TOOLS`. File access is `list_dir`, `stat_file`, `read_file`, `write_file`, `move_file` and `delete_file`. The lock file can't be written or deleted through them.
+- **Large results.** A tool result over `DREAM_MAX_TOOL_RESULT_CHARS` (default 40,000; transcript pages are 75% of it) is saved under `~/graph-memory/dream-runner/spill/` and the model gets the start plus the path to read on from. The spill folder is removed after the run.
+- **Cost controls.** No API call when nothing is pending. Prompt caching on the tools and system prompt. Old tool results are cleared server-side once the conversation gets long (context editing), since the manifest and changelog are on disk. A per-run estimate, `DREAM_MAX_COST_USD` (default $3): at 80% of it the model is told to finish the item in hand, write the changelog and stop, with 20 more turns allowed, and the run is cut off at 1.5x. `DREAM_MAX_TURNS` (default 200) is the hard stop.
 - **Binary ingest files** (PDF, Office, images) need MarkItDown, which the runner doesn't have. They stay in `pending/` and don't count as pending work, so they don't trigger paid runs on their own.
 - **Logs.** Each run writes `~/graph-memory/logs/dream-runner/<timestamp>.log` (one line per turn with the tools called and the running cost estimate) and appends a summary line to `logs/dream-runner/runs.jsonl`. The dream's own changelog and audit log are written as usual.
 
@@ -422,6 +424,7 @@ The runner reads the key at run time from `ANTHROPIC_API_KEY`, or from the file 
 | `DREAM_MAX_TURNS` | `200` | Hard limit on API requests per run |
 | `DREAM_FALLBACKS` | on for Opus/Sonnet 5.x and Fable 5.1 | `off` disables server-side refusal fallbacks |
 | `DREAM_EXCLUDE_TOOLS` | see above | Comma-separated graph tools to hide; empty keeps all |
+| `DREAM_SKIP_ACTIVE_MINUTES` | `30` | Leave sessions modified this recently for the next run; `0` turns it off |
 
 ### Running it
 
