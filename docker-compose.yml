@@ -107,3 +107,47 @@ services:
       options:
         max-size: "10m"
         max-file: "5"
+
+  # ─── Nightly dream on an Anthropic API key (opt-in) ───
+  # Runs prompts/dream-nightly.md through the Messages API instead of a
+  # Claude Code scheduled task, so it bills the API key rather than a claude.ai
+  # plan. Same image as the MCP server; it starts its own stdio copy of the
+  # server to reach the graph. Off unless the "dream" profile is enabled:
+  #   docker compose --profile dream up -d       (or COMPOSE_PROFILES=dream in .env)
+  # One-off run (e.g. from Windows Task Scheduler instead of the daemon):
+  #   docker compose run --rm graph-dream node dist/dream-runner/index.js
+  # See docs/DREAM_PROCESS.md, "API-key runner".
+  graph-dream:
+    image: ghcr.io/stevepridemore/graph-memory-mcp:${MCP_IMAGE_TAG:-latest}
+    container_name: graph-memory-dream
+    profiles: ["dream"]
+    restart: unless-stopped
+    depends_on:
+      neo4j:
+        condition: service_healthy
+    entrypoint: []
+    command: ["node", "dist/dream-runner/index.js", "--daemon"]
+    env_file:
+      - .env
+    environment:
+      - GRAPH_MEMORY_HOME=/root/graph-memory
+      - DREAM_PROJECTS_DIR=/root/.claude/projects
+      - BOOTSTRAP_TENANT_ID=${BOOTSTRAP_TENANT_ID:-bootstrap}
+      - LOCAL_TENANT_ID=${LOCAL_TENANT_ID:-${BOOTSTRAP_TENANT_ID:-bootstrap}}
+      # The key is read from this mounted file at run time. Never put the key
+      # itself in .env or this file.
+      - ANTHROPIC_API_KEY_FILE=/run/secrets/anthropic_api_key
+      - TZ=${DREAM_TZ:-UTC}
+      - DREAM_SCHEDULE=${DREAM_SCHEDULE:-22:47}
+      - DREAM_MODEL=${DREAM_MODEL:-claude-opus-5-5}
+      - DREAM_EFFORT=${DREAM_EFFORT:-medium}
+      - DREAM_MAX_COST_USD=${DREAM_MAX_COST_USD:-3}
+    volumes:
+      - ${GRAPH_MEMORY_HOME}:/root/graph-memory
+      - ${CLAUDE_PROJECTS_DIR}:/root/.claude/projects:ro
+      - ${ANTHROPIC_API_KEY_HOST_FILE:-./.anthropic-api-key}:/run/secrets/anthropic_api_key:ro
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"

@@ -14,6 +14,8 @@ The dream process is NOT a standalone script calling the Claude API. It's a sche
 - No API key management
 - No token cost tracking
 
+There is now one opt-in exception: the [API-key runner](#api-key-runner) runs the same prompt through the Messages API for people who want the dream billed to an API key instead of a Claude plan. The Claude Code scheduled task remains the default.
+
 ## Trigger Model
 
 ### Primary: Scheduled Task (Nightly)
@@ -379,3 +381,57 @@ This session:
 - Queries for stale entities, orphans, and weak clusters
 - Writes a weekly summary to `~/.claude/graph-memory/logs/weekly/`
 - Suggests consolidation or cleanup actions
+
+## API-key runner
+
+An optional way to run the nightly dream on an Anthropic API key instead of a Claude plan. It runs the same `prompts/dream-nightly.md`, through the Messages API, from a small Node program in `src/dream-runner/`. Nothing about the graph, the manifest or the changelog changes; only who pays for the tokens does.
+
+### How it works
+
+```
+graph-dream container (or a Task Scheduler job)
+  └── node dist/dream-runner/index.js
+        ├── quick pending check (manifest, projects dir, ingest/pending)  → exits with no API call if nothing is new
+        ├── acquires processed/dream.lock (source "api-runner")
+        ├── spawns the MCP server over stdio  → graph_* tools, as LOCAL_TENANT_ID
+        ├── file tools confined to ~/graph-memory (read-write) and ~/.claude/projects (read-only)
+        └── tool-use loop on the Messages API until the model finishes, then releases the lock
+```
+
+- **Prompt.** The system prompt is `~/graph-memory/prompts/dream-nightly.md` (the seeded copy, falling back to the one baked into the image) plus a short "Runner notes" section: the runner holds the lock, there's no shell, MarkItDown isn't available, and what to do when the budget runs out.
+- **Tools.** Every graph tool the MCP server lists, except the ones the nightly prompt never calls (`graph_cypher`, `graph_prune`, `graph_reembed`, `graph_export`, `graph_ingest`, `graph_unmerge`; override with `DREAM_EXCLUDE_TOOLS`). File access is `list_dir`, `stat_file`, `read_file`, `write_file`, `move_file` and `delete_file`. The lock file can't be written or deleted through them.
+- **Large results.** A tool result over `DREAM_MAX_TOOL_RESULT_CHARS` (default 80,000) is saved under `~/graph-memory/dream-runner/spill/` and the model gets the start plus the path to read on from. The spill folder is removed after the run.
+- **Cost controls.** No API call when nothing is pending. Prompt caching on the tools and system prompt. Old tool results are cleared server-side once the conversation gets long (context editing), since the manifest and changelog are on disk. A per-run estimate, `DREAM_MAX_COST_USD` (default $3): once it's passed, the model is told to finish the item in hand, write the changelog and stop, with 20 more turns allowed. `DREAM_MAX_TURNS` (default 200) is the hard stop.
+- **Binary ingest files** (PDF, Office, images) need MarkItDown, which the runner doesn't have. They stay in `pending/` and don't count as pending work, so they don't trigger paid runs on their own.
+- **Logs.** Each run writes `~/graph-memory/logs/dream-runner/<timestamp>.log` (one line per turn with the tools called and the running cost estimate) and appends a summary line to `logs/dream-runner/runs.jsonl`. The dream's own changelog and audit log are written as usual.
+
+### API key
+
+The runner reads the key at run time from `ANTHROPIC_API_KEY`, or from the file named by `ANTHROPIC_API_KEY_FILE`. The file can hold the bare key or an `ANTHROPIC_API_KEY=...` line; a folder holding exactly one file also works. The key is never logged, never passed to the MCP server process, and should never be put in `.env` or committed. In compose, set `ANTHROPIC_API_KEY_HOST_FILE` in `.env` to the key file's path on the host; it's mounted read-only at `/run/secrets/anthropic_api_key`.
+
+### Settings
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `ANTHROPIC_API_KEY_HOST_FILE` | none | Host path of the key file (compose only) |
+| `DREAM_SCHEDULE` | `22:47` (compose), `02:30` (runner) | Daily run time for `--daemon`, 24-hour local time |
+| `DREAM_TZ` | `UTC` | IANA time zone the schedule is read in (compose sets `TZ` from it) |
+| `DREAM_MODEL` | `claude-opus-5-5` | `claude-sonnet-5-5` costs about half as much per token |
+| `DREAM_EFFORT` | `medium` | `low`, `medium`, `high`, `xhigh` or `max` |
+| `DREAM_MAX_COST_USD` | `3` | Per-run cost estimate at which the model is told to wrap up |
+| `DREAM_MAX_TURNS` | `200` | Hard limit on API requests per run |
+| `DREAM_FALLBACKS` | on for Opus/Sonnet 5.x and Fable 5.1 | `off` disables server-side refusal fallbacks |
+| `DREAM_EXCLUDE_TOOLS` | see above | Comma-separated graph tools to hide; empty keeps all |
+
+### Running it
+
+Pick one of these, and turn off the Claude Desktop scheduled task (`graph-dream-nightly`) once you have, so the two don't both run. If they overlap, the lock makes the second one exit, but each still uses its own budget.
+
+1. **Always-on container.** Add `COMPOSE_PROFILES=dream` and `ANTHROPIC_API_KEY_HOST_FILE=...` to `.env`, then `docker compose up -d`. The `graph-dream` service waits for `DREAM_SCHEDULE` each day. `docker logs graph-memory-dream` shows when the next run is.
+2. **Windows Task Scheduler.** Leave the profile off and run `.\scripts\register-dream-task.ps1 -At 22:47` from the graph-memory folder. The task runs `docker compose run --rm graph-dream node dist/dream-runner/index.js` daily and catches up after sleep.
+
+To try one run by hand: `docker compose run --rm graph-dream node dist/dream-runner/index.js` (add `--force` to run even when the quick check finds nothing).
+
+### What stays on the subscription
+
+The cloud-session collector (`prompts/collect-cloud-sessions.md`) still runs inside a Claude Code Projects thread, because the tools that list cloud sessions only exist there. It only queues text into `ingest/pending/`; the extraction itself happens in the nightly dream, which is the part this runner moves to the API key.

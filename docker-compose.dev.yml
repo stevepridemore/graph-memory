@@ -13,3 +13,6 @@ services:
   graph-memory-mcp:
     build: .
     image: graph-memory-mcp:dev
+
+  graph-dream:
+    image: graph-memory-mcp:dev
