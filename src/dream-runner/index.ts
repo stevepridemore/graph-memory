@@ -68,7 +68,7 @@ const DEFAULT_WEEKLY_EXCLUDED_TOOLS =
 const toolSet = (raw: string) => new Set(raw.split(",").map((t) => t.trim()).filter(Boolean));
 
 // Models whose server-side `fallbacks: "default"` mode is accepted.
-const FALLBACK_MODELS = new Set(["claude-fable-5-1", "claude-opus-5-5", "claude-opus-5", "claude-sonnet-5-5"]);
+export const FALLBACK_MODELS = new Set(["claude-fable-5-1", "claude-opus-5-5", "claude-opus-5", "claude-sonnet-5-5"]);
 
 export function loadSettings(env: NodeJS.ProcessEnv = process.env, argv: string[] = process.argv): RunnerSettings {
   const model = env.DREAM_MODEL?.trim() || "claude-opus-5-5";
@@ -209,7 +209,7 @@ export function buildSystemPrompt(promptPath: string, job: JobName = "nightly"):
 
 // ─── Logging ───
 
-function makeLogger(logPath: string) {
+export function makeLogger(logPath: string) {
   mkdirSync(dirname(logPath), { recursive: true });
   return (line: string) => {
     const stamped = `${new Date().toISOString()} ${line}`;
@@ -218,7 +218,7 @@ function makeLogger(logPath: string) {
   };
 }
 
-function stamp(d = new Date()): string {
+export function stamp(d = new Date()): string {
   const pad = (n: number) => String(n).padStart(2, "0");
   return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}-${pad(d.getHours())}${pad(d.getMinutes())}${pad(d.getSeconds())}`;
 }
@@ -263,7 +263,7 @@ async function graphTools(mcp: Client, exclude: Set<string>): Promise<Anthropic.
   return tools.sort((a, b) => a.name.localeCompare(b.name));
 }
 
-function mcpResultText(result: Awaited<ReturnType<Client["callTool"]>>): string {
+export function mcpResultText(result: Awaited<ReturnType<Client["callTool"]>>): string {
   const content = Array.isArray(result.content) ? result.content : [];
   const parts = content.map((c: { type: string; text?: string }) =>
     c.type === "text" ? (c.text ?? "") : `[${c.type} content omitted]`,

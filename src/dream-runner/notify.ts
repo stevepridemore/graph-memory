@@ -24,6 +24,8 @@ export function loadMailSettings(env: NodeJS.ProcessEnv = process.env): MailSett
 export interface Mail {
   subject: string;
   text: string;
+  /** Send `text` as an HTML fragment. */
+  html?: boolean;
 }
 
 export type SendFn = (mail: Mail) => Promise<void>;
@@ -38,7 +40,7 @@ export function notifySender(settings: MailSettings, fetchFn: typeof fetch = fet
     const res = await fetchFn(settings.url, {
       method: "POST",
       headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
-      body: JSON.stringify({ subject: mail.subject.slice(0, 200), text }),
+      body: JSON.stringify({ subject: mail.subject.slice(0, 200), text, ...(mail.html ? { html: true } : {}) }),
       signal: AbortSignal.timeout(60_000),
     });
     if (!res.ok) {
