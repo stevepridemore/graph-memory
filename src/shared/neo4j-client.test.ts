@@ -1293,3 +1293,24 @@ describe("Query bounds", () => {
     await expect(client.query(T, ["Hop A"], { max_hops: 50 })).resolves.toBeDefined();
   });
 });
+
+describe("Prune keeps rule edges", () => {
+  it("execute deletes the same weak edges the preview lists, sparing rule edges", async () => {
+    await client.createEntity(T, "Person", "alice", "Alice");
+    await client.createEntity(T, "Project", "side-proj", "Side Project");
+    await client.createEntity(T, "Preference", "no-friday-deploys", "No Friday deploys", { subtype: "rule" }, 1.0);
+    await client.createRelationship(T, "alice", "side-proj", "WORKS_ON", 0.02);
+    await client.createRelationship(T, "alice", "no-friday-deploys", "PREFERS", 0.02);
+
+    const preview = await client.prune(T, "preview", { include_orphans: false });
+    expect(preview.edges_pruned).toBe(1);
+
+    const executed = await client.prune(T, "execute", { include_orphans: false });
+    expect(executed.edges_pruned).toBe(preview.edges_pruned);
+
+    const left = await client.executeCypher(
+      `MATCH (a:Entity {tenant_id: '${T}'})-[r]->(b:Entity {tenant_id: '${T}'}) RETURN type(r) AS rel`,
+    );
+    expect(left.results.map((r: Record<string, unknown>) => r.rel)).toEqual(["PREFERS"]);
+  });
+});
