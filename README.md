@@ -51,6 +51,8 @@ The dream process is just another Claude session that runs on a schedule, reads 
 
 By default that session is a Claude Code scheduled task on your Claude plan. If you'd rather bill it to an Anthropic API key, the optional dream runner (`src/dream-runner/`, the `graph-dream` compose service under the `dream` profile) runs the same nightly and weekly prompts through the Messages API, with a per-run cost cap and an email summary of each run's cost. The same runner can run your other scheduled prompts on the host with only the commands, URLs and MCP tools you allow (`dist/dream-runner/task.js`). See [API-key runner](docs/DREAM_PROCESS.md#api-key-runner).
 
+Two more opt-in pieces use [TypeSafe's Jev](https://docs.typesafe.ai), a model that returns typed judgments for a fraction of a cent each. With `JEV_VERB_SELECT=on`, an edge that would be stored as `RELATED_TO` gets a documented verb when Jev is confident, and stays `RELATED_TO` otherwise. With `JEV_DUPLICATE_CHECK=on`, the nightly runner judges `graph_merge_suggestions` candidates and writes them to a log for you to review; it never merges. Both are off by default and capped on cost. See [Jev judgments](docs/DREAM_PROCESS.md#jev-judgments-optional).
+
 ## Schema
 
 **Node types (19):** `Person`, `Organization`, `Project`, `Feature`, `Concept`, `Technology`, `Decision`, `Reasoning`, `Preference`, `Event`, `Fact`, `Artifact`, `Object`, `Resource`, `Infrastructure`, `Alias`, `Location`, `Issue`, `Task`.
@@ -94,6 +96,7 @@ Slash-command wrappers (`/graph`, `/graph-ask`, `/graph-find`, `/graph-stats`, `
 - **[yt-dlp](https://github.com/yt-dlp/yt-dlp)** — convenient way to grab YouTube/web video subtitle files for ingestion. `yt-dlp --write-auto-sub --sub-lang en --skip-download <url>` writes a `.vtt` you can drop into `ingest/pending/`. Not a runtime dependency; just a tool that produces files graph-memory can already eat.
 - **[cloudflared](https://github.com/cloudflare/cloudflared)** + a Cloudflare account — only needed for the multi-device / claude.ai web setup described in [`docs/REMOTE.md`](docs/REMOTE.md). Local-only deployments don't need it.
 - **Anthropic API key** — only for the optional [API-key runner](docs/DREAM_PROCESS.md#api-key-runner).
+- **TypeSafe API key** — only for the optional [Jev judgments](docs/DREAM_PROCESS.md#jev-judgments-optional) (verb selection and the duplicate check).
 - **Python 3.10+** — required only by MarkItDown and by `scripts/sync-dream-skill.py`.
 
 ## Install
@@ -107,8 +110,8 @@ Use this on the machine that will host Neo4j + the MCP server. This is also wher
 **Linux / macOS / Windows with Git Bash or WSL:**
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/stevepridemore/graph-memory/v0.5.0/scripts/install-primary.sh \
-  | bash -s v0.5.0
+curl -fsSL https://raw.githubusercontent.com/stevepridemore/graph-memory/v0.6.0/scripts/install-primary.sh \
+  | bash -s v0.6.0
 # edit ~/graph-memory/.env (NEO4J_PASSWORD, GRAPH_MEMORY_HOME, CLAUDE_PROJECTS_DIR)
 cd ~/graph-memory && docker compose up -d
 ```
@@ -116,7 +119,7 @@ cd ~/graph-memory && docker compose up -d
 **Windows PowerShell (no bash needed):**
 
 ```powershell
-$v = 'v0.5.0'
+$v = 'v0.6.0'
 iwr "https://raw.githubusercontent.com/stevepridemore/graph-memory/$v/scripts/install-primary.ps1" -UseBasicParsing -OutFile $env:TEMP\gm-install.ps1
 & $env:TEMP\gm-install.ps1 -Version $v
 # edit $HOME\graph-memory\.env
@@ -134,14 +137,14 @@ Use this on every additional laptop, work computer, or phone. No Docker, no Neo4
 **Linux / macOS / Windows with Git Bash or WSL:**
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/stevepridemore/graph-memory/v0.5.0/scripts/install-secondary.sh \
-  | bash -s v0.5.0 your-tunnel-host.example.com
+curl -fsSL https://raw.githubusercontent.com/stevepridemore/graph-memory/v0.6.0/scripts/install-secondary.sh \
+  | bash -s v0.6.0 your-tunnel-host.example.com
 ```
 
 **Windows PowerShell (no bash needed):**
 
 ```powershell
-$v = 'v0.5.0'
+$v = 'v0.6.0'
 iwr "https://raw.githubusercontent.com/stevepridemore/graph-memory/$v/scripts/install-secondary.ps1" -UseBasicParsing -OutFile $env:TEMP\gm-install.ps1
 & $env:TEMP\gm-install.ps1 -Version $v -TunnelHost your-tunnel-host.example.com
 ```
@@ -219,6 +222,7 @@ The graph stores personal information — names of colleagues, decisions, prefer
 | MCP framework | `@modelcontextprotocol/sdk` |
 | Auth | `jose` for JWT signing/verification (RS256) |
 | API-key runner (optional) | `@anthropic-ai/sdk` |
+| Typed judgments (optional) | TypeSafe Jev over HTTPS |
 | Tunnel (optional) | Cloudflare Tunnel (`cloudflared`) + Cloudflare Access |
 | Testing | Vitest |
 
@@ -237,7 +241,7 @@ All planned phases shipped:
 - ✅ npm audit clean (0 vulnerabilities)
 - ✅ Pre-built GHCR images + curl-pipeable installers (no clone or local build required for end users)
 
-Current release: [`v0.5.0`](https://github.com/stevepridemore/graph-memory/releases/tag/v0.5.0).
+Current release: [`v0.6.0`](https://github.com/stevepridemore/graph-memory/releases/tag/v0.6.0).
 
 Currently steady-state. Active development is opportunistic; the system runs unattended via the nightly dream process.
 
@@ -247,6 +251,7 @@ Newest first. Each tag publishes `ghcr.io/stevepridemore/graph-memory-mcp:<tag>`
 
 | Version | Date | Summary |
 |---|---|---|
+| [`v0.6.0`](https://github.com/stevepridemore/graph-memory/releases/tag/v0.6.0) | 2026-10-27 | `graph_prune` execute now spares edges on rule nodes, as its preview already said. Tool descriptions for `graph_decay`, `graph_validate`, `graph_search` and `graph_communities` match what the tools return. Opt-in TypeSafe Jev features: verb selection for edges that would be stored as `RELATED_TO`, and a log-only duplicate check after the nightly dream. |
 | [`v0.5.0`](https://github.com/stevepridemore/graph-memory/releases/tag/v0.5.0) | 2026-10-27 | Optional API-key runner: the nightly dream and weekly maintenance can run on an Anthropic API key (`graph-dream` compose service, `dream` profile) with per-run cost caps and an email summary of each run's cost. A general task runner (`dist/dream-runner/task.js`) runs other scheduled prompts on the same key with only the commands, URLs and MCP tools a task file allows. `graph_ingest` accepts inline content so Claude Code cloud sessions can feed the nightly dream. Adds the `plain-tech-docs` skill for checking docs. |
 | [`v0.4.0`](https://github.com/stevepridemore/graph-memory/releases/tag/v0.4.0) | 2026-10-11 | Security and data-integrity release. Fixes Cypher injection through relation and type names, and a `tenant_id` overwrite through caller-supplied properties. Fixes compounding decay, makes batch writes atomic, routes every write through one entity resolver, and adds the `graph_alias` tool. Types and relations are now checked against the documented vocabulary (see `SCHEMA_ENFORCEMENT`). Transcript format detection no longer misreads transcripts that open with metadata records. |
 | [`v0.3.1`](https://github.com/stevepridemore/graph-memory/releases/tag/v0.3.1) | 2026-05-17 | Rule subtype for permanent preferences, exempt from decay and pruning. `.gitattributes` forces LF on shell scripts and the Dockerfile so a Windows clone builds a working image. |

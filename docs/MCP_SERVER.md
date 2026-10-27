@@ -489,6 +489,7 @@ RETURN count(n) AS decayed
 
 - `mode: "preview"` (default) — returns what would be pruned without deleting anything.
 - `mode: "execute"` — actually deletes. Requires explicit confirmation from the user (Claude should ask before calling with execute).
+- Rules are exempt in both modes: an edge touching a `subtype: "rule"` node on either side is never listed or deleted, and rule nodes are never pruned. Before v0.6.0, execute dropped the edge exemption, so it could delete a weak edge on a rule that the preview had listed as kept.
 - `node_threshold` — prune nodes with confidence below this AND no edges with weight at or above `edge_threshold`. Defaults to config value (`decay.prune_node_threshold`).
 - `edge_threshold` — prune edges with weight below this. Defaults to config value (`decay.prune_edge_threshold`).
 - `include_orphans` (default `true`) also prunes nodes with zero edges, `confidence` at or above `node_threshold`, and `last_seen` older than `max_age_days`.

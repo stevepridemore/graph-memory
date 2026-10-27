@@ -478,3 +478,24 @@ After a nightly API-runner dream completes, the runner takes up to `JEV_DUPLICAT
 Every judged pair is appended to `~/graph-memory/logs/jev-duplicates.jsonl` with its scores and verdict. **Nothing is merged or aliased.** Review the file and use `graph_merge` or `graph_alias` yourself. The run log gets a one-line summary. A failure here is logged and never changes the dream run's outcome. The cap is `JEV_DUPLICATE_MAX_COST_USD` ($0.02 per run).
 
 To run only the check: `docker compose run --rm graph-dream node dist/dream-runner/index.js --job duplicates`. It is read-only and needs no Anthropic key.
+
+### Settings
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `JEV_API_KEY_HOST_FILE` | none | Compose only: host path of the key file. Sets `JEV_API_KEY_FILE` in both containers |
+| `JEV_API_KEY_FILE` | none | Path to the key file as the process sees it. Required outside compose |
+| `JEV_VERB_SELECT` | `off` | `on` turns on verb selection in `graph_relate` |
+| `JEV_VERB_MIN_CONFIDENCE` | `0.55` | Choice confidence needed to relabel |
+| `JEV_VERB_MIN_EVIDENCE` | `0.5` | Probability that the evidence names a specific relationship, needed to relabel |
+| `JEV_VERB_MAX_COST_USD_PER_DAY` | `0.05` | Verb-selection cap per server process, reset daily |
+| `JEV_DUPLICATE_CHECK` | `off` | `on` runs the duplicate check after each completed nightly run |
+| `JEV_DUPLICATE_MAX_COST_USD` | `0.02` | Duplicate-check cap per run |
+| `JEV_DUPLICATE_MIN_SCORE` | `0.6` | `graph_merge_suggestions` threshold for candidates |
+| `JEV_DUPLICATE_LIMIT` | `30` | Candidate pairs per run (max 100) |
+| `JEV_DUPLICATE_LINK_FLOOR` | `0.3` | `link_state` (0-2) needed to flag a pair |
+| `JEV_DUPLICATE_CONTAINS_CEILING` | `0.4` | Flag a pair only when `one_contains_other` is at or below this |
+| `JEV_DUPLICATE_MAX_RELATIONSHIPS` | `15` | Relationships per entity sent as context (`ALIAS_OF` first) |
+| `JEV_TIMEOUT_MS` | `8000` | Per-request timeout |
+| `JEV_MODEL` | `jev-latest` | Model alias |
+| `JEV_URL` | `https://api.typesafe.ai/v1/systemone` | API endpoint |
