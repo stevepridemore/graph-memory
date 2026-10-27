@@ -26,7 +26,8 @@ $ErrorActionPreference = 'Stop'
 
 $name = (Get-Content $TaskFile -Raw | ConvertFrom-Json).name
 if (-not $name) { throw "No name in $TaskFile" }
-$TaskName = "API task: $name"
+# Task Scheduler rejects ":" in names.
+$TaskName = "API task - $name"
 
 if ($Unregister) {
     Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false
@@ -57,7 +58,7 @@ $trigger.StartBoundary = $time.ToString('yyyy-MM-ddTHH:mm:ss')
 $settings = New-ScheduledTaskSettingsSet -StartWhenAvailable -ExecutionTimeLimit (New-TimeSpan -Minutes 30) -MultipleInstances IgnoreNew
 
 Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger $trigger -Settings $settings `
-    -Description "Runs $TaskFile on the Anthropic API key (graph-memory task runner)." -Force | Out-Null
+    -Description "Runs $TaskFile on the Anthropic API key (graph-memory task runner)." -Force -ErrorAction Stop | Out-Null
 
 $when = if ($Weekly) { "every $DayOfWeek at $At" } else { "daily at $At" }
 Write-Host "[register-api-task] '$TaskName' runs $when"
