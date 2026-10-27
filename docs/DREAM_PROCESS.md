@@ -454,11 +454,58 @@ The same runner can run `prompts/weekly-maintenance.md` with `--job weekly`, or 
 
 With `DREAM_NOTIFY_TOKEN_HOST_FILE` set, the runner sends mail after a run (`notify.ts`):
 
-- **Weekly, completed:** the report from `logs/weekly-reports/`, subject `Weekly Graph Maintenance — <date> (<N> action items)`.
-- **Any run that doesn't finish cleanly** (error, budget stop, turn limit, refusal, lock held): a short alert with the outcome, cost and the last 40 log lines.
-- **Nothing** for a normal nightly or a quiet night.
+- **Nightly, completed:** a summary, subject `Graph dream — <date>: <N> sessions, <E> entities, <D> edges (~$cost)`, with the counts `update_manifest` recorded, what discovery found, and the model's closing summary.
+- **Nightly, nothing pending:** a one-line `Graph dream — <date>: nothing new (~$0.00)`, so a quiet night still confirms the runner is alive.
+- **Weekly, completed:** the report from `logs/weekly-reports/`, subject `Weekly Graph Maintenance — <date> (<N> action items, ~$cost)`.
+- **Any run that doesn't finish cleanly** (error, budget stop, turn limit, refusal, lock held): a short alert with the outcome and the last 40 log lines.
+
+Every mail starts with the run's estimated cost (turns, model) and the API spend so far this calendar month, summed from `logs/dream-runner/runs.jsonl`. These are the runner's estimates from its price table; the Console's usage page is the authority.
 
 Mail goes through gws-mcp's send-only notify listener (`POST /notify` with a bearer token). gws-mcp sends from its `NOTIFY_ACCOUNT` to its fixed `NOTIFY_TO`, so the runner holds no Gmail credential and the token can't mail anyone else. The listener's port isn't published: `graph-dream` reaches it as `gws-mcp:3849` over the shared `mcp-notify` docker network, which both compose files declare. To set it up, write one random value (32+ characters) to a file, point gws-mcp's `NOTIFY_TOKEN_HOST_FILE` and this project's `DREAM_NOTIFY_TOKEN_HOST_FILE` at it, set `NOTIFY_ACCOUNT` and `NOTIFY_TO` for gws-mcp, and restart both. A failed send is logged and never fails the run. The report is plain text (it's Markdown, which reads fine as is).
+
+### Other scheduled tasks
+
+`dist/dream-runner/task.js` runs any other scheduled prompt (a Claude Code scheduled task's SKILL.md, say) on the same API key, with only what its task file grants. There's no shell. A task file is JSON:
+
+```json
+{
+  "name": "site-daily-check",
+  "prompt_file": "C:/Users/you/.claude/scheduled-tasks/site-daily-check/SKILL.md",
+  "notes": "Where the prompt says `python tools/stats.py \"...\"`, call stats_query.",
+  "model": "claude-sonnet-5-5",
+  "effort": "medium",
+  "max_cost_usd": 1,
+  "workdir": "C:/Users/you/Projects/site",
+  "write_paths": ["reports"],
+  "commands": [{
+    "name": "stats_query",
+    "description": "Run one read-only stats query.",
+    "exe": "C:/Python312/python.exe",
+    "args": ["tools/stats.py"],
+    "arg": { "name": "query", "description": "A SELECT statement", "pattern": "^\\s*SELECT\\b" },
+    "flags": ["--raw"]
+  }],
+  "http": [
+    { "prefix": "https://api.example.com/graphql", "methods": ["POST"],
+      "bearer_file": "~/.example/read-token", "vars": { "ACCOUNT_ID": "~/.example/account-id" } },
+    { "prefix": "https://www.example.org/", "methods": ["GET"] }
+  ],
+  "mcp_servers": [{ "name": "analytics", "command": "C:/Users/you/.local/bin/analytics-mcp.exe",
+                    "env": { "GOOGLE_APPLICATION_CREDENTIALS": "C:/Users/you/.creds/adc.json" },
+                    "tools": ["run_report"] }],
+  "email": { "url": "http://127.0.0.1:3850/notify/site", "token_file": "~/.config/notify-site-token", "max_per_run": 2 }
+}
+```
+
+What the model gets:
+
+- `list_dir`, `read_file`: anywhere under `workdir`. `write_file`, `edit_file`: only under `write_paths`. Symlinks out are refused.
+- One tool per command. The executable and its leading args are fixed. The model supplies one argument, which must match `pattern`, plus flags from `flags`. It's spawned without a shell, in `workdir`, with a 120 s timeout.
+- `http_request` to the listed prefixes and methods. The runner adds the bearer token and fills `{{VAR}}` from files, so the model never sees either.
+- The allowlisted tools of each stdio MCP server.
+- `send_email`, through a gws-mcp notify profile: the sender and recipient are fixed there, and there's an optional `html` flag. At most `max_per_run` sends per run.
+
+Runs log to `~/graph-memory/logs/dream-runner/<run_id>-<name>.log` and append to the same `runs.jsonl` as the dream, so the dream's "API spend this month" line counts them. If a run doesn't complete, the runner emails an alert through the same profile. These tasks run on the host, not in the container, so they can use local tools. Schedule one with `scripts/register-api-task.ps1 -TaskFile <file> -At HH:MM`.
 
 ### What stays on the subscription
 

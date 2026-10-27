@@ -24,6 +24,8 @@ export function loadMailSettings(env: NodeJS.ProcessEnv = process.env): MailSett
 export interface Mail {
   subject: string;
   text: string;
+  /** Send `text` as an HTML fragment. */
+  html?: boolean;
 }
 
 export type SendFn = (mail: Mail) => Promise<void>;
@@ -38,7 +40,7 @@ export function notifySender(settings: MailSettings, fetchFn: typeof fetch = fet
     const res = await fetchFn(settings.url, {
       method: "POST",
       headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
-      body: JSON.stringify({ subject: mail.subject.slice(0, 200), text }),
+      body: JSON.stringify({ subject: mail.subject.slice(0, 200), text, ...(mail.html ? { html: true } : {}) }),
       signal: AbortSignal.timeout(60_000),
     });
     if (!res.ok) {
@@ -49,9 +51,6 @@ export function notifySender(settings: MailSettings, fetchFn: typeof fetch = fet
   };
 }
 
-/** Outcomes that mean "nothing to tell you": a normal run or a quiet night. */
-const QUIET = new Set(["completed", "nothing_pending"]);
-
 export interface RunSummaryForMail {
   job: "nightly" | "weekly";
   outcome: string;
@@ -60,32 +59,106 @@ export interface RunSummaryForMail {
   costUsd: number;
   logPath: string;
   graphHome: string;
+  model?: string;
+  summary?: string;
+  stats?: { sessions: number; entities: number; edges: number };
+  pending?: { newTranscripts: number; grownTranscripts: number; ingestFiles: number };
 }
 
 /**
- * What to send for a finished run, if anything:
- *  - weekly, completed → the report it wrote this run
+ * What to send for a finished run:
+ *  - nightly, completed or nothing pending → a summary with the cost
+ *  - weekly, completed → the report it wrote this run, with the cost on top
  *  - any job, other outcome (error, budget, turn limit, refusal, lock held) → an alert with the log's tail
+ * Every mail carries this run's cost and the month's API spend so far.
  */
 export function mailForRun(run: RunSummaryForMail): Mail | null {
-  const date = run.started.toISOString().slice(0, 10);
-  const cost = `~$${run.costUsd.toFixed(2)}, ${run.turns} turns`;
+  const date = localDate(run.started);
+  const cost = `$${run.costUsd.toFixed(2)}`;
+  const header = costHeader(run);
+
   if (run.job === "weekly" && run.outcome === "completed") {
     const report = newestReport(join(run.graphHome, "logs", "weekly-reports"), run.started);
     if (report) {
       const action = (report.text.match(/^- \[ \]/gm) ?? []).length;
       return {
-        subject: `Weekly Graph Maintenance — ${date} (${action} action item${action === 1 ? "" : "s"})`,
-        text: report.text + `\n\n---\nAPI runner, ${cost}. Report file: ${report.path}\n`,
+        subject: `Weekly Graph Maintenance — ${date} (${action} action item${action === 1 ? "" : "s"}, ~${cost})`,
+        text: `${header}\n\n---\n\n${report.text}\n\n---\nReport file: ${report.path}\n`,
       };
     }
-    return alert(run, date, cost, "The weekly run finished but wrote no report this run.");
+    return alert(run, date, header, "The weekly run finished but wrote no report this run.");
   }
-  if (QUIET.has(run.outcome)) return null;
-  return alert(run, date, cost);
+
+  if (run.job === "nightly" && run.outcome === "nothing_pending") {
+    return {
+      subject: `Graph dream — ${date}: nothing new (~${cost})`,
+      text: `${header}\n\nNo new or grown transcripts and no ingest files, so no API call was made.\n`,
+    };
+  }
+
+  if (run.job === "nightly" && run.outcome === "completed") {
+    const st = run.stats ?? { sessions: 0, entities: 0, edges: 0 };
+    const p = run.pending;
+    const lines = [
+      header,
+      "",
+      `Sessions processed: ${st.sessions}`,
+      `Entities extracted: ${st.entities}`,
+      `Edges created: ${st.edges}`,
+      ...(p ? [`Found pending: ${p.newTranscripts} new, ${p.grownTranscripts} grown transcripts, ${p.ingestFiles} ingest files`] : []),
+      ...(run.summary ? ["", "Dream summary:", run.summary] : []),
+      "",
+      `Log: ${run.logPath}`,
+    ];
+    return {
+      subject: `Graph dream — ${date}: ${st.sessions} session${st.sessions === 1 ? "" : "s"}, ${st.entities} entities, ${st.edges} edges (~${cost})`,
+      text: lines.join("\n") + "\n",
+    };
+  }
+
+  return alert(run, date, header);
 }
 
-function alert(run: RunSummaryForMail, date: string, cost: string, note?: string): Mail {
+/** "Cost: ~$0.79 (18 turns, claude-opus-5-5)" plus the month's spend from runs.jsonl. */
+function costHeader(run: RunSummaryForMail): string {
+  const model = run.model ? `, ${run.model}` : "";
+  const lines = [`Cost: ~$${run.costUsd.toFixed(2)} (${run.turns} turn${run.turns === 1 ? "" : "s"}${model})`];
+  const month = monthSpend(join(run.graphHome, "logs", "dream-runner", "runs.jsonl"), run.started);
+  if (month) {
+    lines.push(`API spend this month: ~$${month.total.toFixed(2)} over ${month.runs} run${month.runs === 1 ? "" : "s"}`);
+  }
+  return lines.join("\n");
+}
+
+/** Sum of estimated_cost_usd for runs started in the same local calendar month. */
+export function monthSpend(runsPath: string, now: Date): { total: number; runs: number } | null {
+  let raw: string;
+  try {
+    raw = readFileSync(runsPath, "utf-8");
+  } catch {
+    return null;
+  }
+  let total = 0;
+  let runs = 0;
+  for (const line of raw.split("\n")) {
+    if (!line.trim()) continue;
+    try {
+      const r = JSON.parse(line) as { started?: string; estimated_cost_usd?: number };
+      const d = r.started ? new Date(r.started) : null;
+      if (!d || d.getFullYear() !== now.getFullYear() || d.getMonth() !== now.getMonth()) continue;
+      total += Number(r.estimated_cost_usd ?? 0);
+      runs++;
+    } catch { /* skip a bad line */ }
+  }
+  return { total, runs };
+}
+
+function localDate(d: Date): string {
+  const pad = (n: number) => String(n).padStart(2, "0");
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+}
+
+function alert(run: RunSummaryForMail, date: string, header: string, note?: string): Mail {
   let tail = "";
   try {
     tail = readFileSync(run.logPath, "utf-8").split("\n").slice(-40).join("\n");
@@ -100,9 +173,9 @@ function alert(run: RunSummaryForMail, date: string, cost: string, note?: string
   return {
     subject: `graph-memory ${run.job} run ${run.outcome} — ${date}`,
     text:
-      `The ${run.job} run ${what[run.outcome] ?? `ended with outcome ${run.outcome}`} (${cost}).\n` +
+      `The ${run.job} run ${what[run.outcome] ?? `ended with outcome ${run.outcome}`}.\n` +
       (note ? `${note}\n` : "") +
-      `\nLog: ${run.logPath}\n\n${tail}\n`,
+      `\n${header}\n\nLog: ${run.logPath}\n\n${tail}\n`,
   };
 }
 

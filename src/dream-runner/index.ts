@@ -68,7 +68,7 @@ const DEFAULT_WEEKLY_EXCLUDED_TOOLS =
 const toolSet = (raw: string) => new Set(raw.split(",").map((t) => t.trim()).filter(Boolean));
 
 // Models whose server-side `fallbacks: "default"` mode is accepted.
-const FALLBACK_MODELS = new Set(["claude-fable-5-1", "claude-opus-5-5", "claude-opus-5", "claude-sonnet-5-5"]);
+export const FALLBACK_MODELS = new Set(["claude-fable-5-1", "claude-opus-5-5", "claude-opus-5", "claude-sonnet-5-5"]);
 
 export function loadSettings(env: NodeJS.ProcessEnv = process.env, argv: string[] = process.argv): RunnerSettings {
   const model = env.DREAM_MODEL?.trim() || "claude-opus-5-5";
@@ -209,7 +209,7 @@ export function buildSystemPrompt(promptPath: string, job: JobName = "nightly"):
 
 // ─── Logging ───
 
-function makeLogger(logPath: string) {
+export function makeLogger(logPath: string) {
   mkdirSync(dirname(logPath), { recursive: true });
   return (line: string) => {
     const stamped = `${new Date().toISOString()} ${line}`;
@@ -218,7 +218,7 @@ function makeLogger(logPath: string) {
   };
 }
 
-function stamp(d = new Date()): string {
+export function stamp(d = new Date()): string {
   const pad = (n: number) => String(n).padStart(2, "0");
   return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}-${pad(d.getHours())}${pad(d.getMinutes())}${pad(d.getSeconds())}`;
 }
@@ -263,7 +263,7 @@ async function graphTools(mcp: Client, exclude: Set<string>): Promise<Anthropic.
   return tools.sort((a, b) => a.name.localeCompare(b.name));
 }
 
-function mcpResultText(result: Awaited<ReturnType<Client["callTool"]>>): string {
+export function mcpResultText(result: Awaited<ReturnType<Client["callTool"]>>): string {
   const content = Array.isArray(result.content) ? result.content : [];
   const parts = content.map((c: { type: string; text?: string }) =>
     c.type === "text" ? (c.text ?? "") : `[${c.type} content omitted]`,
@@ -290,6 +290,13 @@ interface JobResult {
   turns: number;
   costUsd: number;
   logPath: string;
+  model?: string;
+  /** The model's closing message. */
+  summary?: string;
+  /** Nightly: what update_manifest recorded. */
+  stats?: { sessions: number; entities: number; edges: number };
+  /** Nightly: what discovery found. */
+  pending?: { newTranscripts: number; grownTranscripts: number; ingestFiles: number };
 }
 
 export async function runDream(
@@ -333,7 +340,7 @@ async function runJob(settings: RunnerSettings, deps: RunnerDeps, job: JobName):
   if (pending) {
     if (totalPending(pending) === 0 && !settings.force) {
       log("nothing pending; no API call made");
-      return { outcome: "nothing_pending", started, turns: 0, costUsd: 0, logPath };
+      return { outcome: "nothing_pending", started, turns: 0, costUsd: 0, logPath, model: settings.model };
     }
     log(
       `pending: ${pending.newTranscripts} new, ${pending.grownTranscripts} grown transcripts, ${pending.ingestFiles} ingest files` +
@@ -354,6 +361,8 @@ async function runJob(settings: RunnerSettings, deps: RunnerDeps, job: JobName):
   let outcome: RunOutcome = "error";
   let turns = 0;
   let mcp: Client | null = null;
+  let summaryText: string | undefined;
+  let transcriptTools: TranscriptTools | null = null;
 
   try {
     const client = deps.anthropic ?? new Anthropic({ apiKey: resolveApiKey(), maxRetries: 4 });
@@ -363,11 +372,12 @@ async function runJob(settings: RunnerSettings, deps: RunnerDeps, job: JobName):
       ...FILE_TOOLS,
       ...(weekly ? [] : TRANSCRIPT_TOOLS),
     ];
-    const transcriptTools = new TranscriptTools(
+    const tt = new TranscriptTools(
       pending?.transcripts ?? [],
       settings.roots.graphHome,
       Math.floor(settings.maxToolResultChars * 0.75),
     );
+    transcriptTools = tt;
     log(`job=${job} model=${settings.model} effort=${settings.effort} tools=${tools.length} budget=$${maxCostUsd}`);
 
     const system = buildSystemPrompt(weekly ? settings.weeklyPromptPath : settings.promptPath, job);
@@ -432,7 +442,10 @@ async function runJob(settings: RunnerSettings, deps: RunnerDeps, job: JobName):
           .map((b) => b.text)
           .join("\n")
           .trim();
-        if (text) log(`summary: ${text.replace(/\s+/g, " ")}`);
+        if (text) {
+          summaryText = text;
+          log(`summary: ${text.replace(/\s+/g, " ")}`);
+        }
         outcome = wrapUpSent ? "budget_stopped" : "completed";
         break;
       }
@@ -445,7 +458,7 @@ async function runJob(settings: RunnerSettings, deps: RunnerDeps, job: JobName):
 
       const results: Anthropic.Beta.BetaContentBlockParam[] = [];
       for (const use of toolUses) {
-        results.push(await runTool(use, mcp, transcriptTools, settings, excludeTools, spillDir));
+        results.push(await runTool(use, mcp, tt, settings, excludeTools, spillDir));
       }
       // Wrap-up starts at 80% so the closing turns (changelog, audit) land
       // near the budget rather than well past it.
@@ -486,7 +499,25 @@ async function runJob(settings: RunnerSettings, deps: RunnerDeps, job: JobName):
     log(`done: ${outcome}, ${turns} turns, ~$${cost.toFixed(3)}`);
     try { appendFileSync(join(logDir, "runs.jsonl"), JSON.stringify({ job, ...summary }) + "\n"); } catch { /* best-effort */ }
   }
-  return { outcome, started, turns, costUsd: estimateCostUsd(settings.model, usage), logPath };
+  return {
+    outcome,
+    started,
+    turns,
+    costUsd: estimateCostUsd(settings.model, usage),
+    logPath,
+    model: settings.model,
+    summary: summaryText,
+    ...(pending
+      ? {
+          stats: transcriptTools?.stats() ?? { sessions: 0, entities: 0, edges: 0 },
+          pending: {
+            newTranscripts: pending.newTranscripts,
+            grownTranscripts: pending.grownTranscripts,
+            ingestFiles: pending.ingestFiles,
+          },
+        }
+      : {}),
+  };
 }
 
 async function runTool(
