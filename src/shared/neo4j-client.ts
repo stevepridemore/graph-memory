@@ -1575,11 +1575,13 @@ export class Neo4jClient {
     // Execute mode — actually delete (tenant-scoped)
     const details: Array<{ action: string; id?: string; type?: string; from?: string; to?: string }> = [];
 
-    // Delete edges first
+    // Delete edges first, with the same rule exemption as the preview
     const edgeDeleteRows = await this.run(
       `
       MATCH (a:Entity {tenant_id: $tenantId})-[r]->(b:Entity {tenant_id: $tenantId})
       WHERE r.weight < $edgeThreshold
+        AND (a.subtype IS NULL OR a.subtype <> 'rule')
+        AND (b.subtype IS NULL OR b.subtype <> 'rule')
       DELETE r
       RETURN count(r) AS deleted
       `,

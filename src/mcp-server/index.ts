@@ -655,7 +655,7 @@ server.registerTool("graph_cypher", {
 server.registerTool("graph_decay", {
   title: "Graph Decay",
   description:
-    "Apply time-based decay to every node confidence and edge weight using per-type half-lives (preferences ~693d, events ~99d, etc.). Called by the dream process during maintenance. Always preview with dry_run=true first — decay is irreversible without restoring from a graph_export backup. Returns counts of nodes/edges modified per type.",
+    "Apply time-based decay to every node confidence and edge weight using per-type half-lives (preferences ~693d, events ~99d, etc.). Called by the dream process during maintenance. Always preview with dry_run=true first — decay is irreversible without restoring from a graph_export backup. Rule-subtype nodes and edges touching them are exempt. Returns totals, not per-type counts: `{nodes_decayed, edges_decayed, nodes_flagged_for_pruning}` (with dry_run, edges_decayed is always 0).",
   inputSchema: {
     dry_run: z.boolean().optional().default(false).describe("Preview only, don't apply changes (default: false)"),
   },
@@ -909,9 +909,9 @@ server.registerTool("graph_validate", {
   title: "Validate Graph Entities",
   description:
     "Scan recently extracted entities and edges for quality issues: generic names, reference language, " +
-    "type mismatches, near-duplicate names, and extreme confidence values. " +
+    "isolated low-confidence entities, and near-duplicate names. " +
     "Call this after a dream process extraction batch to catch bad data before it settles into the graph. " +
-    "Returns up to `max_issues` records of shape `{entity_id, name, type, issue, severity}` where severity is high/medium/low. " +
+    "Returns `{total_issues, by_severity, scope, issues}`, where `issues` holds up to `max_issues` records of shape `{entity_id, name, type, issue, severity}` and severity is high/medium/low. " +
     "Read-only — pair with graph_delete or graph_unmerge to act on flagged items.",
   inputSchema: {
     source_session: z
@@ -1378,7 +1378,8 @@ server.registerTool("graph_search", {
     "Find entities semantically similar to a natural-language query, then optionally expand via " +
     "graph traversal. Uses local sentence embeddings (bge-small-en, 384-dim) — no external API. " +
     "Best when the user's wording doesn't match canonical entity names (e.g. \"containers\" → Docker, " +
-    "\"AI tools\" → Claude Code/Anthropic SDK). Falls back to graph_query if no embeddings available.",
+    "\"AI tools\" → Claude Code/Anthropic SDK). If the embedder is unavailable it returns an error; use graph_query instead. " +
+    "Expansion follows the top 5 seeds only, capped at 30 edges.",
   inputSchema: {
     query: z
       .string()
@@ -1515,7 +1516,7 @@ server.registerTool("graph_communities", {
     "edges above the weight threshold — works without GDS or APOC. Each entity is assigned to at most " +
     "one community (the first that reaches it from a high-degree seed). Useful for understanding " +
     "knowledge neighbourhoods (e.g. \"everything related to infrastructure\"). " +
-    "Returns at most `max_communities` clusters, each shaped `{community_id, seed: {id, name, type}, size, members: [{id, name, type}]}`, sorted by size desc; communities below `min_size` are filtered out. " +
+    "Returns `{communities, coverage}`. `communities` holds at most `max_communities` clusters in seed order (highest-degree seed first), each shaped `{id, seed_name, seed_id, member_count, dominant_type, members: [{id, name, type}]}` with at most 30 members listed; communities below `min_size` are left out. `coverage` is `{total_entities, assigned, unassigned}`. " +
     "Use graph_query or graph_search instead when you have a specific entity to start from.",
   inputSchema: {
     weight_threshold: z
