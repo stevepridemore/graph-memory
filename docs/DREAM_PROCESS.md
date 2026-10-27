@@ -425,6 +425,9 @@ The runner reads the key at run time from `ANTHROPIC_API_KEY`, or from the file 
 | `DREAM_FALLBACKS` | on for Opus/Sonnet 5.x and Fable 5.1 | `off` disables server-side refusal fallbacks |
 | `DREAM_EXCLUDE_TOOLS` | see above | Comma-separated graph tools to hide; empty keeps all |
 | `DREAM_SKIP_ACTIVE_MINUTES` | `30` | Leave sessions modified this recently for the next run; `0` turns it off |
+| `DREAM_WEEKLY_SCHEDULE` | `off` | Weekly maintenance in the daemon, e.g. `Sun 06:00` |
+| `DREAM_WEEKLY_MAX_COST_USD` | `1.5` | Weekly job's budget |
+| `DREAM_WEEKLY_EXCLUDE_TOOLS` | see Weekly maintenance | Graph tools hidden from the weekly job |
 
 ### Running it
 
@@ -434,6 +437,16 @@ Pick one of these, and turn off the Claude Desktop scheduled task (`graph-dream-
 2. **Windows Task Scheduler.** Leave the profile off and run `.\scripts\register-dream-task.ps1 -At 22:47` from the graph-memory folder. The task runs `docker compose run --rm graph-dream node dist/dream-runner/index.js` daily and catches up after sleep.
 
 To try one run by hand: `docker compose run --rm graph-dream node dist/dream-runner/index.js` (add `--force` to run even when the quick check finds nothing).
+
+### Weekly maintenance
+
+The same runner can run `prompts/weekly-maintenance.md` with `--job weekly`, or on a schedule in the daemon with `DREAM_WEEKLY_SCHEDULE` (e.g. `Sun 06:00`; off by default). It differs from the nightly job in these ways:
+
+- It always runs; there's no pending check.
+- It gets `graph_export`, `graph_cypher` and `graph_prune`, which the prompt's backup, analysis and prune steps need. `graph_merge` stays hidden, since merging is the reviewer's call (rule 6). Override with `DREAM_WEEKLY_EXCLUDE_TOOLS`.
+- Its own budget, `DREAM_WEEKLY_MAX_COST_USD` (default $1.50). Past the wrap-up point the model is told not to run the prune execute step.
+- **No email.** Step 12 needs a shell, Python and `gws`, which the runner doesn't have, so the report is written to `logs/weekly-reports/` and the report notes that the email was skipped. Keep the Claude Code weekly task if you rely on the email.
+- The lock source is `api-runner-weekly`. In the daemon, when both jobs fall due together, the weekly runs first and the nightly right after.
 
 ### What stays on the subscription
 

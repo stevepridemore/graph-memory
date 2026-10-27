@@ -81,7 +81,7 @@ describe("pending work", () => {
   it("leaves sessions that changed in the last few minutes for next time", () => {
     const p = findPendingWork(graphHome, projectsDir, { activeMinutes: 30 });
     expect(p.transcripts).toEqual([]);
-    expect(p.skippedActive).toBe(2);
+    expect(p.skippedActive.sort()).toEqual(["s-new", "s-old"]);
   });
 
   it("puts the list in the kickoff message", () => {
@@ -181,6 +181,11 @@ describe("schedule and cost", () => {
     expect(nextRunAt("02:30", now)).toEqual(new Date(2026, 9, 27, 2, 30, 0));
     expect(nextRunAt("00:15", now)).toEqual(new Date(2026, 9, 28, 0, 15, 0));
     expect(() => nextRunAt("25:00", now)).toThrow();
+    // 2026-10-27 is a Tuesday.
+    expect(nextRunAt("Sun 06:00", now)).toEqual(new Date(2026, 10, 1, 6, 0, 0));
+    expect(nextRunAt("Tue 00:30", now)).toEqual(new Date(2026, 10, 3, 0, 30, 0));
+    expect(nextRunAt("Tue 01:30", now)).toEqual(new Date(2026, 9, 27, 1, 30, 0));
+    expect(() => nextRunAt("Xyz 01:00", now)).toThrow();
   });
 
   it("estimates cost from usage", () => {
@@ -243,6 +248,38 @@ describe("runDream loop", () => {
     expect(String(results[0].content)).toMatch(/over the 20 limit/);
     expect(calls[0].fallbacks).toBe("default");
     expect(calls[0].model).toBe("claude-opus-5-5");
+  });
+
+  it("runs the weekly job with its own tools and prompt, even with nothing pending", async () => {
+    let params: Record<string, unknown> | undefined;
+    const anthropic = {
+      beta: {
+        messages: {
+          create: async (p: Record<string, unknown>) => {
+            params = p;
+            return { stop_reason: "end_turn", content: [{ type: "text", text: "Done." }], usage: { input_tokens: 1, output_tokens: 1 } };
+          },
+        },
+      },
+    };
+    const fakeMcp = {
+      listTools: async () => ({
+        tools: ["graph_export", "graph_prune", "graph_cypher", "graph_merge", "graph_read_transcript"].map((name) => ({
+          name, description: name, inputSchema: { type: "object" },
+        })),
+      }),
+      callTool: async () => ({ content: [] }),
+      close: async () => {},
+    };
+    const settings = { ...loadSettings({}, []), roots: { graphHome, projectsDir: join(root, "no-projects") } };
+    const outcome = await runDream(settings, { anthropic: anthropic as never, connect: async () => fakeMcp as never }, "weekly");
+    expect(outcome).toBe("completed");
+    const names = (params!.tools as Array<{ name: string }>).map((t) => t.name);
+    expect(names).toEqual(expect.arrayContaining(["graph_export", "graph_prune", "graph_cypher"]));
+    expect(names).not.toContain("graph_merge");
+    expect(names).not.toContain("read_transcript");
+    expect(String(params!.system)).toContain("Step 12 (email) can't run here");
+    expect(String((params!.messages as Array<{ content: string }>)[0].content)).toContain("weekly graph maintenance");
   });
 
   it("makes no API call when nothing is pending", async () => {

@@ -3,8 +3,10 @@
 // Messages API with an Anthropic API key, instead of as a Claude Code
 // scheduled task on a claude.ai subscription.
 //
-//   node dist/dream-runner/index.js            # one run, then exit
-//   node dist/dream-runner/index.js --daemon   # run daily at DREAM_SCHEDULE
+//   node dist/dream-runner/index.js                # one nightly run, then exit
+//   node dist/dream-runner/index.js --job weekly   # one weekly maintenance run
+//   node dist/dream-runner/index.js --daemon       # nightly at DREAM_SCHEDULE,
+//                                                  # weekly at DREAM_WEEKLY_SCHEDULE
 //
 // The graph tools come from this repo's own MCP server, spawned over stdio as
 // a child process (the same way .mcp.json.example connects Claude Code), so it
@@ -37,8 +39,13 @@ export interface RunnerSettings {
   maxToolResultChars: number;
   fallbacks: boolean;
   schedule: string;
+  /** "Sun 06:00", or null when the weekly job is off. */
+  weeklySchedule: string | null;
+  weeklyMaxCostUsd: number;
   promptPath: string;
+  weeklyPromptPath: string;
   excludeTools: Set<string>;
+  weeklyExcludeTools: Set<string>;
   activeMinutes: number;
   roots: FileRoots;
   force: boolean;
@@ -50,6 +57,14 @@ export interface RunnerSettings {
 // ("" keeps all).
 const DEFAULT_EXCLUDED_TOOLS =
   "graph_cypher,graph_prune,graph_reembed,graph_export,graph_ingest,graph_unmerge,graph_read_transcript";
+
+// The weekly maintenance prompt needs graph_export (backup), graph_cypher
+// (stale/orphan/weak-cluster queries) and graph_prune (preview then execute),
+// so it gets its own list. Merging stays a human decision (prompt rule 6).
+const DEFAULT_WEEKLY_EXCLUDED_TOOLS =
+  "graph_reembed,graph_ingest,graph_unmerge,graph_merge,graph_read_transcript";
+
+const toolSet = (raw: string) => new Set(raw.split(",").map((t) => t.trim()).filter(Boolean));
 
 // Models whose server-side `fallbacks: "default"` mode is accepted.
 const FALLBACK_MODELS = new Set(["claude-fable-5-1", "claude-opus-5-5", "claude-opus-5", "claude-sonnet-5-5"]);
@@ -69,7 +84,11 @@ export function loadSettings(env: NodeJS.ProcessEnv = process.env, argv: string[
   };
   const fallbackSetting = env.DREAM_FALLBACKS?.trim().toLowerCase();
   const promptOverride = env.DREAM_PROMPT?.trim();
-  const hostPrompt = join(GRAPH_MEMORY_HOME, "prompts", "dream-nightly.md");
+  const promptFile = (name: string) => {
+    const host = join(GRAPH_MEMORY_HOME, "prompts", name);
+    return existsSync(host) ? host : join(here, "..", "..", "prompts", name);
+  };
+  const weekly = env.DREAM_WEEKLY_SCHEDULE?.trim() ?? "off";
   return {
     model,
     effort,
@@ -78,11 +97,13 @@ export function loadSettings(env: NodeJS.ProcessEnv = process.env, argv: string[
     maxToolResultChars: Math.floor(num("DREAM_MAX_TOOL_RESULT_CHARS", 40_000)),
     fallbacks: fallbackSetting === "off" ? false : FALLBACK_MODELS.has(model),
     schedule: env.DREAM_SCHEDULE?.trim() || "02:30",
-    excludeTools: new Set(
-      (env.DREAM_EXCLUDE_TOOLS ?? DEFAULT_EXCLUDED_TOOLS).split(",").map((t) => t.trim()).filter(Boolean),
-    ),
+    weeklySchedule: weekly === "" || weekly.toLowerCase() === "off" ? null : weekly,
+    weeklyMaxCostUsd: num("DREAM_WEEKLY_MAX_COST_USD", 1.5),
+    excludeTools: toolSet(env.DREAM_EXCLUDE_TOOLS ?? DEFAULT_EXCLUDED_TOOLS),
+    weeklyExcludeTools: toolSet(env.DREAM_WEEKLY_EXCLUDE_TOOLS ?? DEFAULT_WEEKLY_EXCLUDED_TOOLS),
     activeMinutes: env.DREAM_SKIP_ACTIVE_MINUTES?.trim() === "0" ? 0 : num("DREAM_SKIP_ACTIVE_MINUTES", 30),
-    promptPath: promptOverride || (existsSync(hostPrompt) ? hostPrompt : join(here, "..", "..", "prompts", "dream-nightly.md")),
+    promptPath: promptOverride || promptFile("dream-nightly.md"),
+    weeklyPromptPath: env.DREAM_WEEKLY_PROMPT?.trim() || promptFile("weekly-maintenance.md"),
     roots: {
       graphHome: GRAPH_MEMORY_HOME,
       projectsDir: env.DREAM_PROJECTS_DIR?.trim() || join(homedir(), ".claude", "projects"),
@@ -161,8 +182,28 @@ export function kickoffMessage(started: Date, pending: PendingWork): string {
   ].join("\n");
 }
 
-export function buildSystemPrompt(promptPath: string): string {
-  return readFileSync(promptPath, "utf-8") + RUNNER_NOTES;
+const WEEKLY_RUNNER_NOTES = `
+
+---
+
+## Runner notes (API-key runner)
+
+You are running from the standalone runner, not from Claude Code. Nobody is watching this run, so don't ask questions: follow the prompt's rules and put anything doubtful under "Action Required" in the report.
+
+- **Tools.** The graph tools are the graph-memory MCP tools. For files you have list_dir, stat_file, read_file, write_file, move_file and delete_file, under ~/graph-memory. There is no shell.
+- **Lock.** The runner has already acquired ~/graph-memory/processed/dream.lock and releases it after you finish, so skip creating it in Step 0 and deleting it in Step 13. Every other step, including the backup-first and prune sanity-check rules, applies as written.
+- **Appending to a log** (weekly-maintenance.log, weekly-maintenance-errors.log): read the file, then write it back with your line added. If it doesn't exist yet, create it.
+- **Step 8.** manifest.json and dream-audit.jsonl are large. Read the start of the manifest for last_dream_run, and read only the last part of dream-audit.jsonl: stat_file it, then read_file with an offset near the end.
+- **Step 12 (email) can't run here:** there is no shell, Python or gws. Skip it, and add a line to the report's Notes saying the email was skipped because the API runner can't send mail, so the report is only on disk.
+- **Large results.** A tool result over the size limit is saved to a file and you get the start of it plus the path. Read the rest with read_file and an offset.
+- **Budget.** If a message tells you the run's budget is spent, skip any remaining analysis, write the report with what you have (say what was skipped), and stop. Never run the prune execute step after that message.
+- **Finish** with a short plain-text summary of what the run did. That ends the run.
+`;
+
+export type JobName = "nightly" | "weekly";
+
+export function buildSystemPrompt(promptPath: string, job: JobName = "nightly"): string {
+  return readFileSync(promptPath, "utf-8") + (job === "weekly" ? WEEKLY_RUNNER_NOTES : RUNNER_NOTES);
 }
 
 // ─── Logging ───
@@ -240,26 +281,38 @@ export interface RunnerDeps {
   connect?: () => Promise<Client>;
 }
 
-export async function runDream(settings: RunnerSettings, deps: RunnerDeps = {}): Promise<RunOutcome> {
+export async function runDream(
+  settings: RunnerSettings,
+  deps: RunnerDeps = {},
+  job: JobName = "nightly",
+): Promise<RunOutcome> {
   const started = new Date();
-  const runId = stamp(started);
+  const runId = job === "weekly" ? `${stamp(started)}-weekly` : stamp(started);
   const logDir = join(settings.roots.graphHome, "logs", "dream-runner");
   const log = makeLogger(join(logDir, `${runId}.log`));
+  const weekly = job === "weekly";
+  const maxCostUsd = weekly ? settings.weeklyMaxCostUsd : settings.maxCostUsd;
+  const excludeTools = weekly ? settings.weeklyExcludeTools : settings.excludeTools;
 
-  const pending = findPendingWork(settings.roots.graphHome, settings.roots.projectsDir, {
-    activeMinutes: settings.activeMinutes,
-  });
-  if (totalPending(pending) === 0 && !settings.force) {
-    log("nothing pending; no API call made");
-    return "nothing_pending";
+  // The weekly job always runs; the nightly only when there's something new.
+  const pending = weekly
+    ? null
+    : findPendingWork(settings.roots.graphHome, settings.roots.projectsDir, { activeMinutes: settings.activeMinutes });
+  if (pending) {
+    if (totalPending(pending) === 0 && !settings.force) {
+      log("nothing pending; no API call made");
+      return "nothing_pending";
+    }
+    log(
+      `pending: ${pending.newTranscripts} new, ${pending.grownTranscripts} grown transcripts, ${pending.ingestFiles} ingest files` +
+        (pending.skippedActive.length
+          ? ` (still active, left for next run: ${pending.skippedActive.join(", ")})`
+          : ""),
+    );
   }
-  log(
-    `pending: ${pending.newTranscripts} new, ${pending.grownTranscripts} grown transcripts, ${pending.ingestFiles} ingest files` +
-      (pending.skippedActive ? ` (${pending.skippedActive} still active, left for next run)` : ""),
-  );
 
   mkdirSync(join(homedir(), "graph-memory", "processed"), { recursive: true });
-  if (!acquireLock("api-runner")) {
+  if (!acquireLock(weekly ? "api-runner-weekly" : "api-runner")) {
     log("dream.lock is held by another run; exiting");
     return "locked";
   }
@@ -273,15 +326,25 @@ export async function runDream(settings: RunnerSettings, deps: RunnerDeps = {}):
   try {
     const client = deps.anthropic ?? new Anthropic({ apiKey: resolveApiKey(), maxRetries: 4 });
     mcp = await (deps.connect ?? connectGraphServer)();
-    const tools = [...(await graphTools(mcp, settings.excludeTools)), ...FILE_TOOLS, ...TRANSCRIPT_TOOLS];
-    const transcriptTools = new TranscriptTools(pending.transcripts, settings.roots.graphHome, Math.floor(settings.maxToolResultChars * 0.75));
-    log(`model=${settings.model} effort=${settings.effort} tools=${tools.length} budget=$${settings.maxCostUsd}`);
+    const tools = [
+      ...(await graphTools(mcp, excludeTools)),
+      ...FILE_TOOLS,
+      ...(weekly ? [] : TRANSCRIPT_TOOLS),
+    ];
+    const transcriptTools = new TranscriptTools(
+      pending?.transcripts ?? [],
+      settings.roots.graphHome,
+      Math.floor(settings.maxToolResultChars * 0.75),
+    );
+    log(`job=${job} model=${settings.model} effort=${settings.effort} tools=${tools.length} budget=$${maxCostUsd}`);
 
-    const system = buildSystemPrompt(settings.promptPath);
+    const system = buildSystemPrompt(weekly ? settings.weeklyPromptPath : settings.promptPath, job);
     const messages: Anthropic.Beta.BetaMessageParam[] = [
       {
         role: "user",
-        content: kickoffMessage(started, pending),
+        content: pending
+          ? kickoffMessage(started, pending)
+          : `Run the weekly graph maintenance now. Current time: ${started.toISOString()}.`,
       },
     ];
 
@@ -342,25 +405,25 @@ export async function runDream(settings: RunnerSettings, deps: RunnerDeps = {}):
         break;
       }
 
-      if (cost >= settings.maxCostUsd * 1.5) {
-        log(`estimated cost passed 1.5x the $${settings.maxCostUsd} budget during wrap-up; stopping`);
+      if (cost >= maxCostUsd * 1.5) {
+        log(`estimated cost passed 1.5x the $${maxCostUsd} budget during wrap-up; stopping`);
         outcome = "budget_stopped";
         break;
       }
 
       const results: Anthropic.Beta.BetaContentBlockParam[] = [];
       for (const use of toolUses) {
-        results.push(await runTool(use, mcp, transcriptTools, settings, spillDir));
+        results.push(await runTool(use, mcp, transcriptTools, settings, excludeTools, spillDir));
       }
       // Wrap-up starts at 80% so the closing turns (changelog, audit) land
       // near the budget rather than well past it.
-      if (!wrapUpSent && cost >= settings.maxCostUsd * 0.8) {
+      if (!wrapUpSent && cost >= maxCostUsd * 0.8) {
         wrapUpSent = true;
         turnLimit = turns + 20;
-        log(`80% of the $${settings.maxCostUsd} budget used; asking the model to wrap up`);
+        log(`80% of the $${maxCostUsd} budget used; asking the model to wrap up`);
         results.push({
           type: "text",
-          text: `Runner: this run's budget ($${settings.maxCostUsd}) is spent. Wrap up now as the Runner notes describe.`,
+          text: `Runner: this run's budget ($${maxCostUsd}) is spent. Wrap up now as the Runner notes describe.`,
         });
       }
       messages.push({ role: "user", content: results });
@@ -399,6 +462,7 @@ async function runTool(
   mcp: Client,
   transcriptTools: TranscriptTools,
   settings: RunnerSettings,
+  excludeTools: Set<string>,
   spillDir: string,
 ): Promise<Anthropic.Beta.BetaToolResultBlockParam> {
   const input = (use.input ?? {}) as Record<string, unknown>;
@@ -409,7 +473,7 @@ async function runTool(
       text = runFileTool(use.name, input, settings.roots);
     } else if (TRANSCRIPT_TOOL_NAMES.has(use.name)) {
       text = transcriptTools.run(use.name, input);
-    } else if (settings.excludeTools.has(use.name)) {
+    } else if (excludeTools.has(use.name)) {
       throw new Error(`${use.name} is not available to the dream runner`);
     } else {
       const result = await mcp.callTool({ name: use.name, arguments: input });
@@ -437,14 +501,22 @@ async function runTool(
 
 // ─── Daemon ───
 
+const DAYS = ["sun", "mon", "tue", "wed", "thu", "fri", "sat"];
+
+/**
+ * Next time a schedule fires after `now`. "HH:MM" is daily; "Sun 06:00"
+ * (any three-letter day) is weekly. Local time, so set TZ.
+ */
 export function nextRunAt(schedule: string, now = new Date()): Date {
-  const m = /^(\d{1,2}):(\d{2})$/.exec(schedule);
-  if (!m || Number(m[1]) > 23 || Number(m[2]) > 59) {
-    throw new Error(`DREAM_SCHEDULE must be HH:MM in 24-hour local time (got ${schedule})`);
+  const m = /^(?:([A-Za-z]{3})\s+)?(\d{1,2}):(\d{2})$/.exec(schedule.trim());
+  const day = m?.[1] ? DAYS.indexOf(m[1].toLowerCase()) : -1;
+  if (!m || Number(m[2]) > 23 || Number(m[3]) > 59 || (m[1] && day < 0)) {
+    throw new Error(`schedule must be HH:MM or "Sun HH:MM" in 24-hour local time (got ${schedule})`);
   }
   const next = new Date(now);
-  next.setHours(Number(m[1]), Number(m[2]), 0, 0);
-  if (next.getTime() <= now.getTime()) next.setDate(next.getDate() + 1);
+  next.setHours(Number(m[2]), Number(m[3]), 0, 0);
+  if (day >= 0) next.setDate(next.getDate() + ((day - next.getDay() + 7) % 7));
+  if (next.getTime() <= now.getTime()) next.setDate(next.getDate() + (day >= 0 ? 7 : 1));
   return next;
 }
 
@@ -455,18 +527,28 @@ async function daemon(settings: RunnerSettings): Promise<void> {
   process.on("SIGTERM", stop);
   process.on("SIGINT", stop);
 
+  // Each job keeps its own next slot, so when both fall due together the
+  // second still runs after the first finishes instead of being skipped.
+  const due = new Map<JobName, Date>([["nightly", nextRunAt(settings.schedule)]]);
+  if (settings.weeklySchedule) due.set("weekly", nextRunAt(settings.weeklySchedule));
+
   while (!stopping) {
-    const at = nextRunAt(settings.schedule);
-    console.error(`[dream-runner] next run at ${at.toString()}`);
-    await new Promise<void>((resolve) => {
-      wake = resolve;
-      // Re-check at least hourly so clock or DST changes can't strand it.
-      setTimeout(resolve, Math.min(at.getTime() - Date.now(), 60 * 60 * 1000));
-    });
-    wake = null;
+    // Weekly first when both are due: it backs up before the nightly writes.
+    const [job, at] = [...due.entries()].sort((a, b) => a[1].getTime() - b[1].getTime() || (a[0] === "weekly" ? -1 : 1))[0];
+    console.error(`[dream-runner] next: ${job} at ${at.toString()}`);
+    const waitMs = at.getTime() - Date.now();
+    if (waitMs > 0) {
+      await new Promise<void>((resolve) => {
+        wake = resolve;
+        // Re-check at least hourly so clock or DST changes can't strand it.
+        setTimeout(resolve, Math.min(waitMs, 60 * 60 * 1000));
+      });
+      wake = null;
+      continue;
+    }
     if (stopping) break;
-    if (Date.now() < at.getTime()) continue;
-    await runDream(settings).catch((err) => console.error(`[dream-runner] run failed: ${err}`));
+    await runDream(settings, {}, job).catch((err) => console.error(`[dream-runner] ${job} run failed: ${err}`));
+    due.set(job, nextRunAt(job === "weekly" ? settings.weeklySchedule! : settings.schedule, at));
   }
 }
 
@@ -475,10 +557,15 @@ async function daemon(settings: RunnerSettings): Promise<void> {
 const isMain = process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1];
 if (isMain) {
   const settings = loadSettings();
+  const jobArg = process.argv[process.argv.indexOf("--job") + 1];
+  if (process.argv.includes("--job") && jobArg !== "nightly" && jobArg !== "weekly") {
+    throw new Error(`--job must be nightly or weekly (got ${jobArg})`);
+  }
+  const job: JobName = jobArg === "weekly" && process.argv.includes("--job") ? "weekly" : "nightly";
   if (process.argv.includes("--daemon")) {
     await daemon(settings);
   } else {
-    const outcome = await runDream(settings);
+    const outcome = await runDream(settings, {}, job);
     process.exit(outcome === "error" || outcome === "refused" ? 1 : 0);
   }
 }

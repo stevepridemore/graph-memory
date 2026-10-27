@@ -43,8 +43,8 @@ export interface PendingWork {
   /** Oldest first. */
   transcripts: PendingTranscript[];
   ingest: string[];
-  /** Transcripts left for next time because they changed in the last few minutes. */
-  skippedActive: number;
+  /** Session ids left for next time because they changed in the last few minutes. */
+  skippedActive: string[];
 }
 
 export function totalPending(p: PendingWork): number {
@@ -78,7 +78,7 @@ export function findPendingWork(
     ingestFiles: 0,
     transcripts: [],
     ingest: [],
-    skippedActive: 0,
+    skippedActive: [],
   };
 
   let projectDirs: string[] = [];
@@ -114,7 +114,7 @@ export function findPendingWork(
       // A session still being written (this one, a live Remote Control
       // session) is picked up next time, once it's settled.
       if (activeMs > 0 && now - st.mtimeMs < activeMs) {
-        result.skippedActive++;
+        result.skippedActive.push(sessionId);
         continue;
       }
 
