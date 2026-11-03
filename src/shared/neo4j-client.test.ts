@@ -733,6 +733,56 @@ describe("Contradictions edge cases", () => {
     expect(result.count).toBe(0);
   });
 
+  it("treats a CONTRADICTS edge with no resolved flag as unresolved", async () => {
+    await client.createRelationship(T, "fact-vue", "fact-react", "CONTRADICTS", 1.0, {
+      description: "Tech stack conflict",
+    });
+    // Recreate an edge written before the flag was always set.
+    await client.removeEdgeProperty(T, "fact-vue", "fact-react", "CONTRADICTS", "resolved");
+    await client.removeEdgeProperty(T, "fact-vue", "fact-react", "CONTRADICTS", "detected_date");
+
+    const result = await client.findContradictions(T);
+    expect(result.count).toBe(1);
+    expect(result.contradictions[0].resolved).toBe(false);
+    expect(result.contradictions[0].detected_date).not.toBe("");
+
+    const stats = await client.getStats(T);
+    expect(stats.health.unresolved_contradictions).toBe(1);
+  });
+
+  it("fills resolved=false and detected_date when a CONTRADICTS edge is written without them", async () => {
+    await client.createRelationship(T, "fact-vue", "fact-react", "CONTRADICTS", 0.5);
+
+    const edges = await client.getRelationships(T, "fact-vue", "out");
+    const edge = edges.find((e) => e.type === "CONTRADICTS");
+    expect(edge?.properties["resolved"]).toBe(false);
+    expect(edge?.properties["detected_date"]).toBeDefined();
+
+    const result = await client.findContradictions(T);
+    expect(result.count).toBe(1);
+  });
+
+  it("fills the CONTRADICTS defaults in batch mode too", async () => {
+    await client.batchRelate(T, {
+      entities: [],
+      relations: [{ from: "fact-vue", to: "fact-react", relation: "CONTRADICTS", weight: 0.5 }],
+    });
+    const result = await client.findContradictions(T);
+    expect(result.count).toBe(1);
+    expect(result.contradictions[0].resolved).toBe(false);
+  });
+
+  it("does not reopen a resolved contradiction when it is asserted again", async () => {
+    await client.createRelationship(T, "fact-vue", "fact-react", "CONTRADICTS", 1.0, {
+      description: "Tech stack conflict",
+      resolved: true,
+    });
+    await client.createRelationship(T, "fact-vue", "fact-react", "CONTRADICTS", 1.0);
+
+    expect((await client.findContradictions(T)).count).toBe(0);
+    expect((await client.findContradictions(T, true)).contradictions[0].resolved).toBe(true);
+  });
+
   it("surfaces resolved contradictions when include_resolved=true", async () => {
     await client.createRelationship(T, "fact-vue", "fact-react", "CONTRADICTS", 1.0, {
       description: "Tech stack conflict",

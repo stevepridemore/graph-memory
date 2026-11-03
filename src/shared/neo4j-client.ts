@@ -169,6 +169,14 @@ function recordToEdge(
 
 // ─── Neo4jClient ───
 
+/** Fills the review fields on a CONTRADICTS edge when the writer left them
+ *  out, so the edge is always visible to findContradictions() and getStats().
+ *  coalesce keeps any value already on the edge, so re-asserting a resolved
+ *  contradiction does not reopen it. Expects `r` and `$now` in scope. */
+const CONTRADICTS_DEFAULTS =
+  "SET r.resolved = coalesce(r.resolved, false), " +
+  "r.detected_date = coalesce(r.detected_date, datetime($now))";
+
 export class Neo4jClient {
   private driver: Driver;
   private database: string;
@@ -354,6 +362,23 @@ export class Neo4jClient {
       `MATCH (a:Entity {tenant_id: $tenantId, id: $fromId})-[r:\`${rel}\`]->(b:Entity {tenant_id: $tenantId, id: $toId})
        SET r.invalid_at = datetime($isoString)`,
       { tenantId, fromId, toId, isoString },
+    );
+  }
+
+  /** Remove one property from an edge. Used to recreate edges written
+   *  before a property was always set (e.g. CONTRADICTS without `resolved`). */
+  async removeEdgeProperty(
+    tenantId: string,
+    fromId: string,
+    toId: string,
+    relation: RelationshipType,
+    property: "resolved" | "detected_date" | "description",
+  ): Promise<void> {
+    const rel = existingRelation(relation);
+    await this.run(
+      `MATCH (a:Entity {tenant_id: $tenantId, id: $fromId})-[r:\`${rel}\`]->(b:Entity {tenant_id: $tenantId, id: $toId})
+       REMOVE r.\`${property}\``,
+      { tenantId, fromId, toId },
     );
   }
 
@@ -615,6 +640,7 @@ export class Neo4jClient {
     // applies to verbs like FAMILY_OF, where dating one child's birth must not
     // retire every other child.
     const supersede = validAtChecked !== null && isSupersedable(rel.value);
+    const contradictsDefaults = rel.value === "CONTRADICTS" ? CONTRADICTS_DEFAULTS : "";
     const supersedeAt = validAtChecked ?? now;
     const { clean } = sanitizeProperties(properties, "edge");
     const allProps = {
@@ -666,6 +692,7 @@ export class Neo4jClient {
         r.valid_at = CASE WHEN $validAt IS NOT NULL THEN datetime($validAt) ELSE r.valid_at END,
         r += $allProps
       WITH r, a, b
+      ${contradictsDefaults}
       SET r.proposed_relations = CASE
         WHEN $proposed IS NULL THEN r.proposed_relations
         WHEN $proposed IN coalesce(r.proposed_relations, []) THEN r.proposed_relations
@@ -1021,16 +1048,22 @@ export class Neo4jClient {
     }>;
     count: number;
   }> {
-    const resolvedFilter = includeResolved ? "" : "AND r.resolved = false";
+    // A CONTRADICTS edge written without `resolved` is unresolved. Matching
+    // only `r.resolved = false` hid every such edge, so the check reported 0
+    // while real contradictions sat in the graph.
+    const resolvedFilter = includeResolved ? "" : "AND coalesce(r.resolved, false) = false";
     const rows = await this.run(
       `
       MATCH (a:Entity {tenant_id: $tenantId})-[r:CONTRADICTS]->(b:Entity {tenant_id: $tenantId})
       WHERE 1=1 ${resolvedFilter}
       RETURN a.id AS aId, labels(a) AS aLabels, a.name AS aName,
              b.id AS bId, labels(b) AS bLabels, b.name AS bName,
-             r.description AS description, r.detected_date AS detected_date,
-             r.resolved AS resolved
-      ORDER BY r.detected_date DESC
+             r.description AS description,
+             coalesce(r.detected_date, r.ingested_at) AS detected_date,
+             coalesce(r.resolved, false) AS resolved
+      // Older writers stored detected_date as an ISO string, newer edges get a
+      // datetime. toString() puts both on one ISO-ordered scale.
+      ORDER BY toString(coalesce(r.detected_date, r.ingested_at)) DESC
       `,
       { tenantId },
     );
@@ -1360,6 +1393,7 @@ export class Neo4jClient {
             r.valid_at = CASE WHEN $validAt IS NOT NULL THEN datetime($validAt) ELSE r.valid_at END,
             r += $props
           WITH r
+          ${rel.relation === "CONTRADICTS" ? CONTRADICTS_DEFAULTS : ""}
           SET r.proposed_relations = CASE
             WHEN $proposed IS NULL THEN r.proposed_relations
             WHEN $proposed IN coalesce(r.proposed_relations, []) THEN r.proposed_relations
@@ -1462,7 +1496,7 @@ export class Neo4jClient {
       WHERE NOT (orphan)-[]-()
       WITH avgWeight, count(orphan) AS orphanCount
       OPTIONAL MATCH (a2:Entity {tenant_id: $tenantId})-[c:CONTRADICTS]->(b2:Entity {tenant_id: $tenantId})
-      WHERE c.resolved = false
+      WHERE coalesce(c.resolved, false) = false
       WITH avgWeight, orphanCount, count(c) AS contradictions
       OPTIONAL MATCH (stale:Entity {tenant_id: $tenantId})
       WHERE stale.confidence < 0.2 AND stale.last_seen < datetime() - duration('P90D')
