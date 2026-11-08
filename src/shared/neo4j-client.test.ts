@@ -733,6 +733,20 @@ describe("Contradictions edge cases", () => {
     expect(result.count).toBe(0);
   });
 
+  it("treats a CONTRADICTS edge with no resolved property as unresolved", async () => {
+    await client.createRelationship(T, "fact-vue", "fact-react", "CONTRADICTS", 1.0, {
+      description: "Tech stack conflict, resolved never set",
+      detected_date: new Date().toISOString(),
+    });
+
+    const result = await client.findContradictions(T);
+    expect(result.count).toBe(1);
+    expect(result.contradictions[0].resolved).toBe(false);
+
+    const stats = await client.getStats(T);
+    expect(stats.health.unresolved_contradictions).toBe(1);
+  });
+
   it("surfaces resolved contradictions when include_resolved=true", async () => {
     await client.createRelationship(T, "fact-vue", "fact-react", "CONTRADICTS", 1.0, {
       description: "Tech stack conflict",

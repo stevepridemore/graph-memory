@@ -1021,7 +1021,7 @@ export class Neo4jClient {
     }>;
     count: number;
   }> {
-    const resolvedFilter = includeResolved ? "" : "AND r.resolved = false";
+    const resolvedFilter = includeResolved ? "" : "AND coalesce(r.resolved, false) = false";
     const rows = await this.run(
       `
       MATCH (a:Entity {tenant_id: $tenantId})-[r:CONTRADICTS]->(b:Entity {tenant_id: $tenantId})
@@ -1462,7 +1462,7 @@ export class Neo4jClient {
       WHERE NOT (orphan)-[]-()
       WITH avgWeight, count(orphan) AS orphanCount
       OPTIONAL MATCH (a2:Entity {tenant_id: $tenantId})-[c:CONTRADICTS]->(b2:Entity {tenant_id: $tenantId})
-      WHERE c.resolved = false
+      WHERE coalesce(c.resolved, false) = false
       WITH avgWeight, orphanCount, count(c) AS contradictions
       OPTIONAL MATCH (stale:Entity {tenant_id: $tenantId})
       WHERE stale.confidence < 0.2 AND stale.last_seen < datetime() - duration('P90D')
