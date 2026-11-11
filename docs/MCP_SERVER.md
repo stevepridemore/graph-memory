@@ -446,7 +446,7 @@ For `queue`, give either `file_path` (a file on the server, copied into `pending
 ```
 
 **Behavior:**
-Runs one Cypher statement per node type in `config.decay.rates`, then one for edges. Only these types decay: Person, Project, Preference, Concept, Decision, Fact, Event, Object. `Reasoning` and the other types have no rate and never decay. Nodes and edges with `subtype: 'rule'` on either end are exempt.
+Runs one Cypher statement per node type in `config.decay.rates`, then one for edges. Only these types decay: Person, Project, Preference, Concept, Decision, Fact, Event, Object. `Reasoning` and the other types have no rate and never decay. Nodes and edges with `subtype: 'rule'` on either end are exempt. Nodes with `pinned: true` (any type) are also exempt from decay, so long-lived infrastructure doesn't fade just because it stops coming up; their edges still decay.
 
 Decay is measured from the later of `last_seen` (for edges, `last_confirmed`) and `last_decayed`. Each run stamps `last_decayed`, so repeated runs do not compound. The exponent is whole elapsed days. Confidence and weight are floored at 0.01.
 
@@ -489,7 +489,7 @@ RETURN count(n) AS decayed
 
 - `mode: "preview"` (default) — returns what would be pruned without deleting anything.
 - `mode: "execute"` — actually deletes. Requires explicit confirmation from the user (Claude should ask before calling with execute).
-- Rules are exempt in both modes: an edge touching a `subtype: "rule"` node on either side is never listed or deleted, and rule nodes are never pruned. Before v0.6.0, execute dropped the edge exemption, so it could delete a weak edge on a rule that the preview had listed as kept.
+- Rules are exempt in both modes: an edge touching a `subtype: "rule"` node on either side is never listed or deleted, and rule nodes are never pruned. Nodes with `pinned: true` are never pruned either. Before v0.6.0, execute dropped the edge exemption, so it could delete a weak edge on a rule that the preview had listed as kept.
 - `node_threshold` — prune nodes with confidence below this AND no edges with weight at or above `edge_threshold`. Defaults to config value (`decay.prune_node_threshold`).
 - `edge_threshold` — prune edges with weight below this. Defaults to config value (`decay.prune_edge_threshold`).
 - `include_orphans` (default `true`) also prunes nodes with zero edges, `confidence` at or above `node_threshold`, and `last_seen` older than `max_age_days`.
