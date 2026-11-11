@@ -119,9 +119,10 @@ ORDER BY r.weight DESC LIMIT 30
 ### T7 — Contradictions
 ```cypher
 MATCH (a:Entity)-[r:CONTRADICTS]->(b:Entity)
-WHERE r.resolved = false
-RETURN a.name AS entity_a, b.name AS entity_b, r.properties.description AS conflict, r.properties.detected_date AS detected
-ORDER BY r.properties.detected_date DESC LIMIT 20
+WHERE coalesce(r.resolved, false) = false
+RETURN a.name AS entity_a, b.name AS entity_b, r.description AS conflict,
+       coalesce(r.detected_date, r.ingested_at) AS detected
+ORDER BY toString(detected) DESC LIMIT 20
 ```
 *Use for: "what contradictions exist?", "conflicting facts"*
 
