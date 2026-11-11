@@ -635,7 +635,7 @@ Nodes are flagged for pruning (and eligible for `graph_prune`) when:
 - `confidence < prune_node_threshold` (0.1) AND no relationship has a weight at or above `prune_edge_threshold` (0.05), **OR**
 - Zero edges (orphaned) AND `last_seen` older than `prune_orphan_days` (default: 30 days) AND `confidence` at or above the node threshold
 
-Nodes with `subtype: 'rule'` are never flagged.
+Nodes with `subtype: 'rule'` or `pinned: true` are never flagged.
 
 Flagged nodes appear in dream changelogs. Actual deletion requires `graph_prune` with explicit user confirmation — never auto-deleted.
 

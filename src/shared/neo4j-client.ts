@@ -1133,7 +1133,7 @@ export class Neo4jClient {
         const rows = await this.run(
           `
           MATCH (n:\`${type}\` {tenant_id: $tenantId})
-          WHERE (n.subtype IS NULL OR n.subtype <> 'rule')
+          WHERE (n.subtype IS NULL OR n.subtype <> 'rule') AND coalesce(n.pinned, false) = false
           ${nodeBase}
           RETURN count(n) AS count
           `,
@@ -1146,7 +1146,7 @@ export class Neo4jClient {
         const rows = await this.run(
           `
           MATCH (n:\`${type}\` {tenant_id: $tenantId})
-          WHERE (n.subtype IS NULL OR n.subtype <> 'rule')
+          WHERE (n.subtype IS NULL OR n.subtype <> 'rule') AND coalesce(n.pinned, false) = false
           ${nodeBase}
           WITH n, n.confidence * ($rate ^ duration.inDays(base_ts, datetime()).days) AS new_conf
           SET n.confidence = CASE WHEN new_conf < 0.01 THEN 0.01 ELSE new_conf END,
@@ -1190,7 +1190,7 @@ export class Neo4jClient {
       `
       MATCH (n:Entity {tenant_id: $tenantId})
       WHERE n.confidence < $threshold
-        AND (n.subtype IS NULL OR n.subtype <> 'rule')
+        AND (n.subtype IS NULL OR n.subtype <> 'rule') AND coalesce(n.pinned, false) = false
       OPTIONAL MATCH (n)-[r]-(other:Entity {tenant_id: $tenantId})
       WITH n, max(r.weight) AS max_edge_weight
       WHERE max_edge_weight IS NULL OR max_edge_weight < $edgeThreshold
@@ -1549,7 +1549,7 @@ export class Neo4jClient {
       `
       MATCH (n:Entity {tenant_id: $tenantId})
       WHERE n.confidence < $nodeThreshold
-        AND (n.subtype IS NULL OR n.subtype <> 'rule')
+        AND (n.subtype IS NULL OR n.subtype <> 'rule') AND coalesce(n.pinned, false) = false
       OPTIONAL MATCH (n)-[r]-(other:Entity {tenant_id: $tenantId})
       WITH n, labels(n) AS labels, max(r.weight) AS maxEdge
       WHERE maxEdge IS NULL OR maxEdge < $edgeThreshold
@@ -1571,7 +1571,7 @@ export class Neo4jClient {
         WHERE NOT (n)-[]-()
           AND n.last_seen < datetime() - duration({days: $maxAgeDays})
           AND n.confidence >= $nodeThreshold
-          AND (n.subtype IS NULL OR n.subtype <> 'rule')
+          AND (n.subtype IS NULL OR n.subtype <> 'rule') AND coalesce(n.pinned, false) = false
         RETURN n.id AS id, n.name AS name,
                [l IN labels(n) WHERE l <> 'Entity'][0] AS type,
                n.confidence AS confidence

@@ -18,6 +18,11 @@ init Cypher, example queries) see
 - All nodes share these common properties: `id`, `name`, `subtype`,
   `confidence` (0.0–1.0), `times_mentioned`, `first_seen`, `last_seen`,
   `tenant_id`, optionally `embedding` (384-dim).
+- Set `pinned: true` on a node that should keep its confidence even when
+  it stops coming up in conversation (long-lived infrastructure, core
+  tools). Pinned nodes skip decay and are never pruned; their edges still
+  decay normally. Set it through `graph_relate` batch-mode entity
+  `properties`.
 
 ## Status legend
 

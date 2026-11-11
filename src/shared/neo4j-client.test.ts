@@ -605,6 +605,22 @@ describe("Decay", () => {
     expect(e!.confidence).toBe(0.01);
   });
 
+  it("leaves pinned nodes alone in decay and prune", async () => {
+    await client.createEntity(T, "Object", "nas", "NAS", { pinned: true }, 0.05);
+    await client.createEntity(T, "Object", "old-box", "Old Box", {}, 0.05);
+    await client.setNodeLastSeen(T, "nas", 60);
+    await client.setNodeLastSeen(T, "old-box", 60);
+
+    await client.applyDecay(T);
+    expect((await client.getEntity(T, "nas"))!.confidence).toBe(0.05);
+    expect((await client.getEntity(T, "old-box"))!.confidence).toBeLessThan(0.05);
+
+    const preview = await client.prune(T, "preview", { include_orphans: false });
+    const ids = preview.details.map((d) => d.id);
+    expect(ids).toContain("old-box");
+    expect(ids).not.toContain("nas");
+  });
+
   it("does not decay nodes seen within the last day", async () => {
     // Fresh node — no last_seen backdating. Decay should leave it alone.
     await client.createEntity(T, "Person", "fresh", "Fresh Person", {}, 0.7);
