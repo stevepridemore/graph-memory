@@ -1,8 +1,8 @@
-﻿# Graph Memory System â€” Dream Process Design
+# Graph Memory System — Dream Process Design
 
 ## Overview
 
-The dream process is a **Claude Code scheduled task** that reads conversation transcripts, extracts entities and relationships, and updates the graph. It runs AS a Claude Code session â€” meaning Claude itself does the extraction and reasoning, covered by the Max plan. **No separate API key needed.** This is the default path. An optional [API-key runner](#api-key-runner) runs the same prompt through the Messages API instead.
+The dream process is a **Claude Code scheduled task** that reads conversation transcripts, extracts entities and relationships, and updates the graph. It runs AS a Claude Code session — meaning Claude itself does the extraction and reasoning, covered by the Max plan. **No separate API key needed.** This is the default path. An optional [API-key runner](#api-key-runner) runs the same prompt through the Messages API instead.
 
 ## Key Architectural Decision
 
@@ -21,18 +21,18 @@ The [API-key runner](#api-key-runner) is the opt-in exception. It runs the same 
 Stored at `~/.claude/scheduled-tasks/graph-dream-nightly/SKILL.md`. Configured via Claude Desktop's Schedule UI or by asking Claude to schedule it. The SKILL.md file contains the prompt; the schedule (time, recurrence) is set in the Desktop UI. See the full prompt later in this document.
 
 1. Claude reads `~/graph-memory/processed/manifest.json`
-2. If no unprocessed transcripts or ingest docs â†’ exit early
-3. If pending â†’ run full dream pipeline
+2. If no unprocessed transcripts or ingest docs → exit early
+3. If pending → run full dream pipeline
 
 ### Fallback: SessionStart Hook
 ```
 On every Claude Code session start:
   node check-pending.js
-    â†’ Reads manifest.json (< 1ms)
-    â†’ Checks ingest/pending/ folder
-    â†’ If nothing new â†’ exit (< 2 seconds)
-    â†’ If pending AND last dream > 4 hours ago â†’ outputs reminder
-    â†’ (Does NOT run extraction â€” just alerts)
+    → Reads manifest.json (< 1ms)
+    → Checks ingest/pending/ folder
+    → If nothing new → exit (< 2 seconds)
+    → If pending AND last dream > 4 hours ago → outputs reminder
+    → (Does NOT run extraction — just alerts)
 ```
 
 The hook is a lightweight Node.js script that checks file timestamps. No LLM call. It can output a notice that pending work exists, prompting the user to run `/graph-dream` if they want immediate processing.
@@ -53,12 +53,12 @@ Claude Code stores full conversation transcripts locally:
 ```
 
 Each JSONL line is a JSON object with fields including:
-- `type` â€” message type
-- `message` â€” content with role
-- `timestamp` â€” when it occurred
-- `sessionId` â€” UUID
-- `cwd` â€” working directory (provides project context)
-- `model` â€” which model was used
+- `type` — message type
+- `message` — content with role
+- `timestamp` — when it occurred
+- `sessionId` — UUID
+- `cwd` — working directory (provides project context)
+- `model` — which model was used
 
 **Chunking for large transcripts:** Long sessions (100k+ tokens) need to be processed in chunks. The dream prompt instructs Claude to:
 1. Read the first N lines of a JSONL file
@@ -74,12 +74,12 @@ The cloud-session collector bridges the gap. It is a recurring scheduled task th
 
 ```
 cloud collector (scheduled, in a Project thread)
-  â”œâ”€â”€ list_thread_sessions / fetch_thread    â† this Project's threads
-  â”œâ”€â”€ fetch_project_timeline                 â† this Project's coordinator
-  â”œâ”€â”€ list_sessions / list_events            â† other cloud sessions
-  â””â”€â”€ graph_ingest queue (content + meta)    â†’ Graph-Memory connector â†’ ingest/pending/ at home
-                                                        â”‚
-nightly dream (home machine) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”˜ Step 5b, extracted as conversation
+  ├── list_thread_sessions / fetch_thread    ← this Project's threads
+  ├── fetch_project_timeline                 ← this Project's coordinator
+  ├── list_sessions / list_events            ← other cloud sessions
+  └── graph_ingest queue (content + meta)    → Graph-Memory connector → ingest/pending/ at home
+                                                        │
+nightly dream (home machine) ───────────────────────────┘ Step 5b, extracted as conversation
 ```
 
 It sends text with `graph_ingest`'s inline `content` + `file_name` mode, which is admin-tenant only. Each queued document carries `meta.source: "claude-code-cloud"`, `meta.session_id` and `meta.through`; `graph_ingest status` returns the newest `through` per session as `session_cursors`, so each run only queues what is new. Project sessions are only visible from inside their own Project, so each Project needs its own collector thread.
@@ -87,20 +87,20 @@ It sends text with `graph_ingest`'s inline `content` + `file_name` mode, which i
 ## Pipeline Stages
 
 ```
-â”Œâ”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”     â”Œâ”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”     â”Œâ”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”
-â”‚  1a. Discover â”‚     â”‚  2. Claude   â”‚     â”‚  3. Claude   â”‚
-â”‚  Transcripts  â”‚â”€â”€â”€â”€â–¶â”‚  Extracts    â”‚â”€â”€â”€â”€â–¶â”‚  Calls MCP   â”‚
-â”‚               â”‚     â”‚  Entities    â”‚     â”‚  to Update   â”‚
-â”‚  1b. Discover â”‚â”€â”€â”€â”€â–¶â”‚  (reasoning) â”‚     â”‚  Graph       â”‚
-â”‚  Ingest Docs  â”‚     â”‚              â”‚     â”‚              â”‚
-â””â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”˜     â””â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”˜     â””â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”˜
-                                                  â”‚
-                                                  â–¼
-                     â”Œâ”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”     â”Œâ”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”
-                     â”‚  5. Write    â”‚â—€â”€â”€â”€â”€â”‚  4. Call      â”‚
-                     â”‚  Changelog   â”‚     â”‚  graph_decay  â”‚
-                     â”‚  + Manifest  â”‚     â”‚  (maintenance)â”‚
-                     â””â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”˜     â””â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”˜
+┌──────────────┐     ┌──────────────┐     ┌──────────────┐
+│  1a. Discover │     │  2. Claude   │     │  3. Claude   │
+│  Transcripts  │────▶│  Extracts    │────▶│  Calls MCP   │
+│               │     │  Entities    │     │  to Update   │
+│  1b. Discover │────▶│  (reasoning) │     │  Graph       │
+│  Ingest Docs  │     │              │     │              │
+└──────────────┘     └──────────────┘     └──────────────┘
+                                                  │
+                                                  ▼
+                     ┌──────────────┐     ┌──────────────┐
+                     │  5. Write    │◀────│  4. Call      │
+                     │  Changelog   │     │  graph_decay  │
+                     │  + Manifest  │     │  (maintenance)│
+                     └──────────────┘     └──────────────┘
 ```
 
 ### Stage 1a: Discover Transcripts
@@ -153,7 +153,7 @@ Claude checks `~/graph-memory/ingest/pending/` for any files.
 
 ### Stage 2: Entity Extraction (Claude's Reasoning)
 
-For each transcript/document, Claude reads the content and extracts structured information. This is NOT an API call to a separate model â€” it's Claude in the scheduled task session reasoning about the content.
+For each transcript/document, Claude reads the content and extracts structured information. This is NOT an API call to a separate model — it's Claude in the scheduled task session reasoning about the content.
 
 **What Claude extracts:**
 - **Entities:** People, projects, technologies, preferences, decisions, facts
@@ -201,12 +201,12 @@ This audit trail enables:
 
 Claude calls MCP tools to write to the graph:
 
-- `graph_relate` â€” create entities and relationships
-- `graph_boost` â€” strengthen existing relationships that were confirmed
-- `graph_weaken` â€” reduce weight on corrected information
-- `graph_relate` with CONTRADICTS type â€” flag contradictions
+- `graph_relate` — create entities and relationships
+- `graph_boost` — strengthen existing relationships that were confirmed
+- `graph_weaken` — reduce weight on corrected information
+- `graph_relate` with CONTRADICTS type — flag contradictions
 
-All updates happen within Neo4j transactions (ACID). If the process crashes mid-update, the current transaction rolls back â€” no partial state (fixes reviewer concern).
+All updates happen within Neo4j transactions (ACID). If the process crashes mid-update, the current transaction rolls back — no partial state (fixes reviewer concern).
 
 ### Stage 4: Maintenance
 
@@ -220,7 +220,7 @@ Claude calls `graph_decay` MCP tool to apply time-based decay:
 Claude writes a markdown changelog:
 
 ```markdown
-# Dream Process â€” 2026-04-06
+# Dream Process — 2026-04-06
 
 ## Summary
 - Processed: 3 transcripts, 1 ingest document
@@ -229,12 +229,12 @@ Claude writes a markdown changelog:
 - Contradictions: 1 new (unresolved)
 
 ## New Entities
-- **Project:graph-memory** (confidence: 0.7) â€” new project for graph-based memory
-- **Concept:neo4j** (confidence: 0.6) â€” graph database choice
+- **Project:graph-memory** (confidence: 0.7) — new project for graph-based memory
+- **Concept:neo4j** (confidence: 0.6) — graph database choice
 
 ## Reinforcements
-- alice PREFERS TypeScript: 0.7 â†’ 0.75
-- alice KNOWS_ABOUT MCP-servers: 0.6 â†’ 0.65
+- alice PREFERS TypeScript: 0.7 → 0.75
+- alice KNOWS_ABOUT MCP-servers: 0.6 → 0.65
 
 ## Flagged for Review
 - Potential duplicate: "auth project" and "authentication module" (not merged)
@@ -315,12 +315,12 @@ An optional way to run the nightly dream on an Anthropic API key instead of a Cl
 
 ```
 graph-dream container (or a Task Scheduler job)
-  â””â”€â”€ node dist/dream-runner/index.js
-        â”œâ”€â”€ discovery (manifest, projects dir, ingest/pending)  â†’ exits with no API call if nothing is new
-        â”œâ”€â”€ acquires processed/dream.lock (source "api-runner")
-        â”œâ”€â”€ spawns the MCP server over stdio  â†’ graph_* tools, as LOCAL_TENANT_ID
-        â”œâ”€â”€ file tools confined to ~/graph-memory (read-write) and ~/.claude/projects (read-only)
-        â””â”€â”€ tool-use loop on the Messages API until the model finishes, then releases the lock
+  └── node dist/dream-runner/index.js
+        ├── discovery (manifest, projects dir, ingest/pending)  → exits with no API call if nothing is new
+        ├── acquires processed/dream.lock (source "api-runner")
+        ├── spawns the MCP server over stdio  → graph_* tools, as LOCAL_TENANT_ID
+        ├── file tools confined to ~/graph-memory (read-write) and ~/.claude/projects (read-only)
+        └── tool-use loop on the Messages API until the model finishes, then releases the lock
 ```
 
 - **Prompt.** The system prompt is `~/graph-memory/prompts/dream-nightly.md` (the seeded copy, falling back to the one baked into the image) plus a short "Runner notes" section: the runner holds the lock, there's no shell, MarkItDown isn't available, and what to do when the budget runs out.
@@ -390,9 +390,9 @@ The same runner can run `prompts/weekly-maintenance.md` with `--job weekly`, or 
 
 The runner sends mail after every run when email is set up (`notify.ts`). In compose, that means `DREAM_NOTIFY_TOKEN_HOST_FILE` is set. Outside compose, set both `DREAM_NOTIFY_URL` and `DREAM_NOTIFY_TOKEN_FILE`. Email is off unless both are set.
 
-- **Nightly, completed:** a summary, subject `Graph dream â€” <date>: <N> sessions, <E> entities, <D> edges (~$cost)`, with the counts `update_manifest` recorded, what discovery found, and the model's closing summary.
-- **Nightly, nothing pending:** subject `Graph dream â€” <date>: nothing new (~$0.00)`. The body says no API call was made, so a quiet night still confirms the runner is alive.
-- **Weekly, completed:** the report from `logs/weekly-reports/`, subject `Weekly Graph Maintenance â€” <date> (<N> action items, ~$cost)`.
+- **Nightly, completed:** a summary, subject `Graph dream — <date>: <N> sessions, <E> entities, <D> edges (~$cost)`, with the counts `update_manifest` recorded, what discovery found, and the model's closing summary.
+- **Nightly, nothing pending:** subject `Graph dream — <date>: nothing new (~$0.00)`. The body says no API call was made, so a quiet night still confirms the runner is alive.
+- **Weekly, completed:** the report from `logs/weekly-reports/`, subject `Weekly Graph Maintenance — <date> (<N> action items, ~$cost)`.
 - **Any run that doesn't finish cleanly** (error, budget stop, turn limit, refusal, lock held): a short alert with the outcome and the last 40 log lines.
 
 Every mail starts with the run's estimated cost (turns, model) and the API spend so far this calendar month, summed from `logs/dream-runner/runs.jsonl`. These are the runner's estimates from its price table; the Console's usage page is the authority.
