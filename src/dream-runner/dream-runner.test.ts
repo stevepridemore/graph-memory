@@ -17,7 +17,39 @@ const { findPendingWork, totalPending } = await import("./pending.js");
 const { resolvePath, runFileTool, FileToolError } = await import("./file-tools.js");
 const { estimateCostUsd, nextRunAt, loadSettings, runDream, kickoffMessage } = await import("./index.js");
 const { TranscriptTools } = await import("./transcript-tools.js");
-const { mailForRun, loadMailSettings, notifySender } = await import("./notify.js");
+const { mailForRun, loadMailSettings, notifySender, billingCycleStart, billingCycleDay, monthSpend } = await import("./notify.js");
+
+describe("billing cycle", () => {
+  it("runs from the 21st through the 20th", () => {
+    expect(billingCycleStart(new Date(2026, 10, 21, 0, 0, 1), 21)).toEqual(new Date(2026, 10, 21));
+    expect(billingCycleStart(new Date(2026, 10, 20, 23, 59), 21)).toEqual(new Date(2026, 9, 21));
+    expect(billingCycleStart(new Date(2027, 0, 5), 21)).toEqual(new Date(2026, 11, 21));
+  });
+
+  it("defaults to the 21st and takes a valid override", () => {
+    expect(billingCycleDay({})).toBe(21);
+    expect(billingCycleDay({ DREAM_BILLING_CYCLE_DAY: "1" })).toBe(1);
+    expect(billingCycleDay({ DREAM_BILLING_CYCLE_DAY: "31" })).toBe(21);
+  });
+
+  it("sums only runs inside the cycle", () => {
+    const dir = mkdtempSync(join(tmpdir(), "cycle-"));
+    const path = join(dir, "runs.jsonl");
+    writeFileSync(
+      path,
+      [
+        { started: new Date(2026, 10, 20, 23).toISOString(), estimated_cost_usd: 9 },
+        { started: new Date(2026, 10, 21, 4).toISOString(), estimated_cost_usd: 1.5 },
+        { started: new Date(2026, 11, 3).toISOString(), estimated_cost_usd: 2.5 },
+        { started: new Date(2026, 11, 21).toISOString(), estimated_cost_usd: 7 },
+      ].map((r) => JSON.stringify(r)).join("\n") + "\n",
+    );
+    const s = monthSpend(path, new Date(2026, 11, 10), 21)!;
+    expect(s.total).toBeCloseTo(4);
+    expect(s.runs).toBe(2);
+    rmSync(dir, { recursive: true, force: true });
+  });
+});
 
 const roots = { graphHome, projectsDir };
 
@@ -249,7 +281,7 @@ describe("email", () => {
     })!;
     expect(nightly.subject).toMatch(/Graph dream — .*: 2 sessions, 5 entities, 15 edges \(~\$0\.40\)/);
     expect(nightly.text).toContain("Cost: ~$0.40 (3 turns, claude-opus-5-5)");
-    expect(nightly.text).toContain("API spend this month: ~$2.00 over 2 runs");
+    expect(nightly.text).toMatch(/API spend this billing cycle \(since \w{3} 21\): ~\$2\.00 over 2 runs/);
     expect(nightly.text).toContain("Processed 2 sessions.");
 
     const quiet = mailForRun({ ...base, job: "nightly", outcome: "nothing_pending", turns: 0, costUsd: 0 })!;

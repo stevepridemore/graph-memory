@@ -441,7 +441,7 @@ What the model gets:
 - The allowlisted tools of each stdio MCP server.
 - `send_email`, through a gws-mcp notify profile: the sender and recipient are fixed there, and there's an optional `html` flag. At most `max_per_run` sends per run.
 
-Runs log to `~/graph-memory/logs/dream-runner/<run_id>-<name>.log` and append to the same `runs.jsonl` as the dream, so the dream's "API spend this month" line counts them. If a run doesn't complete, the runner emails an alert through the same profile. These tasks run on the host, not in the container, so they can use local tools. Schedule one with `scripts/register-api-task.ps1 -TaskFile <file> -At HH:MM`. The script:
+Runs log to `~/graph-memory/logs/dream-runner/<run_id>-<name>.log` and append to the same `runs.jsonl` as the dream, so the dream's "API spend this billing cycle" line counts them (the cycle runs from the 21st through the 20th, when the API credits renew; set `DREAM_BILLING_CYCLE_DAY` to change it). If a run doesn't complete, the runner emails an alert through the same profile. These tasks run on the host, not in the container, so they can use local tools. Schedule one with `scripts/register-api-task.ps1 -TaskFile <file> -At HH:MM`. The script:
 
 - Registers the Task Scheduler job `API task - <name>`. `-At` defaults to `08:00`. `-Weekly -DayOfWeek <day>` makes it weekly (the day defaults to Monday). `-RepoDir` defaults to the current folder, which must have a built `dist/`.
 - Sets `ANTHROPIC_API_KEY_FILE` to `-ApiKeyFile` for that process only. The default is a file named `claude-api-key` in your user profile folder. The script never reads the key.

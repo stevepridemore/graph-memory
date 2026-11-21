@@ -119,25 +119,57 @@ export function mailForRun(run: RunSummaryForMail): Mail | null {
   return alert(run, date, header);
 }
 
-/** "Cost: ~$0.79 (18 turns, claude-opus-5-5)" plus the month's spend from runs.jsonl. */
+/**
+ * API credits renew on this day of the month, so a billing cycle runs from
+ * the 21st through the 20th of the next month. DREAM_BILLING_CYCLE_DAY
+ * overrides it (1–28).
+ */
+export const DEFAULT_BILLING_CYCLE_DAY = 21;
+
+export function billingCycleDay(env: NodeJS.ProcessEnv = process.env): number {
+  const n = Number(env.DREAM_BILLING_CYCLE_DAY?.trim());
+  return Number.isInteger(n) && n >= 1 && n <= 28 ? n : DEFAULT_BILLING_CYCLE_DAY;
+}
+
+/** Local midnight on the most recent cycle day at or before `now`. */
+export function billingCycleStart(now: Date, day = billingCycleDay()): Date {
+  const start = new Date(now.getFullYear(), now.getMonth(), day);
+  if (now < start) start.setMonth(start.getMonth() - 1);
+  return start;
+}
+
+/** "Cost: ~$0.79 (18 turns, claude-opus-5-5)" plus the billing cycle's spend from runs.jsonl. */
 function costHeader(run: RunSummaryForMail): string {
   const model = run.model ? `, ${run.model}` : "";
   const lines = [`Cost: ~$${run.costUsd.toFixed(2)} (${run.turns} turn${run.turns === 1 ? "" : "s"}${model})`];
-  const month = monthSpend(join(run.graphHome, "logs", "dream-runner", "runs.jsonl"), run.started);
-  if (month) {
-    lines.push(`API spend this month: ~$${month.total.toFixed(2)} over ${month.runs} run${month.runs === 1 ? "" : "s"}`);
+  const cycle = monthSpend(join(run.graphHome, "logs", "dream-runner", "runs.jsonl"), run.started);
+  if (cycle) {
+    lines.push(
+      `API spend this billing cycle (since ${shortDate(cycle.since)}): ~$${cycle.total.toFixed(2)} over ${cycle.runs} run${cycle.runs === 1 ? "" : "s"}`,
+    );
   }
   return lines.join("\n");
 }
 
-/** Sum of estimated_cost_usd for runs started in the same local calendar month. */
-export function monthSpend(runsPath: string, now: Date): { total: number; runs: number } | null {
+function shortDate(d: Date): string {
+  return d.toLocaleDateString("en-US", { month: "short", day: "numeric" });
+}
+
+/** Sum of estimated_cost_usd for runs started in the current billing cycle (see billingCycleStart). */
+export function monthSpend(
+  runsPath: string,
+  now: Date,
+  day = billingCycleDay(),
+): { total: number; runs: number; since: Date } | null {
   let raw: string;
   try {
     raw = readFileSync(runsPath, "utf-8");
   } catch {
     return null;
   }
+  const since = billingCycleStart(now, day);
+  const until = new Date(since);
+  until.setMonth(until.getMonth() + 1);
   let total = 0;
   let runs = 0;
   for (const line of raw.split("\n")) {
@@ -145,12 +177,12 @@ export function monthSpend(runsPath: string, now: Date): { total: number; runs: 
     try {
       const r = JSON.parse(line) as { started?: string; estimated_cost_usd?: number };
       const d = r.started ? new Date(r.started) : null;
-      if (!d || d.getFullYear() !== now.getFullYear() || d.getMonth() !== now.getMonth()) continue;
+      if (!d || d < since || d >= until) continue;
       total += Number(r.estimated_cost_usd ?? 0);
       runs++;
     } catch { /* skip a bad line */ }
   }
-  return { total, runs };
+  return { total, runs, since };
 }
 
 function localDate(d: Date): string {
