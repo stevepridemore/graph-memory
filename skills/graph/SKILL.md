@@ -1,7 +1,7 @@
 ---
 name: graph
 description: Query the memory graph to explore entities, relationships, and knowledge. Use when the user asks what the graph knows, wants to explore connections, or asks about entities in their knowledge base.
-argument-hint: [entity-name] [--hops N] [--type Type] [--related]
+argument-hint: '[entity-name] [--hops N] [--type Type] [--related]'
 ---
 
 The user wants to query the memory graph.

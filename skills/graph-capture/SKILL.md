@@ -1,7 +1,7 @@
 ---
 name: graph-capture
 description: End-of-session catch-up for the memory graph. Reviews the current conversation and writes any new entities, edges, decisions, or facts that weren't already captured in flight. Use before closing a long claude.ai or Desktop conversation, or any time you want to commit recent context to long-term memory.
-argument-hint: [--dry-run] [--topic <focus>] [--since-message <uuid>]
+argument-hint: '[--dry-run] [--topic <focus>] [--since-message <uuid>]'
 ---
 
 The user wants to capture the current conversation to the memory graph. Many conversations contribute knowledge that the dream process can't see (claude.ai web and Desktop chats live server-side, not in the local transcript store the dream walks). This command is the manual catch-up: review what we just talked about, find what hasn't already been written to the graph, and write it.
