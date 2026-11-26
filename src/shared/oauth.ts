@@ -139,6 +139,10 @@ export function getClient(clientId: string): RegisteredClient | null {
 interface RevokedEntry {
   revoked_at: string; // ISO
   exp: number;        // original token expiry (epoch seconds) — for pruning
+  // Set when a refresh token is retired by rotation rather than revoked
+  // outright: until this time (epoch seconds) the old token still works, so a
+  // client that lost the rotated response to a network error can retry.
+  grace_until?: number;
 }
 
 interface RevokedStore {
@@ -179,6 +183,30 @@ export function addRevocation(jti: string, exp: number): void {
   const store = loadRevoked();
   store.revoked[jti] = { revoked_at: new Date().toISOString(), exp };
   saveRevoked(store);
+}
+
+/** Seconds a rotated-out refresh token keeps working (retry window). */
+export const REFRESH_ROTATION_GRACE_SECONDS = 120;
+
+/** Retire a refresh token after rotation. It keeps working for the grace
+ *  window, then counts as revoked. Retiring the same token again (a retry
+ *  inside the window) keeps the original deadline, so retries can't extend it.
+ *  An outright revocation (no grace) is never downgraded. */
+function retireRefreshToken(jti: string, exp: number): void {
+  const store = loadRevoked();
+  if (store.revoked[jti]) return;
+  store.revoked[jti] = {
+    revoked_at: new Date().toISOString(),
+    exp,
+    grace_until: Math.floor(Date.now() / 1000) + REFRESH_ROTATION_GRACE_SECONDS,
+  };
+  saveRevoked(store);
+}
+
+function isRefreshRevoked(jti: string): boolean {
+  const entry = loadRevoked().revoked[jti];
+  if (!entry) return false;
+  return !(entry.grace_until && entry.grace_until > Date.now() / 1000);
 }
 
 // ─── Registration limit error ────────────────────────────────────────────────
@@ -431,10 +459,25 @@ export async function verifyRefreshToken(token: string): Promise<AccessTokenClai
   if (payload.type !== "refresh") {
     throw new Error(`expected refresh token, got type=${payload.type}`);
   }
-  if (payload.jti && isRevoked(payload.jti)) {
+  if (payload.jti && isRefreshRevoked(payload.jti)) {
     throw new Error("token revoked");
   }
   return payload as AccessTokenClaims;
+}
+
+/** Refresh-token rotation (OAuth 2.1 §4.3.1): issue a fresh refresh token and
+ *  retire the one that was just used. Without this, every connector hits a
+ *  hard expiry REFRESH_TOKEN_TTL_SECONDS after it first authorized. The new
+ *  token gets a full TTL, so an active connector never expires.
+ *  `used` must be the claims returned by verifyRefreshToken. */
+export async function rotateRefreshToken(used: AccessTokenClaims): Promise<string> {
+  const next = await issueRefreshToken({
+    email: used.email,
+    client_id: used.client_id,
+    scope: used.scope,
+  });
+  if (used.jti && typeof used.exp === "number") retireRefreshToken(used.jti, used.exp);
+  return next;
 }
 
 /** Revoke a token (access or refresh) per RFC 7009.
@@ -453,7 +496,9 @@ export async function revokeToken(token: string): Promise<{ revoked: boolean; jt
   }
   const jti = payload.jti;
   if (!jti) return { revoked: false }; // pre-jti token — grace period: can't revoke
-  if (isRevoked(jti)) return { revoked: false }; // already revoked
+  // Already revoked outright. A token only retired by rotation (still in its
+  // grace window) falls through and is revoked for good.
+  if (isRevoked(jti) && isRefreshRevoked(jti)) return { revoked: false };
   const exp = typeof payload.exp === "number" ? payload.exp : 0;
   addRevocation(jti, exp);
   return { revoked: true, jti };
@@ -488,6 +533,10 @@ export function authorizationServerMetadata(issuer = getIssuer()) {
     grant_types_supported: ["authorization_code", "refresh_token"],
     token_endpoint_auth_methods_supported: ["none"],
     code_challenge_methods_supported: ["S256"],
+    // RFC 9207: the authorize redirect carries `iss` (MCP 2026-07-28). Only
+    // advertise this while every redirect really sets it — clients that see
+    // `true` reject a redirect without `iss`.
+    authorization_response_iss_parameter_supported: true,
     scopes_supported: ["openid", "email", "profile", "mcp"],
     subject_types_supported: ["public"],
     id_token_signing_alg_values_supported: [ALG],

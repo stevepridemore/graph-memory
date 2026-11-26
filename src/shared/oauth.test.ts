@@ -16,6 +16,8 @@ const {
   issueRefreshToken,
   verifyAccessToken,
   verifyRefreshToken,
+  rotateRefreshToken,
+  REFRESH_ROTATION_GRACE_SECONDS,
   revokeToken,
   addRevocation,
   isRevoked,
@@ -104,6 +106,75 @@ describe("refresh token revocation", () => {
     const token = await issueRefreshToken(SAMPLE);
     await revokeToken(token);
     await expect(verifyRefreshToken(token)).rejects.toThrow("token revoked");
+  });
+});
+
+describe("refresh token rotation", () => {
+  afterEach(() => vi.useRealTimers());
+
+  it("issues a new, distinct refresh token for the same identity", async () => {
+    const old = await issueRefreshToken(SAMPLE);
+    const next = await rotateRefreshToken(await verifyRefreshToken(old));
+    expect(next).not.toBe(old);
+    const claims = await verifyRefreshToken(next);
+    expect(claims.email).toBe(SAMPLE.email);
+    expect(claims.client_id).toBe(SAMPLE.client_id);
+    expect(claims.scope).toBe(SAMPLE.scope);
+    expect(claims.jti).not.toBe(decodeJwt(old).jti);
+  });
+
+  it("the new token gets a full lifetime, not the old one's remainder", async () => {
+    const old = await issueRefreshToken(SAMPLE);
+    const next = await rotateRefreshToken(await verifyRefreshToken(old));
+    expect(decodeJwt(next).exp!).toBeGreaterThanOrEqual(decodeJwt(old).exp!);
+  });
+
+  it("the used token still works inside the grace window (client retry)", async () => {
+    const old = await issueRefreshToken(SAMPLE);
+    await rotateRefreshToken(await verifyRefreshToken(old));
+    await expect(verifyRefreshToken(old)).resolves.toBeDefined();
+  });
+
+  it("the used token is rejected after the grace window", async () => {
+    const old = await issueRefreshToken(SAMPLE);
+    await rotateRefreshToken(await verifyRefreshToken(old));
+    vi.useFakeTimers();
+    vi.setSystemTime(Date.now() + (REFRESH_ROTATION_GRACE_SECONDS + 5) * 1000);
+    await expect(verifyRefreshToken(old)).rejects.toThrow("token revoked");
+  });
+
+  it("a retry inside the window does not extend the deadline", async () => {
+    const old = await issueRefreshToken(SAMPLE);
+    await rotateRefreshToken(await verifyRefreshToken(old));
+    vi.useFakeTimers();
+    vi.setSystemTime(Date.now() + (REFRESH_ROTATION_GRACE_SECONDS - 10) * 1000);
+    await rotateRefreshToken(await verifyRefreshToken(old)); // retry
+    vi.setSystemTime(Date.now() + 20 * 1000);
+    await expect(verifyRefreshToken(old)).rejects.toThrow("token revoked");
+  });
+
+  it("explicit revocation of a rotated-out token ends the grace window", async () => {
+    const old = await issueRefreshToken(SAMPLE);
+    await rotateRefreshToken(await verifyRefreshToken(old));
+    const result = await revokeToken(old);
+    expect(result.revoked).toBe(true);
+    await expect(verifyRefreshToken(old)).rejects.toThrow("token revoked");
+  });
+
+  it("a revoked token is not revived by rotation", async () => {
+    const old = await issueRefreshToken(SAMPLE);
+    const claims = await verifyRefreshToken(old);
+    await revokeToken(old);
+    await rotateRefreshToken(claims);
+    await expect(verifyRefreshToken(old)).rejects.toThrow("token revoked");
+  });
+});
+
+describe("RFC 9207 iss metadata", () => {
+  it("advertises authorization_response_iss_parameter_supported", () => {
+    const md = authorizationServerMetadata("https://test.example");
+    expect(md.authorization_response_iss_parameter_supported).toBe(true);
+    expect(md.issuer).toBe("https://test.example");
   });
 });
 
