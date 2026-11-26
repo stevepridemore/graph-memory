@@ -32,6 +32,8 @@ RUN npm ci --omit=dev && npm cache clean --force
 # Compiled JavaScript from the build stage
 COPY --from=build /build/dist ./dist
 COPY schema/ ./schema/
+# Skills served over MCP (io.modelcontextprotocol/skills); see GRAPH_MCP_SKILLS.
+COPY skills/ ./skills/
 
 # Canonical prompts and helper scripts. The entrypoint copies prompts/ out to
 # the host-mounted /root/graph-memory/prompts/ on first start so the user's

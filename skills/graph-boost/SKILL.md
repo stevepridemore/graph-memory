@@ -1,7 +1,7 @@
 ---
 name: graph-boost
 description: Reinforce or weaken a specific relationship in the memory graph. Use when the user wants to manually adjust edge weights.
-argument-hint: [weaken] [entity-from] [entity-to] [relation-type] [--reason "why"]
+argument-hint: '[weaken] [entity-from] [entity-to] [relation-type] [--reason "why"]'
 ---
 
 The user wants to manually adjust an edge weight in the memory graph.

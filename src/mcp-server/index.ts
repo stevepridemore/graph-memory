@@ -1,6 +1,9 @@
-import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
-import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
+import { toNodeHandler } from "@modelcontextprotocol/node";
+import { serveStdio } from "@modelcontextprotocol/server/stdio";
+import { McpServer, createMcpHandler } from "@modelcontextprotocol/server";
+import { SkillsExtension, type SkillCatalog, type SkillFiles } from "@modelcontextprotocol/server/ext/skills";
+import { nodeSkillFiles } from "@modelcontextprotocol/server/ext/skills/node";
+import { fileURLToPath } from "node:url";
 import { z } from "zod";
 import { decodeJwt } from "jose";
 import { Neo4jClient } from "../shared/neo4j-client.js";
@@ -140,12 +143,58 @@ const server = {
   }) as unknown as McpServer["registerTool"],
 };
 
+// ─── Skills over MCP (io.modelcontextprotocol/skills, SEP-2640) ───
+// The repo's skills/ folder, served so Claude loads a skill only when it's
+// needed instead of each machine installing the plugin. Only skills that work
+// through the connector alone are published by default; the rest (backup,
+// dream, ingest, bootstrap) need the local scripts or filesystem.
+const DEFAULT_MCP_SKILLS = [
+  "graph", "graph-ask", "graph-boost", "graph-briefing",
+  "graph-capture", "graph-find", "graph-stats",
+];
+const SKILLS_DIR = process.env.GRAPH_MCP_SKILLS_DIR
+  ?? fileURLToPath(new URL("../../skills", import.meta.url));
+const MCP_SKILLS = (process.env.GRAPH_MCP_SKILLS ?? DEFAULT_MCP_SKILLS.join(","))
+  .split(",").map((n) => n.trim()).filter(Boolean);
+
+/** A SkillFiles view of `root` that lists only the allowed top-level folders. */
+function allowListedSkillFiles(root: string, allowed: string[]): SkillFiles {
+  const inner = nodeSkillFiles(root);
+  const ok = (path: string) => allowed.includes(path.split("/")[0]);
+  return {
+    async list(dir) {
+      const entries = await inner.list(dir);
+      return dir === "" ? entries.filter((e) => allowed.includes(e.name)) : ok(dir) ? entries : [];
+    },
+    async read(path) {
+      if (!ok(path)) throw new Error(`not a published skill: ${path}`);
+      return inner.read(path);
+    },
+  };
+}
+
+let skillCatalog: SkillCatalog | undefined;
+if (MCP_SKILLS.length > 0) {
+  try {
+    skillCatalog = await SkillsExtension.load(allowListedSkillFiles(SKILLS_DIR, MCP_SKILLS), {
+      prefix: "graph-memory",
+      cacheHint: { ttlMs: 10 * 60 * 1000, cacheScope: "public" },
+      onWarning: (w) => debugLog(`skills: ${w.path}: ${w.message}`),
+    });
+    debugLog(`skills: serving ${skillCatalog.entries.length} from ${SKILLS_DIR}`);
+  } catch (err) {
+    // Never let a bad skill folder stop the server; it just serves no skills.
+    debugLog(`skills: disabled, could not load ${SKILLS_DIR}: ${(err as Error).message}`);
+  }
+}
+
 function createMcpServer(): McpServer {
   const s = new McpServer({
     name: "graph-memory",
     version: "0.1.0",
   });
   for (const register of toolRegistrations) register(s);
+  skillCatalog?.attach(s);
   return s;
 }
 
@@ -201,16 +250,16 @@ server.registerTool("graph_query", {
   title: "Graph Query",
   description:
     "Query the memory graph by canonical entity name. Use when you know the entity name or close-to-canonical form (e.g. \"Steve\", \"graph-memory\"); for natural-language phrasing or synonyms (e.g. \"the knowledge graph project\") prefer graph_search. Returns up to `limit` matching nodes plus the edges that connect them within `max_hops`, with per-edge weight and source provenance.",
-  inputSchema: {
-    entities: z.array(z.string()).describe("Entity names to search for"),
-    entity_types: z.array(z.string()).optional().describe("Filter results to these entity types"),
-    max_hops: z.number().optional().default(2).describe("Max traversal depth (default: 2, capped at 4)"),
-    min_weight: z.number().optional().default(0.3).describe("Min edge weight to traverse (default: 0.3)"),
-    limit: z.number().optional().default(20).describe("Max results (default: 20)"),
-    project_context: z.string().optional().describe("Project directory or name for affinity scoring"),
-    context_level: z.enum(["minimal", "full", "relations-only"]).optional().default("full").describe("Response detail level (default: full)"),
-    current_only: z.boolean().optional().default(true).describe("Only current facts, exclude superseded (default: true)"),
-  },
+  inputSchema: z.object({
+      entities: z.array(z.string()).describe("Entity names to search for"),
+      entity_types: z.array(z.string()).optional().describe("Filter results to these entity types"),
+      max_hops: z.number().optional().default(2).describe("Max traversal depth (default: 2, capped at 4)"),
+      min_weight: z.number().optional().default(0.3).describe("Min edge weight to traverse (default: 0.3)"),
+      limit: z.number().optional().default(20).describe("Max results (default: 20)"),
+      project_context: z.string().optional().describe("Project directory or name for affinity scoring"),
+      context_level: z.enum(["minimal", "full", "relations-only"]).optional().default("full").describe("Response detail level (default: full)"),
+      current_only: z.boolean().optional().default(true).describe("Only current facts, exclude superseded (default: true)"),
+    }),
   annotations: { readOnlyHint: true },
 }, async (args) => {
   try {
@@ -257,42 +306,42 @@ server.registerTool("graph_relate", {
   title: "Graph Relate",
   description:
     "Create or strengthen a relationship between entities. Creates the endpoint entities if they don't exist, matching existing ones by name, case-insensitive name, or alias first. Use single mode (from_name/to_name/relation) for one fact at a time. Use batch mode when extracting from a transcript or document: it runs in one transaction, so a database failure keeps nothing, while an invalid item is skipped and reported without blocking the rest. Types and relations must use the documented vocabulary (see GRAPH_SCHEMA.md); an unknown relation is stored as RELATED_TO with the original kept in proposed_relations, and an unknown type as Object with proposed_type. Idempotent: re-asserting an existing edge strengthens it (capped at 1.0) and reports action \"strengthened\".",
-  inputSchema: {
-    // Single mode
-    from_name: z.string().optional().describe("Source entity name (single mode)"),
-    from_type: z.string().optional().describe("Source entity type (single mode)"),
-    to_name: z.string().optional().describe("Target entity name (single mode)"),
-    to_type: z.string().optional().describe("Target entity type (single mode)"),
-    relation: z.string().optional().describe("Relationship type (single mode)"),
-    weight: z.number().optional().describe("Edge weight 0.0-1.0"),
-    properties: z.record(z.string(), z.unknown()).optional().describe("Additional properties"),
-    evidence: z.string().optional().describe("Why this relationship exists"),
-    valid_at: z.string().optional().describe("ISO-8601 date this fact became true. Also REPLACES the previous value: other edges of this type from the same source are marked invalid as of this date. Omit it for facts that can hold several values at once. FAMILY_OF, KNOWS, COLLABORATES_WITH, MENTOR_OF, ALIAS_OF, CONTRADICTS and RELATED_TO never supersede."),
-    source_session: z.string().optional().describe("Session ID for provenance"),
-    source_transcript: z.string().optional().describe("Transcript path for provenance"),
-    source_type: z.string().optional().describe("Source type: conversation, ingest, manual, bootstrap"),
-    // Batch mode
-    batch: z.object({
-      entities: z.array(z.object({
-        localId: z.string(),
-        name: z.string(),
-        type: z.string(),
-        properties: z.record(z.string(), z.unknown()).optional(),
-      }).strict()),
-      relations: z.array(z.object({
-        from: z.string(),
-        to: z.string(),
-        relation: z.string(),
-        weight: z.number(),
-        properties: z.record(z.string(), z.unknown()).optional(),
-        evidence: z.string().optional(),
-        valid_at: z.string().optional(),
-      }).strict()),
-      source_session: z.string().optional(),
-      source_transcript: z.string().optional(),
-      source_type: z.string().optional(),
-    }).optional().describe("Batch mode: create multiple entities and relationships atomically"),
-  },
+  inputSchema: z.object({
+      // Single mode
+      from_name: z.string().optional().describe("Source entity name (single mode)"),
+      from_type: z.string().optional().describe("Source entity type (single mode)"),
+      to_name: z.string().optional().describe("Target entity name (single mode)"),
+      to_type: z.string().optional().describe("Target entity type (single mode)"),
+      relation: z.string().optional().describe("Relationship type (single mode)"),
+      weight: z.number().optional().describe("Edge weight 0.0-1.0"),
+      properties: z.record(z.string(), z.unknown()).optional().describe("Additional properties"),
+      evidence: z.string().optional().describe("Why this relationship exists"),
+      valid_at: z.string().optional().describe("ISO-8601 date this fact became true. Also REPLACES the previous value: other edges of this type from the same source are marked invalid as of this date. Omit it for facts that can hold several values at once. FAMILY_OF, KNOWS, COLLABORATES_WITH, MENTOR_OF, ALIAS_OF, CONTRADICTS and RELATED_TO never supersede."),
+      source_session: z.string().optional().describe("Session ID for provenance"),
+      source_transcript: z.string().optional().describe("Transcript path for provenance"),
+      source_type: z.string().optional().describe("Source type: conversation, ingest, manual, bootstrap"),
+      // Batch mode
+      batch: z.object({
+        entities: z.array(z.object({
+          localId: z.string(),
+          name: z.string(),
+          type: z.string(),
+          properties: z.record(z.string(), z.unknown()).optional(),
+        }).strict()),
+        relations: z.array(z.object({
+          from: z.string(),
+          to: z.string(),
+          relation: z.string(),
+          weight: z.number(),
+          properties: z.record(z.string(), z.unknown()).optional(),
+          evidence: z.string().optional(),
+          valid_at: z.string().optional(),
+        }).strict()),
+        source_session: z.string().optional(),
+        source_transcript: z.string().optional(),
+        source_type: z.string().optional(),
+      }).optional().describe("Batch mode: create multiple entities and relationships atomically"),
+    }),
   annotations: { idempotentHint: true },
 }, async (args) => {
   try {
@@ -403,9 +452,9 @@ server.registerTool("graph_delete", {
   title: "Graph Delete",
   description:
     "Permanently delete an entity node and all its edges by ID. Use for removing duplicate or erroneous nodes. Cannot be undone.",
-  inputSchema: {
-    id: z.string().describe("Entity ID to delete"),
-  },
+  inputSchema: z.object({
+      id: z.string().describe("Entity ID to delete"),
+    }),
   annotations: { destructiveHint: true },
 }, async (args) => {
   try {
@@ -425,11 +474,11 @@ server.registerTool("graph_alias", {
   title: "Graph Alias",
   description:
     "Add or remove alternate names for an entity, so future writes and lookups using those names resolve to it instead of creating a duplicate node. Use when the user says two names refer to the same person or thing: a nickname, a maiden or married name, a first name used alone. Case-insensitive. An exact entity name always takes precedence over an alias. With neither add nor remove, lists the current aliases.",
-  inputSchema: {
-    entity: z.string().describe("Entity name or ID to attach the aliases to"),
-    add: z.array(z.string()).optional().describe("Names to add as aliases"),
-    remove: z.array(z.string()).optional().describe("Aliases to remove"),
-  },
+  inputSchema: z.object({
+      entity: z.string().describe("Entity name or ID to attach the aliases to"),
+      add: z.array(z.string()).optional().describe("Names to add as aliases"),
+      remove: z.array(z.string()).optional().describe("Aliases to remove"),
+    }),
   annotations: { idempotentHint: true },
 }, async (args) => {
   try {
@@ -456,13 +505,13 @@ server.registerTool("graph_boost", {
   title: "Graph Boost",
   description:
     "Increase an edge's weight when the user confirms recalled information. Call this when the user says 'yes', 'exactly', or confirms something you retrieved from the graph. Persists immediately; weight clamps at 1.0 so repeated boosts saturate rather than overflow. Returns the previous and new weight.",
-  inputSchema: {
-    from_name: z.string().describe("Source entity name or ID"),
-    to_name: z.string().describe("Target entity name or ID"),
-    relation: z.string().describe("Relationship type (e.g. WORKS_ON, PREFERS)"),
-    amount: z.number().optional().default(0.15).describe("Boost amount (default: 0.15)"),
-    reason: z.string().optional().describe("Why boosting"),
-  },
+  inputSchema: z.object({
+      from_name: z.string().describe("Source entity name or ID"),
+      to_name: z.string().describe("Target entity name or ID"),
+      relation: z.string().describe("Relationship type (e.g. WORKS_ON, PREFERS)"),
+      amount: z.number().optional().default(0.15).describe("Boost amount (default: 0.15)"),
+      reason: z.string().optional().describe("Why boosting"),
+    }),
   annotations: { idempotentHint: true },
 }, async (args) => {
   try {
@@ -486,13 +535,13 @@ server.registerTool("graph_weaken", {
   title: "Graph Weaken",
   description:
     "Decrease an edge's weight when the user corrects a recalled fact. Call this when the user says 'no', 'that's wrong', or corrects something from the graph. Persists immediately; weight clamps at 0.0. Returns an error if the edge doesn't exist — use graph_delete to remove an entity outright. To replace a fact rather than weaken it, prefer graph_relate with the new fact and SUPERSEDES.",
-  inputSchema: {
-    from_name: z.string().describe("Source entity name or ID"),
-    to_name: z.string().describe("Target entity name or ID"),
-    relation: z.string().describe("Relationship type"),
-    amount: z.number().optional().default(0.3).describe("Weaken amount (default: 0.3)"),
-    reason: z.string().optional().describe("Why weakening"),
-  },
+  inputSchema: z.object({
+      from_name: z.string().describe("Source entity name or ID"),
+      to_name: z.string().describe("Target entity name or ID"),
+      relation: z.string().describe("Relationship type"),
+      amount: z.number().optional().default(0.3).describe("Weaken amount (default: 0.3)"),
+      reason: z.string().optional().describe("Why weakening"),
+    }),
   annotations: { idempotentHint: true },
 }, async (args) => {
   try {
@@ -517,13 +566,13 @@ server.registerTool("graph_entities", {
   title: "Graph Entities",
   description:
     "Browse or search the entity catalog. Use to check if an entity exists before creating one with graph_relate, or to list entities of a given type. For relationship-aware lookups (entity + its neighbors) use graph_query instead. Returns up to `limit` entities ordered by `sort_by`; pagination is single-page (raise `limit` if you need more).",
-  inputSchema: {
-    search: z.string().optional().describe("Full-text search query"),
-    type: z.string().optional().describe("Filter by entity type (Person, Project, Concept, etc.)"),
-    min_confidence: z.number().optional().describe("Min confidence threshold"),
-    sort_by: z.enum(["confidence", "last_seen", "name"]).optional().default("confidence").describe("Sort order (default: confidence)"),
-    limit: z.number().optional().default(20).describe("Max results (default: 20)"),
-  },
+  inputSchema: z.object({
+      search: z.string().optional().describe("Full-text search query"),
+      type: z.string().optional().describe("Filter by entity type (Person, Project, Concept, etc.)"),
+      min_confidence: z.number().optional().describe("Min confidence threshold"),
+      sort_by: z.enum(["confidence", "last_seen", "name"]).optional().default("confidence").describe("Sort order (default: confidence)"),
+      limit: z.number().optional().default(20).describe("Max results (default: 20)"),
+    }),
   annotations: { readOnlyHint: true },
 }, async (args) => {
   try {
@@ -546,9 +595,9 @@ server.registerTool("graph_contradictions", {
   title: "Graph Contradictions",
   description:
     "Find facts that contradict each other in the memory graph — pairs connected by a CONTRADICTS edge. Use during reviews, before a graph_decay run, or when the user asks about conflicting information. Returns `{contradictions: [{node_a, node_b, description, detected_date, resolved}], count}` ordered by most-recently detected. By default only unresolved pairs are surfaced; set include_resolved=true to audit historical resolutions. Resolve a contradiction by graph_weaken on the wrong edge or by graph_relate with relation=SUPERSEDES on the new fact.",
-  inputSchema: {
-    include_resolved: z.boolean().optional().default(false).describe("Include resolved contradictions (default: false)"),
-  },
+  inputSchema: z.object({
+      include_resolved: z.boolean().optional().default(false).describe("Include resolved contradictions (default: false)"),
+    }),
   annotations: { readOnlyHint: true },
 }, async (args) => {
   try {
@@ -567,22 +616,22 @@ server.registerTool("graph_ingest", {
     "Queue a document for asynchronous extraction into the memory graph (mode='queue'), or check the ingest backlog (mode='status'). Use this when you have a file the user wants summarized into the graph but doesn't need it reflected in the same conversation — the nightly dream process picks queued documents up. For inline assertions during a conversation, call graph_relate directly instead. Idempotent: queueing the same file twice overwrites the prior copy in the pending dir. " +
     "Remote callers (e.g. a cloud session collecting its own transcripts) can't name a file on this machine, so they pass content + file_name instead of file_path (admin tenant only). " +
     "status also returns session_cursors: for each cloud session queued with meta.source='claude-code-cloud', the newest meta.through already queued or dreamed.",
-  inputSchema: {
-    action: z.enum(["queue", "status"]).describe("queue: add file to pending. status: check queue."),
-    file_path: z.string().optional().describe("Path to a file on the server to queue. For queue, give file_path or content + file_name."),
-    content: z.string().optional().describe("Document text to queue inline, for callers that can't reach the server's filesystem. Requires file_name. Admin tenant only."),
-    file_name: z.string().optional().describe("Name for inline content in the pending dir: plain basename ending .md, .txt or .json."),
-    meta: z.object({
-      source: z.string().optional(),
-      author: z.string().optional(),
-      date: z.string().optional(),
-      topic_hints: z.array(z.string()).optional(),
-      weight_override: z.number().optional(),
-      session_id: z.string().optional().describe("Cloud session this document came from (with source='claude-code-cloud')"),
-      through: z.string().optional().describe("ISO timestamp of the newest session event included in this document"),
-      last_event_id: z.string().optional().describe("ID of the newest session event included in this document"),
-    }).optional().describe("Optional metadata for the queued document"),
-  },
+  inputSchema: z.object({
+      action: z.enum(["queue", "status"]).describe("queue: add file to pending. status: check queue."),
+      file_path: z.string().optional().describe("Path to a file on the server to queue. For queue, give file_path or content + file_name."),
+      content: z.string().optional().describe("Document text to queue inline, for callers that can't reach the server's filesystem. Requires file_name. Admin tenant only."),
+      file_name: z.string().optional().describe("Name for inline content in the pending dir: plain basename ending .md, .txt or .json."),
+      meta: z.object({
+        source: z.string().optional(),
+        author: z.string().optional(),
+        date: z.string().optional(),
+        topic_hints: z.array(z.string()).optional(),
+        weight_override: z.number().optional(),
+        session_id: z.string().optional().describe("Cloud session this document came from (with source='claude-code-cloud')"),
+        through: z.string().optional().describe("ISO timestamp of the newest session event included in this document"),
+        last_event_id: z.string().optional().describe("ID of the newest session event included in this document"),
+      }).optional().describe("Optional metadata for the queued document"),
+    }),
   annotations: { idempotentHint: true },
 }, async (args) => {
   try {
@@ -676,10 +725,10 @@ server.registerTool("graph_cypher", {
   title: "Graph Cypher",
   description:
     "Execute a read-only Cypher query against the memory graph. You generate the Cypher — this tool just runs it. Enforced read-only via Neo4j executeRead(). Use for custom queries not covered by other tools. Admin-only (must be the bootstrap tenant) — non-admin tenants would otherwise be able to bypass tenant filtering by writing raw Cypher.",
-  inputSchema: {
-    cypher: z.string().describe("Cypher query to execute (read-only)"),
-    params: z.record(z.string(), z.unknown()).optional().describe("Query parameters"),
-  },
+  inputSchema: z.object({
+      cypher: z.string().describe("Cypher query to execute (read-only)"),
+      params: z.record(z.string(), z.unknown()).optional().describe("Query parameters"),
+    }),
   annotations: { readOnlyHint: true },
 }, async (args) => {
   const tenantId = currentTenant();
@@ -705,9 +754,9 @@ server.registerTool("graph_decay", {
   title: "Graph Decay",
   description:
     "Apply time-based decay to every node confidence and edge weight using per-type half-lives (preferences ~693d, events ~99d, etc.). Called by the dream process during maintenance. Always preview with dry_run=true first — decay is irreversible without restoring from a graph_export backup. Rule-subtype nodes and edges touching them are exempt. Returns totals, not per-type counts: `{nodes_decayed, edges_decayed, nodes_flagged_for_pruning}` (with dry_run, edges_decayed is always 0).",
-  inputSchema: {
-    dry_run: z.boolean().optional().default(false).describe("Preview only, don't apply changes (default: false)"),
-  },
+  inputSchema: z.object({
+      dry_run: z.boolean().optional().default(false).describe("Preview only, don't apply changes (default: false)"),
+    }),
   annotations: { destructiveHint: true },
 }, async (args) => {
   try {
@@ -724,13 +773,13 @@ server.registerTool("graph_prune", {
   title: "Graph Prune",
   description:
     "Remove entities and edges that have decayed below threshold. DESTRUCTIVE — always preview first. Requires user confirmation before execute mode.",
-  inputSchema: {
-    mode: z.enum(["preview", "execute"]).optional().default("preview").describe("preview (default) or execute"),
-    node_threshold: z.number().optional().default(0.1).describe("Prune nodes below this confidence (default: 0.1)"),
-    edge_threshold: z.number().optional().default(0.05).describe("Prune edges below this weight (default: 0.05)"),
-    include_orphans: z.boolean().optional().default(true).describe("Also prune orphaned nodes (default: true)"),
-    max_age_days: z.number().optional().default(30).describe("Max age for orphan pruning (default: 30)"),
-  },
+  inputSchema: z.object({
+      mode: z.enum(["preview", "execute"]).optional().default("preview").describe("preview (default) or execute"),
+      node_threshold: z.number().optional().default(0.1).describe("Prune nodes below this confidence (default: 0.1)"),
+      edge_threshold: z.number().optional().default(0.05).describe("Prune edges below this weight (default: 0.05)"),
+      include_orphans: z.boolean().optional().default(true).describe("Also prune orphaned nodes (default: true)"),
+      max_age_days: z.number().optional().default(30).describe("Max age for orphan pruning (default: 30)"),
+    }),
   annotations: { destructiveHint: true },
 }, async (args) => {
   try {
@@ -752,17 +801,17 @@ server.registerTool("graph_unmerge", {
   title: "Graph Unmerge",
   description:
     "Split a falsely merged entity back into two separate entities, redistributing specified edges. Use when entity resolution made a mistake (e.g. merged 'Anna' and 'Anne'). The original entity keeps every edge not listed in `edges_to_move`; the new entity gets the listed edges plus a fresh embedding stub (re-derive with graph_reembed). Logged to the audit trail with `reason`. Returns the IDs of both entities.",
-  inputSchema: {
-    entity_id: z.string().describe("The merged entity ID to split"),
-    new_entity_name: z.string().describe("Name for the split-off entity"),
-    new_entity_type: z.string().describe("Type label for the split-off entity"),
-    edges_to_move: z.array(z.object({
-      other_entity_id: z.string().describe("Entity on the other end of the edge"),
-      relation_type: z.string().describe("Relationship type (e.g. WORKS_ON)"),
-      direction: z.enum(["in", "out"]).describe("Direction relative to the entity being split"),
-    })).describe("Edges to move to the new entity"),
-    reason: z.string().describe("Why splitting (logged in audit)"),
-  },
+  inputSchema: z.object({
+      entity_id: z.string().describe("The merged entity ID to split"),
+      new_entity_name: z.string().describe("Name for the split-off entity"),
+      new_entity_type: z.string().describe("Type label for the split-off entity"),
+      edges_to_move: z.array(z.object({
+        other_entity_id: z.string().describe("Entity on the other end of the edge"),
+        relation_type: z.string().describe("Relationship type (e.g. WORKS_ON)"),
+        direction: z.enum(["in", "out"]).describe("Direction relative to the entity being split"),
+      })).describe("Edges to move to the new entity"),
+      reason: z.string().describe("Why splitting (logged in audit)"),
+    }),
   annotations: { destructiveHint: true },
 }, async (args) => {
   try {
@@ -804,12 +853,12 @@ server.registerTool("graph_merge", {
   title: "Graph Merge",
   description:
     "Consolidate two entities into one — moves source's edges onto target, adopts source properties for keys target doesn't have, then deletes source. Inverse of graph_unmerge. Use after graph_merge_suggestions surfaces a duplicate pair, or whenever you've confirmed two nodes refer to the same thing. Same-tenant only; refuses to merge an entity with itself. Edges directly between source and target are dropped (would become self-loops). When source and target both have the same edge to a third node, the edge is consolidated and the higher weight wins. Target's embedding is cleared so the next graph_reembed will re-derive it from the merged state. Logged to logs/merge-audit.jsonl with `reason`. DESTRUCTIVE — always preview with dry_run=true first; recovery requires a graph_export backup or graph_unmerge with the original edge layout.",
-  inputSchema: {
-    source_id: z.string().describe("Entity ID to merge from (will be deleted)"),
-    target_id: z.string().describe("Entity ID to merge into (will absorb source)"),
-    reason: z.string().describe("Why merging (logged in audit)"),
-    dry_run: z.boolean().optional().default(false).describe("Preview only, don't apply changes (default: false)"),
-  },
+  inputSchema: z.object({
+      source_id: z.string().describe("Entity ID to merge from (will be deleted)"),
+      target_id: z.string().describe("Entity ID to merge into (will absorb source)"),
+      reason: z.string().describe("Why merging (logged in audit)"),
+      dry_run: z.boolean().optional().default(false).describe("Preview only, don't apply changes (default: false)"),
+    }),
   annotations: { destructiveHint: true },
 }, async (args) => {
   try {
@@ -845,19 +894,19 @@ server.registerTool("graph_merge_suggestions", {
   title: "Graph Merge Suggestions",
   description:
     "Surface candidate pairs of entities likely to be duplicates. Read-only — never auto-merges. Combines embedding similarity, shared-neighbor overlap, and name-token Jaccard. Same-type only. Use to triage entity-explosion before running graph_merge (destructive consolidation) or graph_relate with ALIAS_OF (soft alias).",
-  inputSchema: {
-    entity_id: z.string().optional().describe("Scope to one entity's potential duplicates"),
-    entity_type: z.string().optional().describe("Scope to one entity type (Person, Project, etc.)"),
-    min_score: z.number().optional().describe("Combined-score threshold to surface (default 0.8)"),
-    min_embedding_similarity: z.number().optional().describe("Embedding-similarity floor for candidates (default 0.85)"),
-    limit: z.number().optional().describe("Max suggestions to return (default 20, max 100)"),
-    weights: z.object({
-      embedding: z.number().optional(),
-      neighbor_jaccard: z.number().optional(),
-      name: z.number().optional(),
-    }).optional().describe("Override default weights (0.4 / 0.4 / 0.2)"),
-    log_to_audit: z.boolean().optional().describe("Emit merge_flagged audit events for surfaced pairs (default true)"),
-  },
+  inputSchema: z.object({
+      entity_id: z.string().optional().describe("Scope to one entity's potential duplicates"),
+      entity_type: z.string().optional().describe("Scope to one entity type (Person, Project, etc.)"),
+      min_score: z.number().optional().describe("Combined-score threshold to surface (default 0.8)"),
+      min_embedding_similarity: z.number().optional().describe("Embedding-similarity floor for candidates (default 0.85)"),
+      limit: z.number().optional().describe("Max suggestions to return (default 20, max 100)"),
+      weights: z.object({
+        embedding: z.number().optional(),
+        neighbor_jaccard: z.number().optional(),
+        name: z.number().optional(),
+      }).optional().describe("Override default weights (0.4 / 0.4 / 0.2)"),
+      log_to_audit: z.boolean().optional().describe("Emit merge_flagged audit events for surfaced pairs (default true)"),
+    }),
   annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true },
 }, async (args) => {
   try {
@@ -898,7 +947,7 @@ server.registerTool("graph_stats", {
   title: "Graph Stats",
   description:
     "Graph health dashboard — node/edge counts by type, average weight, orphan count, unresolved contradictions, stale entries, schema version, and pending ingest backlog. Returns aggregate counts only; for individual entities use graph_entities. Call at session start to size up the graph before deeper queries, after graph_decay or graph_prune to verify the result, or when debugging unexpected query output. No parameters.",
-  inputSchema: {},
+  inputSchema: z.object({}),
   annotations: { readOnlyHint: true },
 }, async () => {
   debugLog('graph_stats called');
@@ -962,20 +1011,20 @@ server.registerTool("graph_validate", {
     "Call this after a dream process extraction batch to catch bad data before it settles into the graph. " +
     "Returns `{total_issues, by_severity, scope, issues}`, where `issues` holds up to `max_issues` records of shape `{entity_id, name, type, issue, severity}` and severity is high/medium/low. " +
     "Read-only — pair with graph_delete or graph_unmerge to act on flagged items.",
-  inputSchema: {
-    source_session: z
-      .string()
-      .optional()
-      .describe("Limit checks to entities extracted in this session. Omit to scan the whole graph."),
-    max_issues: z
-      .number()
-      .int()
-      .min(1)
-      .max(200)
-      .optional()
-      .default(50)
-      .describe("Maximum number of issues to return (default 50)."),
-  },
+  inputSchema: z.object({
+      source_session: z
+        .string()
+        .optional()
+        .describe("Limit checks to entities extracted in this session. Omit to scan the whole graph."),
+      max_issues: z
+        .number()
+        .int()
+        .min(1)
+        .max(200)
+        .optional()
+        .default(50)
+        .describe("Maximum number of issues to return (default 50)."),
+    }),
   annotations: { readOnlyHint: true },
 }, async ({ source_session, max_issues = 50 }) => {
   const issues: Array<{ entity_id: string; name: string; type: string; issue: string; severity: "high" | "medium" | "low" }> = [];
@@ -1269,45 +1318,45 @@ server.registerTool("graph_build_context", {
     "run summary, recent additions, top knowledge hubs, unresolved contradictions, and (optionally) a " +
     "topic neighbourhood. Use this at session start instead of running graph_stats / graph_query / " +
     "graph_contradictions separately. Cuts 4-5 round trips to one.",
-  inputSchema: {
-    topic: z
-      .string()
-      .optional()
-      .describe("Optional topic to fetch a neighbourhood for (uses graph_query under the hood)."),
-    project_cwd: z
-      .string()
-      .optional()
-      .describe("Optional project directory for affinity scoring on the topic neighbourhood."),
-    recent_days: z
-      .number()
-      .int()
-      .min(1)
-      .max(90)
-      .optional()
-      .default(7)
-      .describe("Window in days for 'recently added' entities (default 7)."),
-    hub_count: z
-      .number()
-      .int()
-      .min(1)
-      .max(20)
-      .optional()
-      .default(5)
-      .describe("Number of top knowledge hubs to include (default 5)."),
-    include_contradictions: z
-      .boolean()
-      .optional()
-      .default(true)
-      .describe("Include unresolved contradictions (default true)."),
-    max_recent: z
-      .number()
-      .int()
-      .min(1)
-      .max(50)
-      .optional()
-      .default(15)
-      .describe("Max recent entities to list (default 15)."),
-  },
+  inputSchema: z.object({
+      topic: z
+        .string()
+        .optional()
+        .describe("Optional topic to fetch a neighbourhood for (uses graph_query under the hood)."),
+      project_cwd: z
+        .string()
+        .optional()
+        .describe("Optional project directory for affinity scoring on the topic neighbourhood."),
+      recent_days: z
+        .number()
+        .int()
+        .min(1)
+        .max(90)
+        .optional()
+        .default(7)
+        .describe("Window in days for 'recently added' entities (default 7)."),
+      hub_count: z
+        .number()
+        .int()
+        .min(1)
+        .max(20)
+        .optional()
+        .default(5)
+        .describe("Number of top knowledge hubs to include (default 5)."),
+      include_contradictions: z
+        .boolean()
+        .optional()
+        .default(true)
+        .describe("Include unresolved contradictions (default true)."),
+      max_recent: z
+        .number()
+        .int()
+        .min(1)
+        .max(50)
+        .optional()
+        .default(15)
+        .describe("Max recent entities to list (default 15)."),
+    }),
   annotations: { readOnlyHint: true },
 }, async (args) => {
   try {
@@ -1397,13 +1446,13 @@ server.registerTool("graph_reembed", {
     "(idempotent, fast). With force=true, re-embeds every entity — use after changing the embed-text " +
     "recipe (e.g. when richer fields are added). At ~10ms per entity, full re-embed of a few hundred " +
     "nodes finishes in seconds.",
-  inputSchema: {
-    force: z
-      .boolean()
-      .optional()
-      .default(false)
-      .describe("Re-embed every entity, even ones that already have an embedding. Default false."),
-  },
+  inputSchema: z.object({
+      force: z
+        .boolean()
+        .optional()
+        .default(false)
+        .describe("Re-embed every entity, even ones that already have an embedding. Default false."),
+    }),
   annotations: { idempotentHint: true },
 }, async ({ force }) => {
   try {
@@ -1429,43 +1478,43 @@ server.registerTool("graph_search", {
     "Best when the user's wording doesn't match canonical entity names (e.g. \"containers\" → Docker, " +
     "\"AI tools\" → Claude Code/Anthropic SDK). If the embedder is unavailable it returns an error; use graph_query instead. " +
     "Expansion follows the top 5 seeds only, capped at 30 edges.",
-  inputSchema: {
-    query: z
-      .string()
-      .min(1)
-      .describe("Natural-language query (any phrasing — synonyms and paraphrases work)."),
-    top_k: z
-      .number()
-      .int()
-      .min(1)
-      .max(50)
-      .optional()
-      .default(10)
-      .describe("How many semantically similar entities to retrieve as seeds (default 10)."),
-    min_similarity: z
-      .number()
-      .min(0)
-      .max(1)
-      .optional()
-      .default(0.5)
-      .describe("Minimum cosine similarity threshold (default 0.5)."),
-    entity_types: z
-      .array(z.enum(ENTITY_TYPES))
-      .optional()
-      .describe("Restrict results to these entity types."),
-    expand: z
-      .boolean()
-      .optional()
-      .default(true)
-      .describe("If true (default), also return the immediate graph neighbours of each seed."),
-    expand_min_weight: z
-      .number()
-      .min(0)
-      .max(1)
-      .optional()
-      .default(0.3)
-      .describe("Min edge weight when expanding (default 0.3)."),
-  },
+  inputSchema: z.object({
+      query: z
+        .string()
+        .min(1)
+        .describe("Natural-language query (any phrasing — synonyms and paraphrases work)."),
+      top_k: z
+        .number()
+        .int()
+        .min(1)
+        .max(50)
+        .optional()
+        .default(10)
+        .describe("How many semantically similar entities to retrieve as seeds (default 10)."),
+      min_similarity: z
+        .number()
+        .min(0)
+        .max(1)
+        .optional()
+        .default(0.5)
+        .describe("Minimum cosine similarity threshold (default 0.5)."),
+      entity_types: z
+        .array(z.enum(ENTITY_TYPES))
+        .optional()
+        .describe("Restrict results to these entity types."),
+      expand: z
+        .boolean()
+        .optional()
+        .default(true)
+        .describe("If true (default), also return the immediate graph neighbours of each seed."),
+      expand_min_weight: z
+        .number()
+        .min(0)
+        .max(1)
+        .optional()
+        .default(0.3)
+        .describe("Min edge weight when expanding (default 0.3)."),
+    }),
   annotations: { readOnlyHint: true },
 }, async (args) => {
   try {
@@ -1567,38 +1616,38 @@ server.registerTool("graph_communities", {
     "knowledge neighbourhoods (e.g. \"everything related to infrastructure\"). " +
     "Returns `{communities, coverage}`. `communities` holds at most `max_communities` clusters in seed order (highest-degree seed first), each shaped `{id, seed_name, seed_id, member_count, dominant_type, members: [{id, name, type}]}` with at most 30 members listed; communities below `min_size` are left out. `coverage` is `{total_entities, assigned, unassigned}`. " +
     "Use graph_query or graph_search instead when you have a specific entity to start from.",
-  inputSchema: {
-    weight_threshold: z
-      .number()
-      .min(0)
-      .max(1)
-      .optional()
-      .default(0.4)
-      .describe("Only traverse edges with weight strictly greater than this (default 0.4)."),
-    max_communities: z
-      .number()
-      .int()
-      .min(1)
-      .max(30)
-      .optional()
-      .default(10)
-      .describe("Maximum number of communities to return (default 10)."),
-    max_hops: z
-      .number()
-      .int()
-      .min(1)
-      .max(4)
-      .optional()
-      .default(3)
-      .describe("BFS depth from each seed (default 3, capped at 4)."),
-    min_size: z
-      .number()
-      .int()
-      .min(2)
-      .optional()
-      .default(2)
-      .describe("Minimum members for a community to be returned (default 2)."),
-  },
+  inputSchema: z.object({
+      weight_threshold: z
+        .number()
+        .min(0)
+        .max(1)
+        .optional()
+        .default(0.4)
+        .describe("Only traverse edges with weight strictly greater than this (default 0.4)."),
+      max_communities: z
+        .number()
+        .int()
+        .min(1)
+        .max(30)
+        .optional()
+        .default(10)
+        .describe("Maximum number of communities to return (default 10)."),
+      max_hops: z
+        .number()
+        .int()
+        .min(1)
+        .max(4)
+        .optional()
+        .default(3)
+        .describe("BFS depth from each seed (default 3, capped at 4)."),
+      min_size: z
+        .number()
+        .int()
+        .min(2)
+        .optional()
+        .default(2)
+        .describe("Minimum members for a community to be returned (default 2)."),
+    }),
   annotations: { readOnlyHint: true },
 }, async (args) => {
   try {
@@ -1622,20 +1671,20 @@ server.registerTool("graph_export", {
   description:
     "Export all graph nodes and edges to a timestamped JSONL backup file in the backups/ directory. " +
     "Run this before any risky operation, or on a weekly schedule. Old backups are pruned automatically.",
-  inputSchema: {
-    keep: z
-      .number()
-      .int()
-      .min(1)
-      .max(30)
-      .optional()
-      .default(14)
-      .describe("Number of backup files to keep (default 14, ~2 weeks of daily backups)."),
-    label: z
-      .string()
-      .optional()
-      .describe("Optional label appended to the filename, e.g. 'pre-prune' → backup-2026-05-05-pre-prune.jsonl"),
-  },
+  inputSchema: z.object({
+      keep: z
+        .number()
+        .int()
+        .min(1)
+        .max(30)
+        .optional()
+        .default(14)
+        .describe("Number of backup files to keep (default 14, ~2 weeks of daily backups)."),
+      label: z
+        .string()
+        .optional()
+        .describe("Optional label appended to the filename, e.g. 'pre-prune' → backup-2026-05-05-pre-prune.jsonl"),
+    }),
 }, async ({ keep = 14, label }) => {
   const backupsDir = join(GRAPH_MEMORY_HOME, "backups");
   mkdirSync(backupsDir, { recursive: true });
@@ -1691,21 +1740,21 @@ server.registerTool("graph_read_transcript", {
     "Read and parse a Claude Code JSONL transcript file through the canonical transcript parser. " +
     "Returns normalized messages with text content extracted. Use this instead of reading raw JSONL " +
     "directly — if the transcript format changes, only this tool needs updating.",
-  inputSchema: {
-    session_id: z
-      .string()
-      .optional()
-      .describe("Session UUID (filename without .jsonl). Searches ~/.claude/projects/ for a match."),
-    file_path: z
-      .string()
-      .optional()
-      .describe("Absolute path to the .jsonl file. Takes precedence over session_id."),
-    text_only: z
-      .boolean()
-      .optional()
-      .default(true)
-      .describe("If true (default), return only messages that have extractable text content."),
-  },
+  inputSchema: z.object({
+      session_id: z
+        .string()
+        .optional()
+        .describe("Session UUID (filename without .jsonl). Searches ~/.claude/projects/ for a match."),
+      file_path: z
+        .string()
+        .optional()
+        .describe("Absolute path to the .jsonl file. Takes precedence over session_id."),
+      text_only: z
+        .boolean()
+        .optional()
+        .default(true)
+        .describe("If true (default), return only messages that have extractable text content."),
+    }),
   annotations: { readOnlyHint: true },
 }, async ({ session_id, file_path, text_only = true }) => {
   if (!session_id && !file_path) {
@@ -1764,21 +1813,21 @@ server.registerTool("graph_audit", {
     "entity_resolved is the audit trail for entity-resolution decisions during dream — every time the " +
     "dream picks between matching an existing entity, creating a new one, or flagging an ambiguous " +
     "candidate, log it here so a later graph_unmerge can reconstruct why a merge happened.",
-  inputSchema: {
-    event: z
-      .enum([
-        "run_start", "run_end",
-        "transcript_start", "transcript_end", "transcript_skipped",
-        "entity_created", "entity_resolved", "edge_created", "edge_modified",
-        "merge_flagged", "contradiction_found",
-        "ingest_start", "ingest_end",
-        "decay_applied", "format_warning", "error",
-      ])
-      .describe("Event type"),
-    data: z
-      .record(z.string(), z.unknown())
-      .describe("Event payload — fields vary by event type. Always include relevant names/IDs."),
-  },
+  inputSchema: z.object({
+      event: z
+        .enum([
+          "run_start", "run_end",
+          "transcript_start", "transcript_end", "transcript_skipped",
+          "entity_created", "entity_resolved", "edge_created", "edge_modified",
+          "merge_flagged", "contradiction_found",
+          "ingest_start", "ingest_end",
+          "decay_applied", "format_warning", "error",
+        ])
+        .describe("Event type"),
+      data: z
+        .record(z.string(), z.unknown())
+        .describe("Event payload — fields vary by event type. Always include relevant names/IDs."),
+    }),
 }, async ({ event, data }) => {
   const auditEvent = {
     event,
@@ -1794,6 +1843,12 @@ server.registerTool("graph_audit", {
 const MCP_TRANSPORT = process.env.MCP_TRANSPORT ?? "stdio";
 
 if (MCP_TRANSPORT === "http") {
+  const mcpHandler = createMcpHandler(() => createMcpServer(), {
+    onerror: (err) => debugLog(`mcp handler: ${err.message}`),
+  });
+  const mcpNodeHandler = toNodeHandler(mcpHandler, {
+    onerror: (err) => debugLog(`mcp node adapter: ${err.message}`),
+  });
   const port = parseInt(process.env.MCP_PORT ?? "3847", 10);
 
   // TLS: use HTTPS if cert files are provided
@@ -2348,13 +2403,11 @@ if (MCP_TRANSPORT === "http") {
       identity_source: tenantCtx.identity ? "cf-access" : "static",
     });
 
-    // Stateless: a fresh server AND transport per request (see createMcpServer).
-    const mcp = createMcpServer();
-    const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
+    // Serves MCP 2026-07-28 per request and falls back to stateless
+    // 2025-era serving for older clients, from the same per-request factory.
     try {
-      await mcp.connect(transport);
       await tenantContext.run(tenantCtx, async () => {
-        await transport.handleRequest(req, res, parsedBody);
+        await mcpNodeHandler(req, res, parsedBody);
       });
     } catch (err) {
       console.error(`[graph-memory] MCP request failed: ${(err as Error).message}`);
@@ -2362,9 +2415,6 @@ if (MCP_TRANSPORT === "http") {
         res.writeHead(500, { "Content-Type": "application/json" });
         res.end(JSON.stringify({ error: "server_error" }));
       }
-    } finally {
-      await transport.close();
-      await mcp.close();
     }
   };
 
@@ -2377,7 +2427,6 @@ if (MCP_TRANSPORT === "http") {
   });
 
 } else {
-  const transport = new StdioServerTransport();
-  await createMcpServer().connect(transport);
+  serveStdio(() => createMcpServer());
   console.error("[graph-memory] MCP server running on stdio");
 }

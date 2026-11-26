@@ -195,6 +195,19 @@ Claude Code walks the OAuth flow on first call and caches the bearer token. clau
 
 If you use Claude Code on more than one PC and want a single dream process to ingest transcripts from all of them, see [Multi-PC transcript sharing](docs/REMOTE.md#multi-pc-transcript-sharing) — that's a separate concern from the OAuth multi-device story above, with a one-time sync setup.
 
+### Protocol versions and skills over MCP
+
+The server speaks MCP 2026-07-28 and still answers older (2025-era) clients on the same `/mcp` endpoint, so existing connectors keep working. It is built on the v2 TypeScript SDK (`@modelcontextprotocol/server`). Node 20 or later is required.
+
+It also publishes skills from [`skills/`](skills/) through the MCP skills extension (`io.modelcontextprotocol/skills`). Clients that support it, such as Claude and Claude Code, load a skill only when it's needed, so the connector brings its skills with it. By default only the skills that work through the connector alone are published: `graph`, `graph-ask`, `graph-boost`, `graph-briefing`, `graph-capture`, `graph-find` and `graph-stats`. Two environment variables change that:
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `GRAPH_MCP_SKILLS` | the seven above | Comma-separated skill folder names to publish. Empty publishes none. |
+| `GRAPH_MCP_SKILLS_DIR` | `skills/` next to `dist/` | Folder that holds the skill folders |
+
+A skill with invalid frontmatter is skipped with a line in the startup log, and the server keeps running.
+
 ## Document ingestion
 
 Drop files into `~/graph-memory/ingest/pending/`, or call `graph_ingest` with a file path or, from a remote caller that can't reach the server's disk, with inline text (`content` + `file_name`, up to 2 MB). The next dream run extracts entities and relationships into the graph. Native support for `.md`, `.txt`, `.json`, `.html`, `.srt`, `.vtt`. With [MarkItDown](https://github.com/microsoft/markitdown) installed (`pip install "markitdown[pdf,docx,xlsx,pptx]"`), also handles `.pdf`, `.docx`, `.xlsx`, `.pptx`, `.epub`, `.msg`, `.csv`, `.xml`, `.png`, `.jpg`, etc. — converted to Markdown first, then extracted. Original files archive to `ingest/originals/<date>/`.
