@@ -38,6 +38,7 @@ import {
   issueAccessToken,
   issueRefreshToken,
   verifyRefreshToken,
+  rotateRefreshToken,
   verifyPkce,
   authorizationServerMetadata,
   protectedResourceMetadata,
@@ -125,10 +126,28 @@ if (MCP_TRANSPORT_EARLY !== "stdio" && getTenantSource() === "static") {
 }
 
 const client = new Neo4jClient();
-const server = new McpServer({
-  name: "graph-memory",
-  version: "0.1.0",
-});
+// Tools are registered once, at module load, into this list; each MCP
+// connection gets its own McpServer built from it by createMcpServer().
+// A single shared McpServer can't serve overlapping HTTP requests: connect()
+// throws "Already connected to a transport" for the second one, and that
+// unhandled rejection used to take the whole container down.
+const toolRegistrations: Array<(s: McpServer) => void> = [];
+const server = {
+  registerTool: ((...args: unknown[]) => {
+    toolRegistrations.push((s) => {
+      (s.registerTool as (...a: unknown[]) => unknown)(...args);
+    });
+  }) as unknown as McpServer["registerTool"],
+};
+
+function createMcpServer(): McpServer {
+  const s = new McpServer({
+    name: "graph-memory",
+    version: "0.1.0",
+  });
+  for (const register of toolRegistrations) register(s);
+  return s;
+}
 
 // Initialize schema on startup
 try {
@@ -1995,6 +2014,9 @@ if (MCP_TRANSPORT === "http") {
         const dest = new URL(redirectUri);
         dest.searchParams.set("code", code);
         if (state) dest.searchParams.set("state", state);
+        // RFC 9207 (MCP 2026-07-28): lets the client confirm which
+        // authorization server answered. Must match the `issuer` metadata.
+        dest.searchParams.set("iss", getIssuer());
         res.writeHead(302, { Location: dest.toString() });
         res.end();
         return;
@@ -2116,6 +2138,9 @@ if (MCP_TRANSPORT === "http") {
             return jsonResp(res, 400, { error: "invalid_grant", error_description: "email no longer allowed" });
           }
           const access = await issueAccessToken({ email: claims.email, client_id: clientId, scope: claims.scope });
+          // Rotate: a new refresh token with a full lifetime, the used one
+          // retired after a short retry window.
+          const refresh = await rotateRefreshToken(claims);
           let accessJti: string | undefined;
           try { accessJti = decodeJwt(access).jti; } catch { /* shouldn't happen */ }
           appendOAuthEventLog({
@@ -2130,6 +2155,7 @@ if (MCP_TRANSPORT === "http") {
             access_token: access,
             token_type: "Bearer",
             expires_in: 3600,
+            refresh_token: refresh,
             scope: claims.scope,
           });
         }
@@ -2322,14 +2348,23 @@ if (MCP_TRANSPORT === "http") {
       identity_source: tenantCtx.identity ? "cf-access" : "static",
     });
 
+    // Stateless: a fresh server AND transport per request (see createMcpServer).
+    const mcp = createMcpServer();
     const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
-    await server.connect(transport);
     try {
+      await mcp.connect(transport);
       await tenantContext.run(tenantCtx, async () => {
         await transport.handleRequest(req, res, parsedBody);
       });
+    } catch (err) {
+      console.error(`[graph-memory] MCP request failed: ${(err as Error).message}`);
+      if (!res.headersSent) {
+        res.writeHead(500, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "server_error" }));
+      }
     } finally {
       await transport.close();
+      await mcp.close();
     }
   };
 
@@ -2343,6 +2378,6 @@ if (MCP_TRANSPORT === "http") {
 
 } else {
   const transport = new StdioServerTransport();
-  await server.connect(transport);
+  await createMcpServer().connect(transport);
   console.error("[graph-memory] MCP server running on stdio");
 }
