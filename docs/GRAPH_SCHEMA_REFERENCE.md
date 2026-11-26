@@ -698,7 +698,7 @@ ORDER BY b.name, a.name
 ### "Find unresolved contradictions"
 ```cypher
 MATCH (a:Entity)-[c:CONTRADICTS]->(b:Entity)
-WHERE c.resolved = false
+WHERE coalesce(c.resolved, false) = false
 RETURN labels(a) AS type_a, a.id AS id_a,
        labels(b) AS type_b, b.id AS id_b,
        c.description, c.detected_date

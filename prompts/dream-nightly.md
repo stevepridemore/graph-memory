@@ -189,6 +189,16 @@ If none fit exactly, use the closest match. Do NOT invent new values.
 
 When a fact replaces an old one (e.g., "we switched from Vue to React"), `graph_relate` handles this automatically — it sets `invalid_at` on the old edge. Note the supersession in the changelog.
 
+### 4g-1. Flag Contradictions
+
+When two facts can't both be true and nothing says which one won, write a `CONTRADICTS` edge between them with these properties:
+
+- `description`: one line on what conflicts
+- `detected_date`: the run's timestamp
+- `resolved`: `false`
+
+The server fills `resolved: false` and `detected_date` if you leave them out, but always send `description`, since nothing else records why the pair conflicts. Log a `contradiction_found` audit event for each one.
+
 ### 4g-2. Validate Extractions
 
 After writing entities and edges for a transcript, call `graph_validate` with the session's `source_session` to check for bad data:
